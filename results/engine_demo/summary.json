@@ -1,0 +1,53 @@
+{
+  "iso": "NYISO",
+  "period": [
+    "2026-07-31 00:00:00-04:00",
+    "2026-08-14 23:00:00-04:00"
+  ],
+  "calibration": {
+    "mae": 20.68,
+    "rmse": 40.16,
+    "mape_pct": 30.0,
+    "corr": 0.876,
+    "peak_decile_mae": 76.28
+  },
+  "scenario": {
+    "new_load_mw": 500,
+    "deferrable_frac": 0.5,
+    "battery": "400 MWh / 100 MW",
+    "consumer_bill_delta_usd": 76286394,
+    "avg_price_delta_usd_mwh": 10.13,
+    "peak_price_delta_usd_mwh": 196.24
+  },
+  "mitigated": {
+    "consumer_bill_delta_usd": 51306871,
+    "avg_price_delta_usd_mwh": 6.81,
+    "peak_price_delta_usd_mwh": 196.24
+  },
+  "policies": [
+    {
+      "policy": "naive (inflexible)",
+      "system_cost_delta_usd": 14878858,
+      "dc_energy_cost_usd": 15616106,
+      "peak_price_delta_usd_mwh": 196.24
+    },
+    {
+      "policy": "PFA threshold rules",
+      "system_cost_delta_usd": 13299494,
+      "dc_energy_cost_usd": 13649454,
+      "peak_price_delta_usd_mwh": 196.24
+    },
+    {
+      "policy": "DLA lookahead (MPC)",
+      "system_cost_delta_usd": 12019506,
+      "dc_energy_cost_usd": 12192539,
+      "peak_price_delta_usd_mwh": 196.24
+    }
+  ],
+  "chosen": "DLA lookahead (MPC)",
+  "sizing_answer": {
+    "battery": "1000 MWh / 250 MW (covers firm load at peak)",
+    "peak_price_delta_usd_mwh": 55.52,
+    "consumer_bill_delta_usd": 29738044
+  }
+}

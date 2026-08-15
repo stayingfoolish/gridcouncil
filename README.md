@@ -65,3 +65,25 @@ calibrated against the paper's three reference values with seed 42:
 - Exogenous noise processes reconstructed by calibration (see above).
 
 See `results/run1/figures/` and the replication report for findings.
+
+## Grid Optimization Engine (cost mode v1)
+
+`engine/` implements the cost-mode v1 of the Grid Optimization Engine on real
+ISO data (NYISO open feeds; PJM adapter stub pending an API key):
+
+```
+engine/data.py       day-ahead LMP + load + fuel mix via gridstatus (cached)
+engine/twin.py       merit-order twin: isotonic supply stack + hourly adjustment,
+                     out-of-sample calibration report (the credibility anchor)
+engine/scenario.py   load injection -> counterfactual prices & bill impact
+engine/optimizer.py  flexibility dispatch: PFA threshold rules vs DLA lookahead LP
+                     (convex stack cost), arbitrated by realized system cost
+experiments/run_engine_demo.py  end-to-end demo + figures + plain-English explainer
+```
+
+Demo result (NYISO, 2.1 held-out weeks, twin corr 0.88): a 500 MW inflexible
+data center raises the peak clearing price +196 $/MWh and consumer bills
++76.3 M$; dispatching its own flexibility (50 % deferrable compute, storage)
+cuts the consumer impact 33 % and its energy bill 22 %; the engine's sizing
+answer (250 MW / 1 GWh storage) brings the peak impact down to +56 $/MWh.
+Outputs in `results/engine_demo/`.
