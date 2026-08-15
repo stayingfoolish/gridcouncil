@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "## Novel Battery Management Strategy: Momentum-Driven Opportunistic Trading\n\n### Current Implementation Analysis\n\n**Strengths:**\n- Price normalization via z-scores provides relative market context\n- Multi-layer decision logic (z-score + spread awareness) attempts nuanced control\n- Adaptive power scaling based on SOC delta reduces unnecessary cycling\n- History tracking enables pattern recognition\n\n**Critical Limitations:**\n- Z-score threshold (0.8\u03c3) is too conservative\u2014missing 68% of actionable price deviations\n- Conflicting decision layers reduce effectiveness (z-score vs. spread logic create ambiguity)\n- \"Neutral mode\" underutilizes battery when net power is balanced (0.5x multiplier throttles action)\n- No temporal momentum\u2014treats price snapshots as independent rather than trends\n- Best cost (-6.08) achieved 9 iterations ago; current stagnation at 67.83 indicates local maximum\n\nThe current approach is trapped in reactive balancing rather than aggressive opportunistic arbitrage.\n\n---\n\n### Proposed Novel Approach: Price Momentum & Trend Arbitrage\n\n**Core Insight:** Instead of reacting to current price deviations, **predict and ride price trends** using velocity and momentum. Replace z-score logic with a two-state system: MOMENTUM mode (aggressive buying/selling on trend) and EQUILIBRIUM mode (conservative balancing).\n\n**Implementation:**\n\n```python\nclass Policy:\n  def __init__(self):\n    \"\"\"Momentum-driven opportunistic battery trading\"\"\"\n    self.price_history = []\n    self.momentum_window = 10  # Faster trend detection\n    self.max_history = 40\n\n    # Momentum thresholds ($/kWh change per period)\n    self.momentum_threshold = 0.15  # 0.15 = strong trend signal\n    self.strong_charge_momentum = -0.25  # Price dropping fast: BUY\n    self.strong_discharge_momentum = 0.25  # Price rising fast: SELL\n\n    # Simplified SOC targets\n    self.soc_target_charge = 0.95\n    self.soc_target_discharge = 0.05\n    self.soc_neutral = 0.40\n\n    # Aggressive committed power\n    self.max_power = 10.0\n    self.aggressive_power = 10.0  # Full commitment on momentum\n    self.conservative_power = 3.0  # Minimal adjustment in equilibrium\n\n  def calculate_momentum(self, current_price):\n    \"\"\"Compute price velocity (change per period)\"\"\"\n    self.price_history.append(current_price)\n    if len(self.price_history) > self.max_history:\n      self.price_history.pop(0)\n\n    if len(self.price_history) < self.momentum_window:\n      return 0.0\n\n    recent_prices = self.price_history[-self.momentum_window:]\n    momentum = (recent_prices[-1] - recent_prices[0]) / (self.momentum_window - 1)\n    return momentum\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh\n    momentum = self.calculate_momentum(current_grid_buy_price)\n\n    # MOMENTUM MODE: Trend-based aggressive trading\n    if momentum < self.strong_charge_momentum:\n      # Price dropping steeply: CHARGE aggressively\n      if current_soc < self.soc_target_charge:\n        max_charge = battery_capacity_kwh - current_energy_stored_kwh\n        return min(self.aggressive_power, max_charge)\n      else:\n        return 0.0\n\n    elif momentum > self.strong_discharge_momentum:\n      # Price rising steeply: DISCHARGE aggressively\n      if current_soc > self.soc_target_discharge:\n        max_discharge = current_energy_stored_kwh\n        return -min(self.aggressive_power, max_discharge)\n      else:\n        return 0.0\n\n    # EQUILIBRIUM MODE: Conservative reactive control when no momentum\n    else:\n      # Weak momentum: prioritize PV matching + gentle SOC targeting\n      net_power = current_pv_generation_kw - current_demand_kw\n\n      if abs(net_power) > 2.0:\n        # Significant imbalance: absorb or supply power\n        if net_power > 0 and current_soc < 0.90:\n          # Excess PV: store it\n          max_charge = battery_capacity_kwh - current_energy_stored_kwh\n          return min(net_power * 0.8, max_charge)\n        elif net_power < 0 and current_soc > 0.10:\n          # Deficit: supply from battery\n          max_discharge = current_energy_stored_kwh\n          return max(net_power * 0.8, -max_discharge)\n\n      # No strong signal: drift toward neutral SOC\n      soc_delta = self.soc_neutral - current_soc\n      if abs(soc_delta) > 0.10:\n        proportional = soc_delta * self.conservative_power\n        if proportional > 0:\n          max_charge = battery_capacity_kwh - current_energy_stored_kwh\n          return min(proportional, max_charge)\n        else:\n          max_discharge = current_energy_stored_kwh\n          return max(proportional, -max_discharge)\n\n      return 0.0\n```\n\n---\n\n### Expected Impact\n\n**Cost Improvement:**\n- **Mechanism:** Momentum-based trading captures price trends before z-score detects them\n- **Quantitative:** Expect 30-40% cost reduction within 5 iterations by catching uptrends for discharge and downtrends for charging\n- **Target:** Achieve -15 to -20 (profitable arbitrage) vs. current stagnation at 67.83\n\n**System Behavior:**\n- **Reduced Cycling:** Only aggressive action on strong momentum (< -0.25 or > 0.25) prevents over-cycling\n- **Improved Arbitrage:** Captures sell-high/buy-low opportunities systematically\n- **PV Utilization:** Equilibrium mode prioritizes renewable matching when no arbitrage window exists\n- **SOC Stability:** Drifts toward 0.40 in calm periods, ready for both charge/discharge\n\n**Key Advantages Over Current:**\n1. Single unified decision rule eliminates conflicting layers\n2. Explicit momentum detection replaces ambiguous z-score thresholds\n3. Aggressive commitment (10.0 kW) when signals are strong, conservative (3.0 kW) otherwise\n4. Lower SOC neutral (0.40 vs 0.50) positions battery for immediate action\n5. Faster trend window (10 periods vs. 20) captures market shifts quicker\n\nThis approach trades complexity for decisiveness and directly targets the profit opportunity that the current implementation is missing.",
+  "mode": "explore",
+  "best_cost": -6.079146611015874,
+  "best_iteration": 0,
+  "last_code": "class Policy:\n  def __init__(self):\n    \"\"\"Momentum-driven opportunistic battery trading\"\"\"\n    self.price_history = []\n    self.momentum_window = 10\n    self.max_history = 40\n\n    self.momentum_threshold = 0.15\n    self.strong_charge_momentum = -0.25\n    self.strong_discharge_momentum = 0.25\n\n    self.soc_target_charge = 0.95\n    self.soc_target_discharge = 0.05\n    self.soc_neutral = 0.40\n\n    self.max_power = 10.0\n    self.aggressive_power = 10.0\n    self.conservative_power = 3.0\n\n  def calculate_momentum(self, current_price):\n    \"\"\"Compute price velocity (change per period)\"\"\"\n    self.price_history.append(current_price)\n    if len(self.price_history) > self.max_history:\n      self.price_history.pop(0)\n\n    if len(self.price_history) < self.momentum_window:\n      return 0.0\n\n    recent_prices = self.price_history[-self.momentum_window:]\n    momentum = (recent_prices[-1] - recent_prices[0]) / (self.momentum_window - 1)\n    return momentum\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh\n    momentum = self.calculate_momentum(current_grid_buy_price)\n\n    if momentum < self.strong_charge_momentum:\n      if current_soc < self.soc_target_charge:\n        max_charge = battery_capacity_kwh - current_energy_stored_kwh\n        return min(self.aggressive_power, max_charge)\n      else:\n        return 0.0\n\n    elif momentum > self.strong_discharge_momentum:\n      if current_soc > self.soc_target_discharge:\n        max_discharge = current_energy_stored_kwh\n        return -min(self.aggressive_power, max_discharge)\n      else:\n        return 0.0\n\n    else:\n      net_power = current_pv_generation_kw - current_demand_kw\n\n      if abs(net_power) > 2.0:\n        if net_power > 0 and current_soc < 0.90:\n          max_charge = battery_capacity_kwh - current_energy_stored_kwh\n          return min(net_power * 0.8, max_charge)\n        elif net_power < 0 and current_soc > 0.10:\n          max_discharge = current_energy_stored_kwh\n          return max(net_power * 0.8, -max_discharge)\n\n      soc_delta = self.soc_neutral - current_soc\n      if abs(soc_delta) > 0.10:\n        proportional = soc_delta * self.conservative_power\n        if proportional > 0:\n          max_charge = battery_capacity_kwh - current_energy_stored_kwh\n          return min(proportional, max_charge)\n        else:\n          max_discharge = current_energy_stored_kwh\n          return max(proportional, -max_discharge)\n\n      return 0.0\n",
+  "last_metrics": {
+    "utilization_pct": 42.26190476190476,
+    "avg_soc_pct": 49.73008510069594
+  },
+  "cost_history": [
+    -6.079146611015874,
+    -1.5548998476219402,
+    10.950994565795797,
+    16.41371206012987,
+    37.09666561355324,
+    62.71625714333923,
+    16.138079328106315,
+    10.260853664504884,
+    67.82749377314445,
+    6.2625912615161825
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": -6.079146611015874,
+      "utilization_pct": 77.38095238095238,
+      "avg_soc_pct": 48.010823314901444,
+      "runtime_s": 0.0005153748206794262,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": -1.5548998476219402,
+      "utilization_pct": 38.69047619047619,
+      "avg_soc_pct": 57.17671009112307,
+      "runtime_s": 0.0005011251196265221,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": 10.950994565795797,
+      "utilization_pct": 23.214285714285715,
+      "avg_soc_pct": 86.21442275639424,
+      "runtime_s": 0.0005655419081449509,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": 16.41371206012987,
+      "utilization_pct": 59.523809523809526,
+      "avg_soc_pct": 66.95838084667155,
+      "runtime_s": 0.0005938750691711903,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 37.09666561355324,
+      "utilization_pct": 70.23809523809523,
+      "avg_soc_pct": 46.13419159345619,
+      "runtime_s": 0.0006998749449849129,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 62.71625714333923,
+      "utilization_pct": 94.64285714285714,
+      "avg_soc_pct": 48.93784985248728,
+      "runtime_s": 0.0007667499594390392,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 16.138079328106315,
+      "utilization_pct": 11.30952380952381,
+      "avg_soc_pct": 51.63111335178553,
+      "runtime_s": 0.0007991660386323929,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 10.260853664504884,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 2.9585798816568047,
+      "runtime_s": 0.0005636671558022499,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 67.82749377314445,
+      "utilization_pct": 82.14285714285714,
+      "avg_soc_pct": 44.30021713551213,
+      "runtime_s": 0.000811832956969738,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 6.2625912615161825,
+      "utilization_pct": 42.26190476190476,
+      "avg_soc_pct": 49.73008510069594,
+      "runtime_s": 0.000604833010584116,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}

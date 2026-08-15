@@ -1,0 +1,182 @@
+<title>APS Replication Report</title>
+<style>
+  :root {
+    --ground: #FBFAF7; --ink: #22271F; --ink-soft: #5A6156;
+    --accent: #2E7D5B; --signal: #B97A1C; --rule: #E4E2D8;
+    --card: #F3F2EB; --mono-bg: #EEEDE4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #15181A; --ink: #E6E4DC; --ink-soft: #9BA396;
+      --accent: #5BBF94; --signal: #D99A45; --rule: #2C3134;
+      --card: #1C2023; --mono-bg: #22262A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #15181A; --ink: #E6E4DC; --ink-soft: #9BA396;
+    --accent: #5BBF94; --signal: #D99A45; --rule: #2C3134;
+    --card: #1C2023; --mono-bg: #22262A;
+  }
+  body {
+    background: var(--ground); color: var(--ink);
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    line-height: 1.62; margin: 0; font-size: 17px;
+  }
+  main { max-width: 72ch; margin: 0 auto; padding: 3.5rem 1.4rem 5rem; }
+  h1, h2, h3 { font-family: system-ui, -apple-system, sans-serif; text-wrap: balance; line-height: 1.2; }
+  h1 { font-size: 2rem; font-weight: 700; margin: 0 0 .4rem; }
+  h2 { font-size: 1.25rem; font-weight: 650; margin: 2.8rem 0 .8rem; color: var(--accent); }
+  h3 { font-size: 1.02rem; font-weight: 650; margin: 1.6rem 0 .4rem; }
+  .eyebrow {
+    font-family: system-ui, sans-serif; font-size: .74rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: .8rem;
+  }
+  .subtitle { color: var(--ink-soft); font-size: 1.05rem; margin: 0 0 2rem; }
+  .verdict {
+    background: var(--card); border-left: 3px solid var(--accent);
+    padding: 1rem 1.2rem; margin: 1.8rem 0; border-radius: 0 6px 6px 0;
+  }
+  .verdict strong { color: var(--accent); }
+  table {
+    border-collapse: collapse; width: 100%; margin: 1.2rem 0;
+    font-family: system-ui, sans-serif; font-size: .88rem;
+  }
+  th { text-align: left; font-weight: 650; border-bottom: 2px solid var(--rule);
+       padding: .45rem .6rem; }
+  td { border-bottom: 1px solid var(--rule); padding: .45rem .6rem;
+       font-variant-numeric: tabular-nums; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .84rem; }
+  .ok { color: var(--accent); font-weight: 650; }
+  .warn { color: var(--signal); font-weight: 650; }
+  figure { margin: 1.8rem 0; }
+  figure img { max-width: 100%; border-radius: 6px; border: 1px solid var(--rule); }
+  figcaption { font-family: system-ui, sans-serif; font-size: .8rem; color: var(--ink-soft); margin-top: .5rem; }
+  code, .mono {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .85em;
+    background: var(--mono-bg); border-radius: 4px; padding: .08em .35em;
+  }
+  .scroll { overflow-x: auto; }
+  ul { padding-left: 1.3rem; } li { margin: .35rem 0; }
+  a { color: var(--accent); }
+</style>
+<main>
+  <div class="eyebrow">Replication study · gridcouncil</div>
+  <h1>APS Replication Report</h1>
+  <p class="subtitle">Replicating "Adaptive Self-Improvement for Smarter Energy Systems using
+  Agentic Policy Search" (Sommer, Bazan, Babaeian, Fellerer, Powell &amp; German,
+  FAU Erlangen-Nürnberg / Princeton) — LLM agents that write, evaluate, and iteratively
+  refine executable battery-control policies for a residential energy system.</p>
+
+  <div class="verdict">
+    <strong>Verdict: the headline claim replicates; the convergence claim does not.</strong>
+    Within 10 iterations, every one of 10 episodes produced a profitable battery policy, and the
+    best (−6.08&nbsp;€) lands within 0.24&nbsp;€ (96&nbsp;% of the achievable gap) of the
+    perfect-foresight optimum — matching the paper's "up to −6.20&nbsp;€, near the −6.67&nbsp;€
+    optimum" result. However, the paper's declining median cost trajectory did not reproduce:
+    with a weaker code model, the meta-level's explore/refine loop <em>degrades</em> the median
+    after iteration 2, amplifying the instability the authors themselves report in later iterations.
+  </div>
+
+  <h2>What was replicated</h2>
+  <p>The full three-level APS architecture (paper Sections 5–7, Algorithm 1):</p>
+  <ul>
+    <li><strong>Level 1 — Simulation.</strong> 7-day residential energy system at 60-min resolution,
+    seed 42: 10&nbsp;kWh battery (90&nbsp;% round-trip efficiency, 50&nbsp;% initial SoC,
+    +10/−5&nbsp;kW power limits), 5&nbsp;kWp sinusoidal PV with irradiance noise, base +
+    morning/evening-peak load, volatile buy price (mean 0.35&nbsp;€/kWh, 10&nbsp;% volatility),
+    fixed 0.08&nbsp;€/kWh feed-in tariff.</li>
+    <li><strong>Level 2 — Policy generation.</strong> An LLM turns a task description into a Python
+    <code>Policy.take_action()</code> class (paper's verbatim prompt and interface), post-processed
+    (Φ) and executed in a sandboxed subprocess; runtime errors trigger the paper's repair prompt for
+    up to 5 attempts, then the iteration restarts.</li>
+    <li><strong>Level 3 — Meta-policy.</strong> A second LLM receives cost/utilization/SoC metrics
+    and the current implementation, and emits the next task description under the paper's greedy
+    rule: refine after improvement, explore otherwise, with automatic switch to exploration on
+    stagnation.</li>
+  </ul>
+  <p>Substitutions: Claude Haiku 4.5 (fresh stateless call per prompt) stands in for Gemini 2.5
+  Flash Preview; 10 episodes were run instead of 20 (compute budget), each with 10 iterations as
+  in the paper.</p>
+
+  <h2>Deterministic benchmarks calibrate closely</h2>
+  <p>The paper's noise processes are under-specified, so free shape parameters (peak widths, PV
+  irradiance factor, price-noise level) were calibrated on seed 42 against the paper's three
+  published reference costs. The perfect-foresight linear program (Appendix D) then reproduces:</p>
+  <div class="scroll"><table>
+    <tr><th>Benchmark</th><th class="num">Paper</th><th class="num">This replication</th><th class="num">Δ</th></tr>
+    <tr><td>No-battery baseline</td><td class="num">10.70 €</td><td class="num">10.64 €</td><td class="num">0.06</td></tr>
+    <tr><td>Finite-horizon optimum</td><td class="num">−6.67 €</td><td class="num">−6.32 €</td><td class="num">0.35</td></tr>
+    <tr><td>Steady-state optimum</td><td class="num">−5.20 €</td><td class="num">−5.55 €</td><td class="num">0.35</td></tr>
+    <tr><td>Price volatility</td><td class="num">10 %</td><td class="num">10.1 %</td><td class="num">—</td></tr>
+  </table></div>
+
+  <h2>Agentic search results</h2>
+  <figure>
+    <img src="{{FIG2}}" alt="Cost evolution across iterations: median rises after iteration 2 while min stays near the optimum">
+    <figcaption>Fig. 2 replication — cost per iteration across 10 episodes (median, quartiles,
+    min–max) against the three benchmarks. The floor of the distribution sits on the optimum from
+    iteration 1; the median diverges upward instead of converging.</figcaption>
+  </figure>
+  <div class="scroll"><table>
+    <tr><th>Paper claim</th><th>Outcome</th><th>Evidence</th></tr>
+    <tr><td>Near-optimal policy within seven simulated days</td><td class="ok">Replicates</td>
+        <td>Best −6.08 € vs −6.32 € optimum (paper: −6.20 € vs −6.67 €)</td></tr>
+    <tr><td>Costs fall below the no-battery baseline early</td><td class="ok">Replicates</td>
+        <td>All 10 episodes profitable (negative cost) by iteration 3; 9/10 within 1.8 € of optimum</td></tr>
+    <tr><td>Median cost declines below zero over iterations</td><td class="warn">Does not replicate</td>
+        <td>Median: −2.9 € (iter 1) → ~+11 € (iter 3–4) → +20 € (iter 10)</td></tr>
+    <tr><td>Variance grows in later iterations; refinement past saturation degrades quality</td><td class="ok">Replicates (amplified)</td>
+        <td>Min–max span grows from 17 € (iter 1) to ~75 € (iter 9); paper's own outliers reached 41.8 €</td></tr>
+    <tr><td>Rule-based PFA policies dominate the best solutions</td><td class="ok">Replicates</td>
+        <td>All episode-best policies are threshold/rule-based heuristics on price, PV surplus, and SoC</td></tr>
+    <tr><td>Error-repair loop enables autonomous recovery</td><td class="ok">Replicates</td>
+        <td>10 runtime failures repaired; 0 permanently failed iterations in 100</td></tr>
+  </table></div>
+
+  <h3>The best generated policy behaves like the paper's</h3>
+  <figure>
+    <img src="{{FIG3}}" alt="State of charge and battery actions of the best policy: daily full cycles, daytime charging, evening discharge">
+    <figcaption>Fig. 3 replication — the best policy (episode 1, iteration 1, −6.08 €) charges
+    from midday PV surplus, discharges through the evening peak, and cycles the battery across
+    its full capacity daily: the same self-consumption + price-arbitrage pattern as the paper's
+    exemplary run.</figcaption>
+  </figure>
+
+  <h3>Why the median diverges here</h3>
+  <p>Two mechanisms, both visible in the transcripts, compound with a small code model. First,
+  strong simple policies appear immediately (iteration 1–2), so the greedy rule rarely registers
+  an improvement, and the meta-level switches to exploration almost permanently. Second, each
+  exploration instruction (6–9&nbsp;kB of ambitious strategy text) pushes the generator toward
+  increasingly baroque implementations whose unit errors — e.g. price thresholds of 3.5&nbsp;€/kWh
+  against actual prices of ~0.35&nbsp;€/kWh — buy heavily from the grid. The paper's discussion
+  anticipates exactly this failure class ("further adjustments tend to degrade quality" after
+  saturation, myopic selection criterion, minimal environmental context in prompts); with
+  Haiku 4.5 in place of Gemini 2.5 Flash, the effect dominates the median rather than the tail.
+  Since the search keeps the best-so-far policy, the deployable result is unaffected.</p>
+
+  <h2>Environment</h2>
+  <figure>
+    <img src="{{FIG45}}" alt="Demand versus PV generation, and buy/sell price series over 168 hours">
+    <figcaption>Figs. 4–5 replication — calibrated exogenous realization (seed 42): demand vs.
+    on-site generation, and the volatile buy price over the fixed feed-in tariff.</figcaption>
+  </figure>
+
+  <h2>Deviations and limitations</h2>
+  <ul>
+    <li>10 episodes instead of 20; medians over 10 runs are noisier.</li>
+    <li>Different LLM (Haiku 4.5); the divergence finding is therefore a statement about
+    APS-with-a-weaker-model, not a contradiction of the paper's exact setup.</li>
+    <li>Exogenous noise processes reconstructed by calibration against three published costs;
+    exact series differ from the authors'.</li>
+    <li>Iteration restarts capped at 2 (paper: unbounded); the cap was never reached.</li>
+    <li>No statistical outliers were removed (the paper removed two runs); our distribution's
+    heavy upper tail is structural rather than two-point.</li>
+  </ul>
+
+  <h2>Artifacts</h2>
+  <p>Code layout: <code>aps/simulation.py</code> (Level 1), <code>aps/benchmark.py</code> (LP optimum),
+  <code>aps/prompts.py</code> (verbatim templates), <code>aps/episode.py</code> (Algorithm 1 state
+  machine), <code>experiments/driver.py</code> (filesystem-based orchestration),
+  <code>experiments/analyze.py</code> (figures + summary). All 100 generated policies, meta
+  instructions, and per-iteration metrics are preserved under <code>results/run1/</code>.</p>
+</main>
