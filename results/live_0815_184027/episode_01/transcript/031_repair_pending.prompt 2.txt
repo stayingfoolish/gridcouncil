@@ -1,0 +1,388 @@
+You are an expert Python developer debugging a power-market dispatch policy.
+
+A DispatchPolicy implementation has failed in the simulation environment with the following:
+Error Message:
+Traceback (most recent call last):
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/results/live_0815_184027/episode_01/work/_eval.py", line 11, in <module>
+    exec(compile(source, "policy.py", "exec"), ns)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "policy.py", line 327
+    loads_mean = np.mean(
+                        ^
+SyntaxError: '(' was never closed
+
+
+Failed Code:
+```python
+import numpy as np
+from collections import deque
+from scipy.optimize import LinearConstraint, Bounds, minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class DispatchPolicy:
+    def __init__(self):
+        # Core parameters
+        self.flex_capacity_mw = 250.0
+        self.battery_capacity_mwh = 400.0
+        self.battery_power_rating_mw = 100.0
+        self.battery_efficiency = 0.92
+        self.firm_base_capacity_mw = 250.0
+        
+        # Historical tracking
+        self.price_history = deque(maxlen=672)
+        self.load_history = deque(maxlen=672)
+        self.backlog_history = deque(maxlen=168)
+        self.battery_soc_history = deque(maxlen=168)
+        
+        self.hour_price_dist = {}
+        self.hour_load_dist = {}
+        
+        # Deadline and safety
+        self.backlog_deadline_h = 24.0
+        self.soc_safety_margin_pct = 0.10
+        self.soc_target_pct = 0.50
+        
+        # Optimization horizons
+        self.commitment_horizon_h = 6
+        self.recourse_horizon_h = 24
+        self.lookahead_horizon_h = 48
+        
+        # Cost attribution
+        self.marginal_deferral_cost = {}
+        self.flexibility_value_by_hour = {}
+        
+        # Adaptive parameters
+        self.deadline_tightness_factor = 1.0
+        self.price_volatility_factor = 1.0
+        
+        self.iteration_count = 0
+        self.last_flex_serve = 0.0
+        self.last_battery_dispatch = 0.0
+
+    def take_action(self,
+        hour_of_day: int,
+        current_price: float,
+        firm_load_mw: float,
+        arriving_flex_mw: float,
+        backlog_mwh: float,
+        oldest_backlog_age_h: float,
+        battery_soc_mwh: float,
+        battery_capacity_mwh: float,
+        battery_power_mw: float,
+    ) -> tuple:
+        """Decide this hour's flexible dispatch.
+
+        Returns:
+          (flex_serve_mw, battery_mw)
+          flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+            serving more than arriving_flex_mw works down the backlog)
+          battery_mw: positive = charge, negative = discharge [MW]
+        """
+        
+        self.iteration_count += 1
+        
+        # Update historical tracking
+        self.price_history.append(current_price)
+        self.load_history.append(firm_load_mw)
+        self.backlog_history.append(backlog_mwh)
+        self.battery_soc_history.append(battery_soc_mwh)
+        
+        # Update hour-of-day distributions
+        self._update_distributions(hour_of_day, current_price, firm_load_mw)
+        
+        # Generate scenarios for optimization
+        price_scenarios, load_scenarios = self._generate_scenarios(
+            hour_of_day, current_price, firm_load_mw, num_scenarios=10
+        )
+        
+        # Stage 1: Solve commitment problem for flex serving
+        flex_serve_mw, marginal_cost, commitment_cost = self._solve_commitment_problem(
+            hour_of_day,
+            arriving_flex_mw,
+            backlog_mwh,
+            oldest_backlog_age_h,
+            battery_soc_mwh,
+            current_price,
+            firm_load_mw,
+            price_scenarios,
+            load_scenarios,
+        )
+        
+        # Stage 2: Solve battery dispatch problem
+        battery_dispatch_mw = self._solve_battery_dispatch(
+            hour_of_day,
+            battery_soc_mwh,
+            flex_serve_mw,
+            firm_load_mw,
+            current_price,
+            price_scenarios,
+            load_scenarios,
+            backlog_mwh,
+            oldest_backlog_age_h,
+        )
+        
+        # Enforce capacity constraints
+        flex_serve_mw = np.clip(flex_serve_mw, 0, self.flex_capacity_mw)
+        battery_dispatch_mw = np.clip(battery_dispatch_mw, -battery_power_mw, battery_power_mw)
+        
+        # Store for tracking
+        self.last_flex_serve = flex_serve_mw
+        self.last_battery_dispatch = battery_dispatch_mw
+        
+        return float(flex_serve_mw), float(battery_dispatch_mw)
+
+    def _update_distributions(self, hour_of_day: int, price: float, load: float):
+        """Update hour-of-day statistics."""
+        if hour_of_day not in self.hour_price_dist:
+            self.hour_price_dist[hour_of_day] = {'values': [], 'mean': price, 'std': price * 0.1}
+            self.hour_load_dist[hour_of_day] = {'values': [], 'mean': load, 'std': load * 0.1}
+        
+        self.hour_price_dist[hour_of_day]['values'].append(price)
+        self.hour_load_dist[hour_of_day]['values'].append(load)
+        
+        if len(self.hour_price_dist[hour_of_day]['values']) > 0:
+            self.hour_price_dist[hour_of_day]['mean'] = np.mean(self.hour_price_dist[hour_of_day]['values'])
+            self.hour_price_dist[hour_of_day]['std'] = max(np.std(self.hour_price_dist[hour_of_day]['values']), price * 0.05)
+        
+        if len(self.hour_load_dist[hour_of_day]['values']) > 0:
+            self.hour_load_dist[hour_of_day]['mean'] = np.mean(self.hour_load_dist[hour_of_day]['values'])
+            self.hour_load_dist[hour_of_day]['std'] = max(np.std(self.hour_load_dist[hour_of_day]['values']), load * 0.05)
+
+    def _generate_scenarios(self, current_hour: int, base_price: float, base_load: float, num_scenarios: int = 10) -> tuple:
+        """Generate price and load scenarios using historical distributions."""
+        
+        if len(self.price_history) < 168:
+            # Bootstrap: repeat available history
+            price_list = list(self.price_history) if len(self.price_history) > 0 else [base_price]
+            load_list = list(self.load_history) if len(self.load_history) > 0 else [base_load]
+            
+            price_scenarios = []
+            load_scenarios = []
+            for _ in range(num_scenarios):
+                p_scenario = (price_list * ((self.lookahead_horizon_h // len(price_list)) + 2))[:self.lookahead_horizon_h]
+                l_scenario = (load_list * ((self.lookahead_horizon_h // len(load_list)) + 2))[:self.lookahead_horizon_h]
+                price_scenarios.append(p_scenario)
+                load_scenarios.append(l_scenario)
+            
+            price_scenarios = np.array(price_scenarios)
+            load_scenarios = np.array(load_scenarios)
+        else:
+            price_scenarios = []
+            load_scenarios = []
+            
+            for _ in range(num_scenarios):
+                price_path = [base_price]
+                load_path = [base_load]
+                
+                for h in range(1, self.lookahead_horizon_h):
+                    future_hour = (current_hour + h) % 24
+                    
+                    if future_hour in self.hour_price_dist:
+                        mean_price = self.hour_price_dist[future_hour].get('mean', base_price)
+                        std_price = max(self.hour_price_dist[future_hour].get('std', base_price * 0.2), base_price * 0.1)
+                    else:
+                        mean_price = base_price
+                        std_price = base_price * 0.2
+                    
+                    price_noise = np.random.normal(0, std_price * 0.5)
+                    price_path.append(max(20.0, mean_price + price_noise))
+                    
+                    if future_hour in self.hour_load_dist:
+                        mean_load = self.hour_load_dist[future_hour].get('mean', base_load)
+                        std_load = max(self.hour_load_dist[future_hour].get('std', base_load * 0.15), base_load * 0.05)
+                    else:
+                        mean_load = base_load
+                        std_load = base_load * 0.15
+                    
+                    load_noise = np.random.normal(0, std_load * 0.5)
+                    load_path.append(max(100.0, min(500.0, mean_load + load_noise)))
+                
+                price_scenarios.append(price_path)
+                load_scenarios.append(load_path)
+            
+            price_scenarios = np.array(price_scenarios)
+            load_scenarios = np.array(load_scenarios)
+        
+        return price_scenarios, load_scenarios
+
+    def _solve_commitment_problem(
+        self,
+        current_hour: int,
+        arriving_flex_mw: float,
+        backlog_mwh: float,
+        oldest_backlog_age_h: float,
+        battery_soc_mwh: float,
+        current_price: float,
+        firm_load_mw: float,
+        price_scenarios: np.ndarray,
+        load_scenarios: np.ndarray,
+    ) -> tuple:
+        """Solve Stage 1: commitment on flex serving for next 6 hours."""
+        
+        num_scenarios = price_scenarios.shape[0]
+        commitment_h = self.commitment_horizon_h
+        
+        # Ensure we don't index beyond scenario dimensions
+        commitment_h = min(commitment_h, price_scenarios.shape[1])
+        
+        prices_commit = price_scenarios[:, :commitment_h]
+        loads_commit = load_scenarios[:, :commitment_h]
+        
+        prices_commit_mean = np.mean(prices_commit, axis=0)
+        loads_commit_mean = np.mean(loads_commit, axis=0)
+        prices_commit_std = np.std(prices_commit, axis=0)
+        
+        serve_cost = np.zeros(commitment_h)
+        for h in range(commitment_h):
+            base_cost = prices_commit_mean[h]
+            
+            firm_available = max(0, self.firm_base_capacity_mw - loads_commit_mean[h])
+            stress = max(0, 1.0 - (firm_available / (self.flex_capacity_mw + 1e-6)))
+            stress_cost = stress * prices_commit_mean[h] * 1.0
+            
+            serve_cost[h] = base_cost + stress_cost
+        
+        hours_to_deadline = self.backlog_deadline_h - oldest_backlog_age_h
+        
+        if hours_to_deadline <= 0:
+            deferral_penalty = 1000.0
+        else:
+            deferral_penalty = (backlog_mwh / max(hours_to_deadline, 0.5)) * np.mean(prices_commit_mean) * 2.0
+        
+        if hours_to_deadline <= 1.0:
+            min_serve_total = backlog_mwh
+        else:
+            min_serve_rate = backlog_mwh / max(hours_to_deadline, 0.5)
+            min_serve_total = min(min_serve_rate * commitment_h, arriving_flex_mw * commitment_h + backlog_mwh)
+        
+        c = np.append(serve_cost, deferral_penalty)
+        
+        A_ub = []
+        b_ub = []
+        
+        for h in range(commitment_h):
+            row = np.zeros(commitment_h + 1)
+            row[h] = 1.0
+            A_ub.append(row)
+            b_ub.append(self.flex_capacity_mw)
+        
+        for h in range(commitment_h):
+            row = np.zeros(commitment_h + 1)
+            row[h] = -1.0
+            A_ub.append(row)
+            b_ub.append(0.0)
+        
+        row = np.zeros(commitment_h + 1)
+        row[-1] = -1.0
+        A_ub.append(row)
+        b_ub.append(0.0)
+        
+        row = np.ones(commitment_h + 1) * -1.0
+        A_ub.append(row)
+        b_ub.append(-(arriving_flex_mw * commitment_h + backlog_mwh))
+        
+        cumulative_must_serve = min_serve_total / max(commitment_h, 1) * np.arange(1, commitment_h + 1)
+        for h in range(commitment_h):
+            row = np.zeros(commitment_h + 1)
+            row[:h+1] = -1.0
+            A_ub.append(row)
+            b_ub.append(-cumulative_must_serve[h])
+        
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        bounds = Bounds(np.zeros(commitment_h + 1), np.inf * np.ones(commitment_h + 1))
+        
+        try:
+            result = minimize(
+                lambda x: np.dot(c, x),
+                x0=np.append(np.full(commitment_h, min(arriving_flex_mw, self.flex_capacity_mw / 2)), max(0, backlog_mwh - arriving_flex_mw)),
+                method='SLSQP',
+                bounds=bounds,
+                constraints=LinearConstraint(A_ub, -np.inf, b_ub),
+                options={'ftol': 1e-5, 'maxiter': 50}
+            )
+            
+            optimal_flex_serve = result.x[:commitment_h]
+            flex_deferred = result.x[-1]
+            cost = result.fun
+            
+        except:
+            optimal_flex_serve = np.full(commitment_h, arriving_flex_mw / max(commitment_h, 1))
+            flex_deferred = backlog_mwh
+            cost = np.dot(serve_cost, optimal_flex_serve) + deferral_penalty * flex_deferred
+        
+        marginal_cost = serve_cost.copy()
+        
+        first_hour_flex = optimal_flex_serve[0] if len(optimal_flex_serve) > 0 else arriving_flex_mw
+        
+        return first_hour_flex, marginal_cost, cost
+
+    def _solve_battery_dispatch(
+        self,
+        current_hour: int,
+        battery_soc_mwh: float,
+        flex_serve_mw: float,
+        firm_load_mw: float,
+        current_price: float,
+        price_scenarios: np.ndarray,
+        load_scenarios: np.ndarray,
+        backlog_mwh: float,
+        oldest_backlog_age_h: float,
+    ) -> float:
+        """Solve Stage 2: battery dispatch for current hour."""
+        
+        recourse_h = min(self.recourse_horizon_h, price_scenarios.shape[1])
+        
+        prices_recourse = price_scenarios[:, :recourse_h]
+        loads_recourse = load_scenarios[:, :recourse_h]
+        
+        prices_mean = np.mean(prices_recourse, axis=0)
+        loads_mean = np.mean(
+
+```
+
+Task:
+Fix the implementation errors while maintaining the original strategy where appropriate.
+
+Expected output structure:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Return only the corrected DispatchPolicy class implementation without markdown formatting or extra comments outside the class.

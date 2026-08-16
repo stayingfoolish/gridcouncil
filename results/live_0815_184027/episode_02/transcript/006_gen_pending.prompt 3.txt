@@ -1,0 +1,136 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Analysis & Recommendation
+
+## Current Implementation Assessment
+
+**Strengths:**
+- Price trend detection captures market momentum effectively
+- Percentile-based thresholds adapt to historical price distribution
+- Backlog urgency mechanism prevents deadline violations
+- Dynamic battery targeting responds to price direction
+
+**Critical Limitation:**
+The battery utilization is only **30.3%** despite a 50% nominal target. This indicates the policy is being **too conservative with battery discharge**, especially during expensive hours. The gap between achieved cost ($14.39M) and theoretical optimum ($12.02M) (~16.4% gap) suggests significant untapped battery arbitrage opportunity.
+
+## Root Cause
+
+The discharge conditions are overly restrictive:
+1. Line 67: `battery_excess > 1e-6` requires expensive hours AND excess charge - but excess only exists if previous charging wasn't aggressive
+2. Line 71: `battery_excess > 20.0 and current_price > self.price_percentile_10 * 1.2` is a weak discharge trigger in moderately expensive hours
+3. No proactive discharge strategy when prices spike above historical norms
+
+---
+
+## Specific Improvement: Aggressive Discharge During Peak Price Events
+
+**Replace lines 60-73** with:
+
+```python
+if is_cheap_hour and battery_deficit > 1e-6:
+    available_charge_power = min(battery_power_mw, battery_deficit / 1.0, 
+                                 (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+    battery_mw = available_charge_power
+elif is_expensive_hour and battery_soc_mwh > battery_capacity_mwh * 0.15:
+    # AGGRESSIVE: Discharge whenever expensive AND have minimum reserves
+    available_discharge_power = min(battery_power_mw, 
+                                    battery_soc_mwh - battery_capacity_mwh * 0.15) / 1.0
+    battery_mw = -available_discharge_power
+elif current_price > self.price_percentile_90 * 1.15 and battery_soc_mwh > battery_capacity_mwh * 0.20:
+    # SPIKE DETECTION: Discharge on extreme prices (>115% of p90)
+    available_discharge_power = min(battery_power_mw * 0.8, 
+                                    battery_soc_mwh - battery_capacity_mwh * 0.20) / 1.0
+    battery_mw = -available_discharge_power
+elif battery_deficit > 20.0 and not is_expensive_hour:
+    available_charge_power = min(battery_power_mw * 0.5, battery_deficit / 1.0, 
+                                 (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+    battery_mw = available_charge_power
+else:
+    battery_mw = 0.0
+```
+
+**Key Changes:**
+- **Line 67:** Lower minimum reserve from implicit high level → `0.15 × capacity` (15% minimum safety)
+- **Line 71:** New condition triggers on price spikes >115% of p90 with 20% minimum reserve
+- **Line 75:** Discharge at 80% power during extreme events (smoother ramps than full 100%)
+
+---
+
+## Expected Impact
+
+| Metric | Current | Expected | Rationale |
+|--------|---------|----------|-----------|
+| **Battery Utilization** | 30.3% | 45-55% | Removes artificial discharge constraints |
+| **Added System Cost** | $14.39M | $13.8-14.1M | Capture $400-600K from peak arbitrage |
+| **Peak Price Impact** | 196.2 $/MWh | 185-190 $/MWh | Demand smoothing reduces spikes |
+| **Deadline Violations** | 0 | 0 | Minimum reserve (15%) prevents shortage |
+
+**Why this works:**
+1. Current policy wastes capacity by waiting for both expensive hours AND excess charge—this decouples those requirements
+2. Spike detection (>115% p90) targets the highest-value discharge moments without requiring prior charge buildup
+3. 15% minimum reserve is conservative enough to handle most flexible workload deadlines while enabling ~70% more discharge cycles
+
+This is a **minimal surgical change** that directly addresses the observed underutilization without redesigning the core price-trend strategy.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

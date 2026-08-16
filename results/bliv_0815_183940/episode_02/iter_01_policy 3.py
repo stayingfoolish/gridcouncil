@@ -1,0 +1,78 @@
+class Policy:
+    def __init__(self):
+        """Initializes the policy with optimized parameters."""
+        # Battery state thresholds
+        self.charge_threshold = 0.30  # Start charging when below 30%
+        self.discharge_threshold = 0.70  # Start discharging when above 70%
+        
+        # Price-based decision threshold
+        # Discharge when buy_price > sell_price * ratio
+        # Optimized ratio captures typical 15-30% market spreads
+        self.price_threshold_ratio = 0.85
+        
+        # Battery power limits [kW]
+        self.max_charge_power = 10.0
+        self.max_discharge_power = 5.0
+
+    def take_action(self,
+                    current_energy_stored_kwh: float,
+                    current_pv_generation_kw: float,
+                    current_demand_kw: float,
+                    current_grid_buy_price: float,
+                    current_grid_sell_price: float,
+                    battery_capacity_kwh: float) -> float:
+        """Determines the target battery power action based on current state.
+
+        Args:
+            current_energy_stored_kwh: Current energy in battery [kWh]
+            current_pv_generation_kw: PV generation power [kW]
+            current_demand_kw: Household demand [kW]
+            current_grid_buy_price: Grid purchase price [euro/kWh]
+            current_grid_sell_price: Grid sell price [euro/kWh]
+            battery_capacity_kwh: Maximum battery capacity [kWh]
+
+        Returns:
+            float: Target battery power [kW]
+                positive: charging
+                negative: discharging
+                zero: no action
+        """
+        
+        # Calculate battery state of charge
+        soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+        
+        # Calculate net generation (PV - demand)
+        net_generation = current_pv_generation_kw - current_demand_kw
+        
+        # Initialize action
+        action_kw = 0.0
+        
+        # CHARGING LOGIC
+        if net_generation > 0 and soc < self.charge_threshold:
+            # Excess PV generation and battery below threshold - charge
+            can_charge = min(net_generation, self.max_charge_power)
+            can_charge = min(can_charge, (battery_capacity_kwh - current_energy_stored_kwh) / (1/60))
+            action_kw = can_charge
+        
+        # DISCHARGING LOGIC
+        elif net_generation < 0:
+            # Deficit: demand exceeds PV generation
+            deficit = abs(net_generation)
+            
+            # Check if discharging is economically beneficial
+            if current_grid_buy_price > current_grid_sell_price * self.price_threshold_ratio:
+                # Grid electricity is expensive relative to battery value - discharge
+                if soc > self.discharge_threshold:
+                    can_discharge = min(deficit, self.max_discharge_power)
+                    can_discharge = min(can_discharge, current_energy_stored_kwh / (1/60))
+                    action_kw = -can_discharge
+        
+        # PRICE-BASED CHARGING
+        elif net_generation == 0 and soc < self.charge_threshold:
+            # No generation but battery below threshold and price is low
+            if current_grid_buy_price < current_grid_sell_price * self.price_threshold_ratio:
+                can_charge = self.max_charge_power
+                can_charge = min(can_charge, (battery_capacity_kwh - current_energy_stored_kwh) / (1/60))
+                action_kw = can_charge
+        
+        return action_kw

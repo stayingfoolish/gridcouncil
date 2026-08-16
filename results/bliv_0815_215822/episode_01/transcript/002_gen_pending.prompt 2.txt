@@ -1,0 +1,196 @@
+You are an expert Python developer.
+
+Develop an intelligent battery management policy to optimize energy costs while satisfying the demand_sequence.
+The policy must make strategic decisions about:
+1. When to charge the battery (buy & store energy)
+2. When to discharge the battery (sell & discharge energy)
+3. When to directly purchase from the market
+
+Key Constraints:
+1. Battery Capacity:
+   - 0 <= energy_stored <= max_energy_stored
+   - Battery charge must stay within physical limits
+   - power_discharge >= -5
+   - power_charge <= 10
+
+2. Energy Conservation:
+   - energy_discharged <= energy_stored
+   - Cannot discharge more energy than stored
+
+3. Demand Coverage:
+   - power_bought + power_discharged >= power_own_demand
+   - Must meet energy demand_sequence in each timestep
+
+Structure example:
+class Policy:
+  def __init__(self):
+    """Initializes the policy.
+    Parameters or internal states can be defined here
+    """
+    pass
+
+  def take_action(self,
+    # energy stored in the battery [kWh]
+    current_energy_stored_kwh: float,
+    # PV power generation [kW]
+    current_pv_generation_kw: float,
+    # household power demand [kW]
+    current_demand_kw: float,
+    # grid purchase price [euro/kWh]
+    current_grid_buy_price: float,
+    # grid feed-in tariff (sell price) [euro/kWh]
+    current_grid_sell_price: float,
+    # Maximum battery capacity [kWh]
+    battery_capacity_kwh: float,
+  ) -> float:
+    """Determines the target action for the battery based on the current state.
+
+    Returns:
+      (action_kw, reason): the target battery power [kW]
+        (positive: charging; negative: discharging; zero: no action)
+        and a SHORT one-sentence explanation of why, mentioning the
+        numbers that drove the decision.
+    """
+    # --- Implement your logic here ---
+    action_kw = 0.0
+    reason = "no action: explain the thresholds and values behind this choice"
+
+    return action_kw, reason
+
+Implementation instructions:
+# Analysis & Specific Improvement Recommendation
+
+## Current Implementation Assessment
+
+**Strengths:**
+- Clear price-based arbitrage logic (buy low, sell high)
+- Reasonable SOC thresholds prevent over-charging/over-discharging
+- Distinguishes between PV surplus and demand deficit scenarios
+
+**Critical Limitation:**
+The price thresholds are **absolute values** (0.15€/kWh and 0.25€/kWh) that don't adapt to market conditions. With **Price Volatility of 10.1**, these fixed thresholds are either too aggressive or too conservative depending on the actual price range.
+
+---
+
+## Recommended Improvement: Adaptive Price Thresholds
+
+### Implementation
+
+Replace fixed thresholds with **percentile-based logic** that adapts to volatility:
+
+```python
+class Policy:
+    def __init__(self):
+        self.price_percentile_buy = 0.35  # Buy when price is in lower 35th percentile
+        self.price_percentile_sell = 0.65  # Sell when price is in upper 65th percentile
+        self.battery_charge_threshold = 0.8
+        self.battery_discharge_threshold = 0.3
+        self.min_reserve = 0.1
+        self.price_history = []
+        self.history_window = 24  # Track last 24 periods
+        
+    def _get_adaptive_thresholds(self, current_price: float) -> tuple:
+        """Calculate adaptive buy/sell thresholds based on recent price history"""
+        if len(self.price_history) < 5:
+            # Fallback during warmup period
+            return 0.15, 0.25
+        
+        sorted_prices = sorted(self.price_history)
+        buy_threshold = sorted_prices[int(len(sorted_prices) * self.price_percentile_buy)]
+        sell_threshold = sorted_prices[int(len(sorted_prices) * self.price_percentile_sell)]
+        
+        return buy_threshold, sell_threshold
+    
+    def take_action(self, 
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> tuple:
+        
+        # Update price history
+        self.price_history.append(current_grid_buy_price)
+        if len(self.price_history) > self.history_window:
+            self.price_history.pop(0)
+        
+        # Get adaptive thresholds
+        adaptive_buy_threshold, adaptive_sell_threshold = self._get_adaptive_thresholds(current_grid_buy_price)
+        
+        max_charge_rate = 10.0
+        max_discharge_rate = 5.0
+        
+        energy_needed = current_demand_kw
+        net_pv = current_pv_generation_kw - energy_needed
+        battery_soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+        reserve_energy = self.min_reserve * battery_capacity_kwh
+        usable_energy = current_energy_stored_kwh - reserve_energy
+        
+        if net_pv > 0:
+            surplus_pv = net_pv
+            if current_grid_sell_price > adaptive_sell_threshold and battery_soc > self.battery_discharge_threshold:
+                discharge_amount = min(max_discharge_rate, usable_energy / 1.0)
+                action_kw = -discharge_amount
+                reason = f"discharge at high sell price {current_grid_sell_price:.2f}€/kWh (threshold: {adaptive_sell_threshold:.2f}), SOC {battery_soc:.1%}"
+                return action_kw, reason
+            
+            if battery_soc < self.battery_charge_threshold:
+                charge_amount = min(max_charge_rate, surplus_pv, battery_capacity_kwh - current_energy_stored_kwh)
+                action_kw = charge_amount
+                reason = f"charge excess PV {surplus_pv:.2f}kW, SOC {battery_soc:.1%}"
+                return action_kw, reason
+            else:
+                action_kw = 0.0
+                reason = f"battery full, excess PV to grid"
+                return action_kw, reason
+        else:
+            deficit = -net_pv
+            
+            if current_grid_buy_price > adaptive_buy_threshold and battery_soc > self.battery_discharge_threshold:
+                discharge_amount = min(max_discharge_rate, usable_energy, deficit)
+                if discharge_amount > 0:
+                    action_kw = -discharge_amount
+                    reason = f"discharge to avoid high buy price {current_grid_buy_price:.2f}€/kWh (threshold: {adaptive_buy_threshold:.2f})"
+                    return action_kw, reason
+            
+            if current_grid_buy_price < adaptive_buy_threshold and battery_soc < self.battery_charge_threshold:
+                charge_amount = min(max_charge_rate, battery_capacity_kwh - current_energy_stored_kwh)
+                if charge_amount > 0:
+                    action_kw = charge_amount
+                    reason = f"charge at low buy price {current_grid_buy_price:.2f}€/kWh (threshold: {adaptive_buy_threshold:.2f})"
+                    return action_kw, reason
+            
+            if usable_energy > 0 and battery_soc > self.battery_discharge_threshold:
+                discharge_needed = min(max_discharge_rate, usable_energy, deficit)
+                if discharge_needed > 0:
+                    action_kw = -discharge_needed
+                    reason = f"discharge to meet demand, SOC {battery_soc:.1%}"
+                    return action_kw, reason
+            
+            action_kw = 0.0
+            reason = f"buy from grid: demand {current_demand_kw:.2f}kW"
+            return action_kw, reason
+```
+
+---
+
+## Expected Impact
+
+| Metric | Current | Expected |
+|--------|---------|----------|
+| **Cost Improvement** | -2.06€ | -2.40€ to -2.80€ (15-35% better) |
+| **Battery Utilization** | 42.9% | 55-65% (better opportunistic trading) |
+| **Avg SOC** | 52.9% | 48-52% (more dynamic) |
+| **Volatility Adaptation** | None | Full |
+
+### Why This Works
+
+1. **Market-Aware**: With 10.1 volatility, percentile-based thresholds automatically tighten/loosen to market conditions
+2. **Opportunistic**: Captures more arbitrage by trading at extremes relative to recent history rather than absolute values
+3. **Prevents Regret**: Avoids selling at "high" prices that are still below long-term average
+4. **Minimal Overhead**: Only 24-period rolling window with O(n log n) sort operation
+
+**Implementation Priority**: HIGH - This directly addresses suboptimal price-sensing in volatile markets.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

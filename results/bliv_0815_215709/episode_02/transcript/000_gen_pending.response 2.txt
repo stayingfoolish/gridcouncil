@@ -1,0 +1,76 @@
+class Policy:
+  def __init__(self):
+    """Initializes the policy with decision thresholds."""
+    self.charge_threshold = 0.3
+    self.discharge_threshold = 0.7
+    self.price_arbitrage_margin = 0.05
+
+  def take_action(self,
+    current_energy_stored_kwh: float,
+    current_pv_generation_kw: float,
+    current_demand_kw: float,
+    current_grid_buy_price: float,
+    current_grid_sell_price: float,
+    battery_capacity_kwh: float,
+  ) -> tuple:
+    """Determines the target action for the battery based on the current state."""
+    
+    action_kw = 0.0
+    reason = ""
+    
+    battery_soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+    net_generation = current_pv_generation_kw - current_demand_kw
+    
+    if net_generation > 0.1:
+      if battery_soc < 0.95 and battery_soc < self.discharge_threshold:
+        max_charge = min(10.0, net_generation, (battery_capacity_kwh * 0.95 - current_energy_stored_kwh) / 0.25)
+        action_kw = max_charge
+        reason = f"Charge battery: excess PV {current_pv_generation_kw:.2f}kW, SOC {battery_soc*100:.1f}%, price {current_grid_buy_price:.3f}€/kWh"
+      elif current_grid_sell_price > current_grid_buy_price * 1.1 and net_generation > 0.5:
+        export_power = min(net_generation, 5.0)
+        action_kw = 0.0
+        reason = f"Export excess PV to grid: sell {current_grid_sell_price:.3f}€/kWh vs buy {current_grid_buy_price:.3f}€/kWh"
+      else:
+        action_kw = 0.0
+        reason = f"Hold battery: excess PV but battery adequate or export price unfavorable"
+    
+    elif net_generation < -0.1:
+      demand_deficit = abs(net_generation)
+      
+      if current_energy_stored_kwh > battery_capacity_kwh * 0.2 and current_grid_buy_price > current_grid_sell_price * 1.5:
+        max_discharge = min(5.0, demand_deficit, current_energy_stored_kwh / 0.25)
+        action_kw = -max_discharge
+        reason = f"Discharge battery: high buy price {current_grid_buy_price:.3f}€/kWh, SOC {battery_soc*100:.1f}%"
+      
+      elif battery_soc > self.discharge_threshold and current_grid_buy_price > 0.25:
+        max_discharge = min(5.0, demand_deficit, current_energy_stored_kwh / 0.25)
+        action_kw = -max_discharge
+        reason = f"Discharge battery: SOC {battery_soc*100:.1f}% high, buy price {current_grid_buy_price:.3f}€/kWh elevated"
+      
+      elif battery_soc > 0.8:
+        discharge_rate = min(3.0, demand_deficit, current_energy_stored_kwh / 0.25)
+        action_kw = -discharge_rate
+        reason = f"Partial discharge: battery near full {battery_soc*100:.1f}%, demand {current_demand_kw:.2f}kW"
+      
+      else:
+        action_kw = 0.0
+        reason = f"Buy from grid: battery low SOC {battery_soc*100:.1f}%, preserve reserve"
+    
+    else:
+      if current_energy_stored_kwh > battery_capacity_kwh * 0.9 and current_grid_sell_price > current_grid_buy_price * 1.2:
+        discharge_amount = min(2.0, (current_energy_stored_kwh - battery_capacity_kwh * 0.8) / 0.25)
+        action_kw = -discharge_amount
+        reason = f"Sell stored energy: profitable arbitrage at {current_grid_sell_price:.3f}€/kWh"
+      
+      elif current_energy_stored_kwh < battery_capacity_kwh * 0.4 and current_grid_buy_price < 0.15:
+        charge_amount = min(8.0, (battery_capacity_kwh * 0.7 - current_energy_stored_kwh) / 0.25)
+        action_kw = charge_amount
+        reason = f"Charge battery: low price opportunity {current_grid_buy_price:.3f}€/kWh, SOC {battery_soc*100:.1f}%"
+      
+      else:
+        action_kw = 0.0
+        reason = f"Idle: balanced generation-demand, SOC {battery_soc*100:.1f}%, buy/sell {current_grid_buy_price:.3f}/{current_grid_sell_price:.3f}€/kWh"
+    
+    action_kw = max(-5.0, min(10.0, action_kw))
+    
+    return action_kw, reason

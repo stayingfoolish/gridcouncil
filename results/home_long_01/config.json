@@ -1,0 +1,32 @@
+{
+  "episodes": 5,
+  "iterations": 10,
+  "params": {
+    "battery_capacity_kwh": 10.0,
+    "round_trip_efficiency": 0.9,
+    "initial_soc": 0.5,
+    "max_charge_kw": 10.0,
+    "max_discharge_kw": 5.0,
+    "base_load_kw": 0.25,
+    "morning_peak_kw": 1.25,
+    "evening_peak_kw": 2.25,
+    "morning_peak_hour": 7.5,
+    "evening_peak_hour": 19.0,
+    "morning_peak_width_h": 0.75,
+    "evening_peak_width_h": 1.05,
+    "load_noise_kw": 0.03,
+    "pv_nominal_kwp": 5.0,
+    "pv_sunrise_h": 6.0,
+    "pv_sunset_h": 18.0,
+    "pv_noise_rel": 0.22,
+    "pv_irradiance_mean": 0.68,
+    "grid_buy_price": 0.35,
+    "feed_in_tariff": 0.08,
+    "price_peak_amplitude": 0.02,
+    "price_noise": 0.031,
+    "price_noise_phi": 0.0,
+    "days": 7,
+    "dt_h": 1.0,
+    "seed": 42
+  }
+}
