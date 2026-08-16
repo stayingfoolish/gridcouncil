@@ -415,12 +415,12 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_today, t_agents,
+(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_today, t_who, t_agents,
  t_live_home, t_live_dc, t_hood) = st.tabs([
     "🎯 Tour", "🛰 Mission Control",
     "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
     "4 · 🌊 2035: Why coordination", "4b · 🧘 Today: The calm story",
-    "5 · 🤝 How the agents talk",
+    "4c · ⚖️ Who pays?", "5 · 🤝 How the agents talk",
     "🔴 Live Lab: Home", "🔴 Live Lab: Data center", "🔍 Under the hood"])
 
 # ---------------------------------------------------------------- the problem
@@ -1226,3 +1226,68 @@ the grid absorbs everyone's flexibility, selfish or coordinated.**""")
                "load at the peak — flexible load is easy to absorb. (2) The herding problem "
                "is real but *ahead of us* — open the 🌊 2035 tab to see when it arrives. "
                "Coordination is infrastructure you build *before* you need it.")
+
+
+# ---------------------------------------------------------------- who pays
+@st.cache_data(show_spinner="Dispatching the data center across the whole year…")
+def year_smoothing(mw: float, flex_pct: int, batt_mw: int):
+    df, _, twin, _ = load_twin()
+    yr = df.iloc[-8760:].reset_index(drop=True) if len(df) > 8760 else df
+    dc = datacenter(len(yr), mw=mw, deferrable_frac=flex_pct / 100,
+                    battery_mwh=batt_mw * 4.0, battery_mw=float(batt_mw))
+    rigid = assess(twin, yr, dc)
+    opt = dispatch_pfa(twin, yr, dc)
+    disp = assess(twin, yr, dc, injected_mw=opt.served_mw)
+    out = pd.DataFrame({"date": yr["time"].dt.date,
+                        "Grid alone": rigid.price_base,
+                        "Rigid data center": rigid.price_new,
+                        "Dispatched data center": disp.price_new})
+    daily = out.groupby("date").max()
+    return daily
+
+with t_who:
+    st.subheader("⚖️ Who pays? Two neighborhoods and one data center")
+    era_w = st.radio("Scale", ["Today (50k battery homes, 500 MW DC)",
+                               "2035 (1M battery homes, 3 GW DC, 4M EVs)"],
+                     horizontal=True)
+    if era_w.startswith("Today"):
+        W = run_coordination(50_000, 500, 0, 4); n_b = 50_000
+    else:
+        W = run_coordination(1_000_000, 3_000, 0, 5, 4_000_000); n_b = 1_000_000
+    home_mwh_mo = 0.7      # typical NY household consumption per month [MWh]
+    scale_mo = 10.0        # 3-day episode -> per-month (~x10)
+    ex_mwh = float(W["existing_mw"].sum())
+    up_self = float(((W["p_selfish"] - W["p0"]) * W["existing_mw"]).sum()) / ex_mwh
+    up_joint = float(((W["p_joint"] - W["p0"]) * W["existing_mw"]).sum()) / ex_mwh
+    fleet_rev = max(float((-W["fleet_batt"] * W["p_joint"]).sum()), 0.0) / n_b
+    r1, r2, r3 = st.columns(3)
+    r1.metric("🏚 Home WITHOUT battery",
+              f"{up_self * home_mwh_mo * scale_mo:+.2f} $/mo",
+              f"{up_joint * home_mwh_mo * scale_mo:+.2f} $/mo if coordinated",
+              delta_color="inverse" if up_joint > 0 else "normal")
+    r2.metric("🔋 Home WITH battery",
+              f"{up_self * home_mwh_mo * scale_mo - fleet_rev * scale_mo:+.2f} $/mo",
+              f"earns ${fleet_rev * scale_mo:.2f}/mo arbitrage")
+    r3.metric("🏢 The data center",
+              "hedged by its own flexibility",
+              "see story tab 3 for its bill")
+    st.caption("Price uplift × household consumption, scaled from the worst-3-day episode "
+               "to a month (×10) — an upper-bound month, labeled as such. Battery homes "
+               "feel the same uplift but earn arbitrage; batteryless homes just pay. "
+               "Coordination is what protects the second group.")
+
+    st.markdown("#### The whole year — which peaks got smoothed")
+    yd = year_smoothing(500.0, 50, 100)
+    st.line_chart(yd, height=280, color=["#9d9d9d", "#e45756", "#54a24b"])
+    shave = (yd["Rigid data center"] - yd["Dispatched data center"])
+    smoothed = shave[shave > 10].sort_values(ascending=False)
+    c1, c2 = st.columns([1, 2])
+    c1.metric("Spike days smoothed", f"{len(smoothed)}",
+              f"best day: −${shave.max():.0f}/MWh off the peak")
+    with c2:
+        st.bar_chart(smoothed.head(15).rename("peak $/MWh shaved"), height=220,
+                     color=["#54a24b"])
+    st.caption("Daily peak prices across the entire dataset: gray = grid alone, red = a rigid "
+               "500 MW data center, green = the same data center dispatched by threshold rules "
+               "(the fast policy — the LP does better still). Bars: the 15 days where dispatch "
+               "shaved the most off the peak.")
