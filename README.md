@@ -21,7 +21,8 @@ uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python -m streamlit run app.py
 ```
 
-Four tabs — 🎯 Tour (guided), 🎤 Pitch (presenter mode), 🧭 Explore, and
+Four tabs — 📖 Project (a scrollable one-pager: thesis, methodology, evidence,
+and both case studies), 🎤 Pitch (presenter mode), 🧭 Explore, and
 🔬 Lab — covering: the problem on a full year of real market data (zonal price map,
 hourly carbon intensity from the real fuel mix), three precomputed stories —
 a home battery in €, a 500 MW data center in $, and the flagship

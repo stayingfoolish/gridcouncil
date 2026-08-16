@@ -3,10 +3,10 @@
     streamlit run app.py
 
 Information architecture (four top-level tabs):
-  🎯 Tour     — guided five-act walkthrough (default)
+  📖 Project  — scrollable one-pager: thesis, method, evidence, case studies
   🎤 Pitch    — presenter mode: keyboard-free screens from recorded data
-  🧭 Explore  — Mission Control, the problem, both stories, coordination,
-                Today, Who pays (picked via a selector inside the tab)
+  🧭 Explore  — landing dial, Mission Control, the problem, both stories,
+                coordination, Today, Who pays (picked via a selector inside the tab)
   🔬 Lab      — How the agents talk, both Live Labs, Under the hood
 """
 
@@ -480,8 +480,8 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-t_tour, t_pitch, t_explore, t_lab = st.tabs(
-    ["🎯 Tour", "🎤 Pitch", "🧭 Explore", "🔬 Lab"])
+t_project, t_pitch, t_explore, t_lab = st.tabs(
+    ["📖 Project", "🎤 Pitch", "🧭 Explore", "🔬 Lab"])
 
 # ---------------------------------------------------------------- the problem
 def render_problem():
@@ -1078,180 +1078,167 @@ def render_hood():
                     "in place. Every run started from now on keeps the full verbatim transcript.")
 
 
-# ================================================================ 🎯 guided tour
-ACTS = ["Welcome", "The problem", "The proof", "The fix", "The coordination",
-        "The engine"]
-PERSONAS = {
-    "🏛 I run a city": "city",
-    "🏢 I run a data center": "dc",
-    "⚡ I operate the grid": "grid",
-    "🔧 Show me the engineering": "eng",
-}
+# ================================================================ 📖 project
 
-TAKEAWAYS = {  # act -> persona -> one-line takeaway
-    3: {"city": "Your residents' bills don't have to rise for the grid to grow.",
-        "dc": "Flexibility cuts your energy bill ~20% **and** is your fastest path through interconnection.",
-        "grid": "The interconnection request can be absorbed without firing peakers — here's the dispatch proof.",
-        "eng": "The LP closes 100% of the achievable gap by construction; every other policy is scored against it."},
-    4: {"city": "Coordinated flexibility protects every consumer — not just the flexible ones.",
-        "dc": "Joining the coordination pool makes your interconnection case stronger than going alone.",
-        "grid": "Price signals alone recover most of the coordination value — no direct control needed.",
-        "eng": "Damped best-response against the repriced stack converges in a handful of rounds."},
-}
+def _whitepaper_references() -> str:
+    """The References section of docs/whitepaper.md, verbatim."""
+    wp_md = ROOT / "docs" / "whitepaper.md"
+    if not wp_md.exists():
+        return ""
+    md = wp_md.read_text()
+    idx = md.find("## References")
+    return md[idx:] if idx >= 0 else ""
 
 
-def tour_ledger(step: int):
-    """Persistent value strip that accumulates as the tour advances."""
-    _, naive5, impact5, opt5, mit5 = run_scenario(500.0, 50, 100, True)
-    items = []
-    if step >= 1:
-        items.append(("The problem", f"+${impact5.consumer_bill_delta/1e6:.0f}M consumer bills"))
-    if step >= 2:
-        _, _, twin, _ = load_twin()
-        items.append(("The proof", f"twin corr {twin.report.corr:.2f} out-of-sample"))
-    if step >= 3:
-        cut = 1 - mit5.consumer_bill_delta / impact5.consumer_bill_delta
-        items.append(("The fix", f"−{cut*100:.0f}% consumer impact"))
-    if step >= 4:
-        items.append(("Coordination", "herding peak eliminated"))
-    if step >= 5:
-        items.append(("The engine", "best strategy kept, always improving"))
-    if items:
-        st.markdown(" → ".join(f"**{k}**: {v}" for k, v in items))
-        st.divider()
+def render_project():
+    """Scrollable one-pager: thesis, problem, method, evidence, case studies."""
+    df, test, twin, iso = load_twin()
 
+    # ---- 1 · hero
+    st.header("The Grid Optimization Engine")
+    st.markdown("#### Agentic Policy Search for Flexible Load Dispatch")
+    st.markdown("""
+Re-engineering the market's nervous system with code, transparency, and classical
+verification. Electricity demand is rising for the first time in two decades — and
+because wholesale markets settle at the marginal price, **a single new demand peak
+acts as a lever on the entire system**. This project builds a digital twin calibrated
+on real market data, an optimizer that dispatches the flexibility new loads already
+have, and an agentic policy search in which AI agents write, test, and iteratively
+improve control strategies as ordinary, auditable code. We must ask two questions:
+**how much new load can the grid absorb — and what should that load do about it?**""")
 
-def render_tour():
-    step = st.session_state.setdefault("tour_step", 0)
-    persona = st.session_state.get("tour_persona", "city")
+    hb_best = recorded_home_best()
+    hb_opt = EUR_BENCH["Best possible (perfect foresight)"]
+    lad = recorded_ladder()
+    h1, h2, h3 = st.columns(3)
+    h1.metric("Twin correlation (out-of-sample)", f"{twin.report.corr:.2f}",
+              help="How well the calibrated market twin tracks prices on weeks it never saw")
+    if hb_best is not None:
+        h2.metric("Best searched policy", eur(hb_best),
+                  f"{eur(hb_best - hb_opt)} from the optimum",
+                  help="Home-battery search: best AI-written strategy vs the perfect-foresight bound")
+    else:
+        h2.metric("Best searched policy", "0.24 € from optimum",
+                  "recorded run · Jun–Aug 2026")
+    h3.metric("AI vs hand rules", f"{lad['ai_gap']:.0f}% / {lad['pfa_gap']:.0f}%",
+              "of the optimality gap closed (data-center problem)")
+    st.divider()
 
-    st.progress((step + 1) / len(ACTS),
-                text=f"Act {step} of {len(ACTS)-1} — {ACTS[step]}")
-    tour_ledger(step)
+    # ---- 2 · problem
+    st.subheader("The problem: one marginal megawatt reprices the whole market")
+    pb1, pb2 = st.columns([2, 3])
+    with pb1:
+        st.markdown(f"""
+Wholesale electricity is a **marginal-price auction**: every hour, the most expensive
+plant needed sets the price *everyone* pays. Data centers and EV fleets are the
+fastest-growing new loads in decades, and a rigid gigawatt landing on the evening
+peak climbs the steep end of the supply stack — repricing that hour for every
+consumer on the grid ({iso}, real data).""")
+    with pb2:
+        stack_df = pd.DataFrame(
+            {"clearing price ($/MWh)": twin.grid_price},
+            index=pd.Index(twin.grid, name="net load (MW)"))
+        st.line_chart(stack_df, height=240, color=PALETTE["price"])
+        st.caption("The market's actual fitted supply curve — one new peak climbs the "
+                   "steep end and reprices every megawatt-hour.")
+    st.divider()
 
-    if step == 0:
-        st.title("How much new load can this grid welcome?")
-        st.caption("One year of real market data · NYISO day-ahead · every number out-of-sample")
-        p = st.radio("Who's asking?", list(PERSONAS), horizontal=True, key="tour_who")
-        st.session_state["tour_persona"] = PERSONAS[p]
-        mw = st.slider("Drop a new data center on the grid (MW)", 100, 1500, 500, 100,
-                       key="tour_mw")
-        defaults_file = ROOT / "results" / "landing_defaults.json"
-        if mw == 500 and defaults_file.exists():
-            # instant first paint: precomputed by scripts/warm_cache.py
-            _d = json.loads(defaults_file.read_text())
-            peak_delta, bill_delta, own_bill = (
-                _d["peak_price_delta"], _d["consumer_bill_delta"], _d["energy_cost"])
-        else:
-            _, naive_t, impact_t, _, _ = run_scenario(float(mw), 50, 100, False)
-            peak_delta, bill_delta, own_bill = (
-                impact_t.peak_price_delta, impact_t.consumer_bill_delta,
-                naive_t.energy_cost)
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Peak clearing-price impact", f"+${peak_delta:.0f}/MWh",
-                  "every consumer pays this hour", delta_color="inverse")
-        m2.metric("Consumer bill impact (2 weeks)",
-                  f"+${bill_delta/1e6:.0f}M",
-                  "before any intervention", delta_color="inverse")
-        m3.metric("Its own energy bill", f"${own_bill/1e6:.1f}M")
-        st.markdown("**That's the problem.** The next four screens show the proof, "
-                    "the fix, the coordination — and the engine that keeps improving it.")
+    # ---- 3 · methodology
+    st.subheader("Methodology")
+    st.markdown("**(a) The five-element modeling framework** (Powell), instantiated "
+                "here for the data-center dispatch problem:")
+    st.markdown("""
+| Element | Meaning | Data-center instantiation |
+|---|---|---|
+| **State** | all information available at time *t* | hour of day, baseline price, firm load, arriving deferrable compute, backlog + age of its oldest element, battery state of charge |
+| **Decision** | produced by a policy | (flex_serve_mw, battery_mw) — how much deferred work to run this hour, and how to move the battery |
+| **Exogenous** | known only after deciding | the price / net-load realization |
+| **Transition** | system dynamics | FIFO backlog aging with a 24 h deadline (overdue work force-served); battery dynamics with per-leg efficiency √η |
+| **Objective** | expected cumulative contribution | minimize *added system dispatch cost* — not the private bill — which is what neutralizes price impact for all consumers |
+""")
 
-    elif step == 1:
-        df, test, twin, iso = load_twin()
-        st.header("Electricity is an auction — the priciest plant sets everyone's price")
-        daily = df.set_index("time")["LMP"].resample("D").agg(["median", "max"])
-        st.line_chart(daily.rename(columns={"median": "typical day ($/MWh)",
-                                            "max": "worst hour ($/MWh)"}), height=260,
-                      color=[PALETTE["price"], PALETTE["ai"]])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Typical price", f"${df['LMP'].median():.0f}/MWh")
-        c2.metric("Worst hour this year", f"${df['LMP'].max():.0f}/MWh",
-                  f"{df['LMP'].max()/df['LMP'].median():.0f}x typical", delta_color="inverse")
-        c3.metric("Avg carbon intensity", f"{df['carbon_t_per_mwh'].mean()*1000:.0f} kg/MWh")
-        st.markdown("Scarcity hours are rare — but they set the year's economics. "
-                    "**New demand that lands in those hours is what raises everyone's bills.**")
-        st.caption(f"{iso} day-ahead prices, {YEAR_START} → {YEAR_END}. Real data, no simulation.")
+    st.markdown("**(b) The four fundamental policy classes** — implemented as "
+                "competitors, not commitments:")
+    c_pfa, c_cfa, c_vfa, c_dla = st.columns(4)
+    with c_pfa:
+        st.markdown("##### ✅ PFA")
+        st.markdown("Policy-function approximation — implemented twice: hand-written "
+                    "threshold rules **and** the AI-written policies of the agentic search.")
+    with c_cfa:
+        st.markdown("##### ⬜ CFA")
+        st.markdown("Cost-function approximation — future work.")
+    with c_vfa:
+        st.markdown("##### ⬜ VFA")
+        st.markdown("Value-function approximation — future work.")
+    with c_dla:
+        st.markdown("##### ✅ DLA")
+        st.markdown("Direct lookahead — the perfect-foresight LP that bounds every "
+                    "other policy.")
+    st.markdown("*The optimizer stays in the loop as competitor, bound, and verifier.*")
 
-    elif step == 2:
-        df, test, twin, iso = load_twin()
-        st.header("First, earn the right to say “what if” — the digital twin")
-        pred = twin.predict(test["net_load_mw"].values, test["time"])
-        st.line_chart(pd.DataFrame({"actual price ($/MWh)": test["LMP"].values,
-                                    "twin's price ($/MWh)": pred},
-                                   index=test["time"]), height=260,
-                      color=[PALETTE["grid"], PALETTE["price"]])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Correlation (held-out)", f"{twin.report.corr:.2f}")
-        c2.metric("Typical error", f"${twin.report.mae:.0f}/MWh")
-        c3.metric("Trained on", f"{twin.report.n_train:,} hours")
-        st.markdown("The twin rebuilds the market's supply curve from public data — and is "
-                    "graded on **weeks it never saw**. Only because it tracks reality do the "
-                    "counterfactuals that follow mean anything.")
-        st.caption("Isotonic merit-order reconstruction; scarcity hours are where the error concentrates — shown, not hidden.")
+    st.markdown("**(c) The architecture we implement and extend:**")
+    st.image(str(ROOT / "assets/aps_fig1_architecture.png"),
+             caption="Fig. 1 of Sommer, Bazan, Babaeian, Fellerer, Powell & German, "
+                     "'Adaptive Self-Improvement for Smarter Energy Systems using "
+                     "Agentic Policy Search' — the three-level architecture this "
+                     "project implements and extends. Reproduced for attribution.")
+    st.divider()
 
-    elif step == 3:
-        st.header("The fix: dispatch the flexibility the load already has")
-        fx1, fx2 = st.columns(2)
-        flex = fx1.slider("Share of compute that can wait up to 24 h", 0, 80, 50, 10,
-                          key="tour_flex", format="%d%%")
-        batt = fx2.slider("Battery size (MW)", 0, 300, 100, 50, key="tour_batt")
-        _, naive_f, impact_f, opt_f, mit_f = run_scenario(500.0, flex, batt, True)
-        l1, l2, l3 = st.columns(3)
-        l1.metric("Do nothing", f"+${impact_f.consumer_bill_delta/1e6:.0f}M",
-                  "consumer bills", delta_color="off")
-        l2.metric("Dispatch its flexibility", f"+${mit_f.consumer_bill_delta/1e6:.0f}M",
-                  f"−{(1-mit_f.consumer_bill_delta/impact_f.consumer_bill_delta)*100:.0f}% consumer impact")
-        l3.metric("Its own bill", f"${opt_f.energy_cost/1e6:.1f}M",
-                  f"−{(1-opt_f.energy_cost/naive_f.energy_cost)*100:.0f}% vs rigid")
-        st.markdown(f"**{TAKEAWAYS[3][st.session_state.get('tour_persona','city')]}**")
-        st.caption("Optimal lookahead dispatch (LP) on the calibrated twin; same compute served, different hours.")
+    # ---- 4 · evidence
+    st.subheader("Evidence: our replication of the paper's search")
+    ev1, ev2 = st.columns(2)
+    with ev1:
+        st.image(str(ROOT / "results/run1/figures/fig2_cost_evolution.png"),
+                 caption="OUR replication run — cost evolution across ten independent "
+                         "searches: the best attempt is near-optimal within 3 rounds.")
+    with ev2:
+        st.image(str(ROOT / "results/run1/figures/fig3_best_policy.png"),
+                 caption="OUR replication run — the best policy found. The median "
+                         "attempt diverges with a small code model, which is exactly "
+                         "why the loop always keeps the best-so-far strategy.")
+    st.divider()
 
-    elif step == 4:
-        st.header("One grid, many good intentions — why coordination is the product")
-        co = run_coordination(50_000, 500, 0, 4)
-        st.line_chart(pd.DataFrame({
-            "baseline net load (MW)": co["base"],
-            "everyone selfish, herding (MW)": co["selfish_net"],
-            "coordinated (MW)": co["joint_net"]}, index=co["times"]), height=280,
-                      color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Selfish peak", f"{co['selfish_net'].max():,.0f} MW",
-                  f"+{co['selfish_net'].max()-co['base'].max():,.0f} MW rebound",
-                  delta_color="inverse")
-        r2.metric("Coordinated peak", f"{co['joint_net'].max():,.0f} MW",
-                  f"{co['joint_net'].max()-co['base'].max():+,.0f} MW vs baseline")
-        r3.metric("Negotiation", f"{len(co['rounds'])} rounds",
-                  f"peak ${co['rounds'][0]['peak_price']:.0f} → ${co['rounds'][-1]['peak_price']:.0f}/MWh")
-        st.markdown(f"**{TAKEAWAYS[4][st.session_state.get('tour_persona','city')]}**")
-        st.caption("50,000 home batteries + the 500 MW data center on the year's worst 3 days; three solved regimes.")
+    # ---- 5 · case study 1: home battery
+    st.subheader("Case study 1 — Home battery (€, lab bench)")
+    st.markdown("**Setup:** a 10 kWh battery, 5 kWp rooftop PV, one simulated week on "
+                "a dynamic tariff.")
+    if hb_best is not None:
+        st.markdown(f"**Result:** 10/10 independent searches found a profitable "
+                    f"strategy within 3 rounds; the best reached **{eur(hb_best)}** "
+                    f"against the {eur(hb_opt)} perfect-foresight bound.")
+    else:
+        st.markdown("**Result:** 10/10 searches profitable within 3 rounds; best "
+                    "−6.08 € vs the −6.32 € perfect-foresight bound "
+                    "*(recorded run · Jun–Aug 2026)*.")
+    st.caption("→ replay it round by round in 🔬 Lab")
+    st.divider()
 
-    elif step == 5:
-        st.header("The engine keeps improving — and shows its work")
-        lad = recorded_ladder()
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Do nothing", f"${lad['naive']/1e6:.1f}M", "added system cost",
-                  delta_color="off")
-        s2.metric("AI-written rules", f"${lad['ai']/1e6:.1f}M",
-                  f"closed {lad['ai_gap']:.0f}% of the gap")
-        s3.metric("Hand-written rules", f"${lad['pfa']/1e6:.1f}M",
-                  f"closed {lad['pfa_gap']:.0f}%")
-        s4.metric("Optimizer (bound)", f"${lad['dla']/1e6:.1f}M", "100% — kept in the loop")
-        st.markdown("""
-AI agents **write strategies as plain code**, a simulator scores them, a coach decides
-*refine or rethink* — and the best strategy is always kept. Where classical optimization
-wins, the scoreboard says so; that honesty is the design.
-**Next:** open a 🔴 Live Lab to watch a search happen, or 🔍 Under the hood for every
-prompt and transcript.""")
-        st.caption("Recorded searches; every round, prompt, and score archived and replayable in this app.")
+    # ---- 6 · case study 2: data center
+    st.subheader("Case study 2 — Data center (\\$, field)")
+    ladder_df = pd.DataFrame(
+        {"added system cost ($M)": [lad["naive"]/1e6, lad["ai"]/1e6,
+                                    lad["pfa"]/1e6, lad["dla"]/1e6]},
+        index=["Do nothing", "AI-written rules", "Hand-written rules",
+               "Perfect foresight (bound)"])
+    st.bar_chart(ladder_df, horizontal=True, height=260, color=[PALETTE["dc"]])
+    st.markdown(f"**The honest finding:** the AI's reactive rules closed "
+                f"{lad['ai_gap']:.0f}% of the optimality gap — hand-written rules "
+                f"closed {lad['pfa_gap']:.0f}% — and both plateau above the optimizer: "
+                "timing a 24-hour backlog against price spikes needs foresight a "
+                "simple rule can't express. That is exactly why the engine keeps a "
+                "classical optimizer in the room and lets the scoreboard pick the winner.")
+    st.caption("→ explore it interactively in 🧭 Explore")
+    st.divider()
 
-    nav_l, _, nav_r = st.columns([1, 4, 1])
-    if step > 0 and nav_l.button("← Back", key="tour_back"):
-        st.session_state["tour_step"] = step - 1
-        st.rerun()
-    if step < len(ACTS) - 1 and nav_r.button("Next →", type="primary", key="tour_next"):
-        st.session_state["tour_step"] = step + 1
-        st.rerun()
+    # ---- footer
+    wp_pdf = ROOT / "docs" / "whitepaper.pdf"
+    if wp_pdf.exists():
+        st.download_button("Download the white paper (PDF)", data=wp_pdf.read_bytes(),
+                           file_name="grid_optimization_engine_whitepaper.pdf")
+    refs = _whitepaper_references()
+    if refs:
+        with st.expander("References"):
+            st.markdown(refs)
 
 
 # ================================================================ 🛰 mission control
@@ -1604,13 +1591,35 @@ LAB_PAGES = {
     "🔍 Under the hood": render_hood,
 }
 
-with t_tour:
-    render_tour()
+with t_project:
+    render_project()
 
 with t_pitch:
     render_pitch()
 
 with t_explore:
+    st.subheader("How much new load can this grid welcome?")
+    st.caption("One year of real market data · NYISO day-ahead · every number out-of-sample")
+    dial_mw = st.slider("Drop a new data center on the grid (MW)", 100, 1500, 500, 100,
+                        key="explore_mw")
+    _defaults_file = ROOT / "results" / "landing_defaults.json"
+    if dial_mw == 500 and _defaults_file.exists():
+        # instant first paint: precomputed by scripts/warm_cache.py
+        _d = json.loads(_defaults_file.read_text())
+        _peak_delta, _bill_delta, _own_bill = (
+            _d["peak_price_delta"], _d["consumer_bill_delta"], _d["energy_cost"])
+    else:
+        _, _naive_t, _impact_t, _, _ = run_scenario(float(dial_mw), 50, 100, False)
+        _peak_delta, _bill_delta, _own_bill = (
+            _impact_t.peak_price_delta, _impact_t.consumer_bill_delta,
+            _naive_t.energy_cost)
+    dm1, dm2, dm3 = st.columns(3)
+    dm1.metric("Peak clearing-price impact", f"+${_peak_delta:.0f}/MWh",
+               "every consumer pays this hour", delta_color="inverse")
+    dm2.metric("Consumer bill impact (2 weeks)", f"+${_bill_delta/1e6:.0f}M",
+               "before any intervention", delta_color="inverse")
+    dm3.metric("Its own energy bill", f"${_own_bill/1e6:.1f}M")
+    st.divider()
     explore_pick = st.selectbox("Where to?", list(EXPLORE_PAGES), key="explore_pick")
     EXPLORE_PAGES[explore_pick]()
 
