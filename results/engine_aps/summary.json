@@ -1,0 +1,46 @@
+{
+  "baselines_usd": {
+    "naive": 14878858,
+    "pfa": 13299494,
+    "dla": 12019506
+  },
+  "episodes": [
+    {
+      "ep": "episode_01",
+      "best_usd": 14360351,
+      "best_iter": 0,
+      "iterations_done": 6
+    },
+    {
+      "ep": "episode_02",
+      "best_usd": 14523351,
+      "best_iter": 1,
+      "iterations_done": 6
+    },
+    {
+      "ep": "episode_03",
+      "best_usd": 14098257,
+      "best_iter": 4,
+      "iterations_done": 5
+    },
+    {
+      "ep": "episode_04",
+      "best_usd": 14296269,
+      "best_iter": 0,
+      "iterations_done": 5
+    },
+    {
+      "ep": "episode_05",
+      "best_usd": 14280854,
+      "best_iter": 0,
+      "iterations_done": 5
+    }
+  ],
+  "best_llm_policy_usd": 14098257,
+  "gap_closure_pct": {
+    "llm_best": 27.3,
+    "hand_pfa": 55.2,
+    "dla_lp": 100.0
+  },
+  "stopped_early": "after 5-6 of 10 iterations per episode; no best-cost improvement trend (stagnation), conclusion stable"
+}
