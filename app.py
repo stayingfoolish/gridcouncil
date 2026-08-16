@@ -2,14 +2,12 @@
 
     streamlit run app.py
 
-Information architecture (story-first, live separated):
-  1. The problem            — shared opening: the marginal-price auction, real data
-  2. Story: Home battery    — precomputed narrative (simulated week, EUR)
-  3. Story: Data center     — precomputed narrative + interactive scenario (real NYISO, USD)
-  4. How the agents talk    — the coach / strategy-writer / twin message loop
-  5. Live Lab: Home         — kick off APS on the home battery, watch it deliberate
-  6. Live Lab: Data center  — kick off APS on the dispatch problem, watch it deliberate
-  7. Under the hood         — prompts, data, logs, verbatim transcripts
+Information architecture (four top-level tabs):
+  🎯 Tour     — guided five-act walkthrough (default)
+  🎤 Pitch    — presenter mode: keyboard-free screens from recorded data
+  🧭 Explore  — Mission Control, the problem, both stories, coordination,
+                Today, Who pays (picked via a selector inside the tab)
+  🔬 Lab      — How the agents talk, both Live Labs, Under the hood
 """
 
 import json
@@ -439,16 +437,11 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_today, t_who, t_agents,
- t_live_home, t_live_dc, t_hood) = st.tabs([
-    "🎯 Tour", "🛰 Mission Control",
-    "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
-    "4 · 🌊 2035: Why coordination", "4b · 🧘 Today: The calm story",
-    "4c · ⚖️ Who pays?", "5 · 🤝 How the agents talk",
-    "🔴 Live Lab: Home", "🔴 Live Lab: Data center", "🔍 Under the hood"])
+t_tour, t_pitch, t_explore, t_lab = st.tabs(
+    ["🎯 Tour", "🎤 Pitch", "🧭 Explore", "🔬 Lab"])
 
 # ---------------------------------------------------------------- the problem
-with t_prob:
+def render_problem():
     df, test, twin, iso = load_twin()
     left, right = st.columns([3, 2])
     with left:
@@ -500,7 +493,7 @@ and a calibrated twin of the market keeps the score.""")
         st.warning(f"Map data unavailable ({e}); the price chart above tells the same story.")
 
 # ---------------------------------------------------------------- home story
-with t_home:
+def render_home():
     st.subheader("🏠 A home with solar and a battery — can an AI learn to run it?")
     st.markdown("""
 **The problem.** A family has rooftop solar (5 kW), a 10 kWh battery, and a dynamic
@@ -545,7 +538,7 @@ score as feedback.
     replay_ui(euro_runs(), "home")
 
 # ---------------------------------------------------------------- dc story
-with t_dc:
+def render_dc():
     st.subheader("🏢 A 500 MW data center wants to connect — what happens to everyone's bill?")
     st.markdown("""
 **The problem.** AI data centers are the fastest-growing load on the grid. A 500 MW campus
@@ -715,7 +708,7 @@ def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: in
     return out
 
 
-with t_coord:
+def render_coord():
     st.subheader("🌊 Fast-forward the grid — when everyone's flexibility collides")
     st.markdown("""
 **Today, flexible actors are too small to hurt each other** (see the 🧘 Today tab). But
@@ -791,7 +784,7 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
             "Labs plug in.")
 
 # ---------------------------------------------------------------- agents
-with t_agents:
+def render_agents():
 
     st.markdown("### 🎬 Demo theater — a real search, replayed on loop")
     if st.toggle("Run the theater (auto-advances every few seconds; loops forever)"):
@@ -913,7 +906,7 @@ conversation *is* the record. (See 🔍 Under the hood for the verbatim transcri
                 "the original recorded runs predate full event logging.")
 
 # ---------------------------------------------------------------- live labs
-with t_live_home:
+def render_live_home():
     st.subheader("🔴 Live Lab — home battery")
     live_lab({"name": "home battery (one simulated week, score in €)",
               "driver": "experiments/driver.py", "prefix": "bliv_",
@@ -921,7 +914,7 @@ with t_live_home:
               "best_label": "Best possible", "default_ep": 2, "default_it": 6},
              "lh")
 
-with t_live_dc:
+def render_live_dc():
     st.subheader("🔴 Live Lab — data center dispatch")
     live_lab({"name": "data-center dispatch problem (real market weeks, score in $M)",
               "driver": "experiments/driver2.py", "prefix": "live_",
@@ -930,7 +923,7 @@ with t_live_dc:
              "ld")
 
 # ---------------------------------------------------------------- under the hood
-with t_hood:
+def render_hood():
     st.subheader("Full transparency: prompts, data, and logs")
     sec = st.radio("What do you want to inspect?",
                    ["Prompt templates", "Initial data & assumptions", "Run logs & transcripts"],
@@ -1070,7 +1063,7 @@ def tour_ledger(step: int):
         st.divider()
 
 
-with t_tour:
+def render_tour():
     step = st.session_state.setdefault("tour_step", 0)
     persona = st.session_state.get("tour_persona", "city")
 
@@ -1187,7 +1180,7 @@ prompt and transcript.""")
 
 
 # ================================================================ 🛰 mission control
-with t_mission:
+def render_mission():
     df_m, test_m, twin_m, iso_m = load_twin()
     ctrl, center, ledger = st.columns([1, 3, 1], gap="medium")
 
@@ -1256,7 +1249,7 @@ with t_mission:
 
 
 # ---------------------------------------------------------------- today (calm)
-with t_today:
+def render_today():
     st.subheader("🧘 Today's grid — the calm, honest story")
     st.markdown("""
 Run **today's actual fleet sizes** through the same three regimes and the drama vanishes —
@@ -1308,7 +1301,7 @@ def year_smoothing(mw: float, flex_pct: int, batt_mw: int):
     daily = out.groupby("date").max()
     return daily
 
-with t_who:
+def render_who():
     st.subheader("⚖️ Who pays? Two neighborhoods and one data center")
     era_w = st.radio("Scale", ["Today (50k battery homes, 500 MW DC)",
                                "2035 (1M battery homes, 3 GW DC, 4M EVs)"],
@@ -1354,3 +1347,40 @@ with t_who:
                "500 MW data center, green = the same data center dispatched by threshold rules "
                "(the fast policy — the LP does better still). Bars: the 15 days where dispatch "
                "shaved the most off the peak.")
+
+
+# ================================================================ 🎤 pitch
+def render_pitch():
+    st.caption("Presenter mode is coming in the next act — for now, take the 🎯 Tour.")
+
+
+# ================================================================ dispatch
+EXPLORE_PAGES = {
+    "🛰 Mission Control": render_mission,
+    "1 · The problem": render_problem,
+    "2 · 🏠 Story: Home battery": render_home,
+    "3 · 🏢 Story: Data center": render_dc,
+    "4 · 🌊 2035: Why coordination": render_coord,
+    "4b · 🧘 Today: The calm story": render_today,
+    "4c · ⚖️ Who pays?": render_who,
+}
+LAB_PAGES = {
+    "🤝 How the agents talk (+ demo theater)": render_agents,
+    "🔴 Live Lab: Home": render_live_home,
+    "🔴 Live Lab: Data center": render_live_dc,
+    "🔍 Under the hood": render_hood,
+}
+
+with t_tour:
+    render_tour()
+
+with t_pitch:
+    render_pitch()
+
+with t_explore:
+    explore_pick = st.selectbox("Where to?", list(EXPLORE_PAGES), key="explore_pick")
+    EXPLORE_PAGES[explore_pick]()
+
+with t_lab:
+    lab_pick = st.selectbox("Which bench?", list(LAB_PAGES), key="lab_pick")
+    LAB_PAGES[lab_pick]()
