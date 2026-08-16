@@ -60,6 +60,13 @@ def cmd_step(args):
         resp_path = ep_dir / "response.txt"
         if st.phase != "done" and resp_path.exists():
             response = resp_path.read_text()
+            tdir = ep_dir / "transcript"
+            tdir.mkdir(exist_ok=True)
+            seq = len(list(tdir.glob("*.response.txt")))
+            prompt_file = ep_dir / "pending_prompt.txt"
+            if prompt_file.exists():
+                (tdir / f"{seq:03d}_{st.phase}.prompt.txt").write_text(prompt_file.read_text())
+            (tdir / f"{seq:03d}_{st.phase}.response.txt").write_text(response)
             resp_path.unlink()
             (ep_dir / "pending_prompt.txt").unlink(missing_ok=True)
             event = st.process_response(response)

@@ -56,6 +56,15 @@ def cmd_step(args):
         resp = ep_dir / "response.txt"
         if ep.phase != "done" and resp.exists():
             response = resp.read_text()
+            # archive the full exchange verbatim before consuming it
+            tdir = ep_dir / "transcript"
+            tdir.mkdir(exist_ok=True)
+            seq = len(list(tdir.glob("*.response.txt")))
+            phase = ep.phase
+            prompt_file = ep_dir / "pending_prompt.txt"
+            if prompt_file.exists():
+                (tdir / f"{seq:03d}_{phase}.prompt.txt").write_text(prompt_file.read_text())
+            (tdir / f"{seq:03d}_{phase}.response.txt").write_text(response)
             resp.unlink()
             (ep_dir / "pending_prompt.txt").unlink(missing_ok=True)
             print(f"{ep_dir.name}: {ep.process_response(response)}")
