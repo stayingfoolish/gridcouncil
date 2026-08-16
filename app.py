@@ -1078,14 +1078,24 @@ def render_tour():
         st.session_state["tour_persona"] = PERSONAS[p]
         mw = st.slider("Drop a new data center on the grid (MW)", 100, 1500, 500, 100,
                        key="tour_mw")
-        _, naive_t, impact_t, _, _ = run_scenario(float(mw), 50, 100, False)
+        defaults_file = ROOT / "results" / "landing_defaults.json"
+        if mw == 500 and defaults_file.exists():
+            # instant first paint: precomputed by scripts/warm_cache.py
+            _d = json.loads(defaults_file.read_text())
+            peak_delta, bill_delta, own_bill = (
+                _d["peak_price_delta"], _d["consumer_bill_delta"], _d["energy_cost"])
+        else:
+            _, naive_t, impact_t, _, _ = run_scenario(float(mw), 50, 100, False)
+            peak_delta, bill_delta, own_bill = (
+                impact_t.peak_price_delta, impact_t.consumer_bill_delta,
+                naive_t.energy_cost)
         m1, m2, m3 = st.columns(3)
-        m1.metric("Peak clearing-price impact", f"+${impact_t.peak_price_delta:.0f}/MWh",
+        m1.metric("Peak clearing-price impact", f"+${peak_delta:.0f}/MWh",
                   "every consumer pays this hour", delta_color="inverse")
         m2.metric("Consumer bill impact (2 weeks)",
-                  f"+${impact_t.consumer_bill_delta/1e6:.0f}M",
+                  f"+${bill_delta/1e6:.0f}M",
                   "before any intervention", delta_color="inverse")
-        m3.metric("Its own energy bill", f"${naive_t.energy_cost/1e6:.1f}M")
+        m3.metric("Its own energy bill", f"${own_bill/1e6:.1f}M")
         st.markdown("**That's the problem.** The next four screens show the proof, "
                     "the fix, the coordination — and the engine that keeps improving it.")
 
