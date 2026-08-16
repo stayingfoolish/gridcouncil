@@ -328,12 +328,19 @@ def live_lab(flavor: dict, keyp: str):
             pid_file.unlink(missing_ok=True)
             st.rerun()
 
-    @st.fragment(run_every="4s")
-    def live_feed():
-        if not default_dir:
+    if not default_dir:
+        # Empty state: replay the most recent recorded search instead of a bare info box.
+        recorded = flavor["runs_fn"]() if flavor.get("runs_fn") else {}
+        if recorded:
+            st.markdown("#### 🎬 Recorded search *(start a live run to replace this)*")
+            replay_ui(recorded, f"{keyp}_rec")
+        else:
             st.info("No live run yet — press **Start new run** above (or launch "
                     "`experiments/worker.py` from a terminal).")
-            return
+        return
+
+    @st.fragment(run_every="4s")
+    def live_feed():
         live_dir = ROOT / default_dir
         st.caption(f"Watching `{live_dir.name}`")
         ev_file = live_dir / "events.jsonl"
@@ -960,7 +967,8 @@ def render_live_home():
     live_lab({"name": "home battery (one simulated week, score in €)",
               "driver": "experiments/driver.py", "prefix": "bliv_",
               "unit": "€", "scale": 1.0, "naive_label": "No battery",
-              "best_label": "Best possible", "default_ep": 2, "default_it": 6},
+              "best_label": "Best possible", "default_ep": 2, "default_it": 6,
+              "runs_fn": euro_runs},
              "lh")
 
 def render_live_dc():
@@ -968,7 +976,8 @@ def render_live_dc():
     live_lab({"name": "data-center dispatch problem (real market weeks, score in $M)",
               "driver": "experiments/driver2.py", "prefix": "live_",
               "unit": "$M", "scale": 1e6, "naive_label": "Do nothing",
-              "best_label": "Best possible", "default_ep": 2, "default_it": 6},
+              "best_label": "Best possible", "default_ep": 2, "default_it": 6,
+              "runs_fn": dollar_runs},
              "ld")
 
 # ---------------------------------------------------------------- under the hood
@@ -1420,7 +1429,8 @@ def render_who():
 
 
 # ================================================================ 🎤 pitch
-PITCH_SCREENS = ["The problem", "The proof", "The fix", "Who pays", "The engine"]
+PITCH_SCREENS = ["The problem", "The proof", "The fix", "Who pays", "The engine",
+                 "Who buys this"]
 
 
 def _pitch_landing_numbers():
@@ -1533,6 +1543,33 @@ def render_pitch():
             st.info("No recorded searches found in results/.")
         st.caption("The engine writes its own strategies, shows its work, and keeps "
                    "the best.")
+
+    elif k == 5:
+        st.header("Who buys this")
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            st.subheader("🏗 DC developers")
+            st.markdown("Stuck in multi-year interconnection queues because their load "
+                        "looks rigid to the utility.")
+            st.markdown("**Deliverable:** an interconnection-ready flexibility plan — "
+                        "the dispatch schedule, the peak impact before/after, and the "
+                        "twin-backed proof.")
+        with w2:
+            st.subheader("⚡ Utilities / DSOs")
+            st.markdown("Asked to answer *how much can we absorb, on what terms* with "
+                        "planning tools built for a static grid.")
+            st.markdown("**Deliverable:** absorption studies in an afternoon, not "
+                        "18 months — every scenario re-run on a calibrated twin.")
+        with w3:
+            st.subheader("🔋 Aggregators")
+            st.markdown("Herding thousands of batteries and EVs that all chase the "
+                        "same cheap hours — and blunt each other's value.")
+            st.markdown("**Deliverable:** coordinated dispatch that pays every member "
+                        "instead of manufacturing a new peak.")
+        st.markdown("**The wedge:** every megawatt stuck in an interconnection queue "
+                    "is a customer for the flexibility plan that gets it connected first.")
+        st.caption("Three buyers, one engine: the twin does the proving, the optimizer "
+                   "does the dispatching, the agents keep improving it.")
 
     st.divider()
     nav_b, nav_n = st.columns([1, 5])

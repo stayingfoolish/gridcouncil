@@ -16,11 +16,13 @@ the grid welcome before prices spike — and what do we do about it?**
 
 ```bash
 uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python numpy scipy matplotlib pandas scikit-learn pyarrow gridstatus streamlit anthropic
+uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python scripts/warm_cache.py   # optional: pre-warm data + landing dials
 .venv/bin/python -m streamlit run app.py
 ```
 
-Eight tabs: the problem on a full year of real market data (zonal price map,
+Four tabs — 🎯 Tour (guided), 🎤 Pitch (presenter mode), 🧭 Explore, and
+🔬 Lab — covering: the problem on a full year of real market data (zonal price map,
 hourly carbon intensity from the real fuel mix), three precomputed stories —
 a home battery in €, a 500 MW data center in $, and the flagship
 **coordination story** (a 50,000-home battery fleet and the data center
