@@ -1420,8 +1420,134 @@ def render_who():
 
 
 # ================================================================ 🎤 pitch
+PITCH_SCREENS = ["The problem", "The proof", "The fix", "Who pays", "The engine"]
+
+
+def _pitch_landing_numbers():
+    """Landing-dial numbers: precomputed JSON if present, else the cached scenario."""
+    f = ROOT / "results" / "landing_defaults.json"
+    if f.exists():
+        d = json.loads(f.read_text())
+        return d["peak_price_delta"], d["consumer_bill_delta"], d["energy_cost"]
+    _, naive, impact, _, _ = run_scenario(500.0, 50, 100, False)
+    return impact.peak_price_delta, impact.consumer_bill_delta, naive.energy_cost
+
+
 def render_pitch():
-    st.caption("Presenter mode is coming in the next act — for now, take the 🎯 Tour.")
+    """Keyboard-free presenter mode: recorded/cached data only, no live LLM calls."""
+    k = st.session_state.setdefault("pitch_step", 0)
+    st.progress((k + 1) / len(PITCH_SCREENS),
+                text=f"Screen {k + 1} of {len(PITCH_SCREENS)} — {PITCH_SCREENS[k]}")
+
+    if k == 0:
+        peak_delta, bill_delta, own_bill = _pitch_landing_numbers()
+        st.title("How much new load can this grid welcome?")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Peak clearing-price impact", f"+${peak_delta:.0f}/MWh",
+                  "every consumer pays this hour", delta_color="inverse")
+        m2.metric("Consumer bill impact (2 weeks)", f"+${bill_delta/1e6:.0f}M",
+                  "before any intervention", delta_color="inverse")
+        m3.metric("Its own energy bill", f"${own_bill/1e6:.1f}M")
+        st.caption(f"A 500 MW data center raises the peak price ${peak_delta:.0f} — "
+                   f"that's ${bill_delta/1e6:.0f}M on everyone's bills in two weeks.")
+
+    elif k == 1:
+        df, test, twin, iso = load_twin()
+        st.header("The twin is graded on weeks it never saw")
+        pred = twin.predict(test["net_load_mw"].values, test["time"])
+        st.line_chart(pd.DataFrame({"actual price ($/MWh)": test["LMP"].values,
+                                    "twin's price ($/MWh)": pred},
+                                   index=test["time"]), height=320,
+                      color=[PALETTE["grid"], PALETTE["price"]])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Correlation (held-out)", f"{twin.report.corr:.2f}")
+        c2.metric("Typical error", f"${twin.report.mae:.0f}/MWh")
+        c3.metric("Trained on", f"{twin.report.n_train:,} hours")
+        st.caption("We earned the right to say what-if: the twin is graded on weeks "
+                   "it never saw.")
+
+    elif k == 2:
+        lad = recorded_ladder()
+        st.header("The fix ladder — same compute, different hours")
+        ladder_df = pd.DataFrame({
+            "added system cost ($M)": [lad["naive"]/1e6, lad["ai"]/1e6,
+                                       lad["pfa"]/1e6, lad["dla"]/1e6]},
+            index=["Do nothing", "AI-written rules", "Hand-written rules",
+                   "Optimal (perfect foresight)"])
+        st.bar_chart(ladder_df, horizontal=True, height=300, color=[PALETTE["dc"]])
+        g1, g2 = st.columns(2)
+        g1.metric("AI-written rules", f"closed {lad['ai_gap']:.0f}% of the gap")
+        g2.metric("Hand-written rules", f"closed {lad['pfa_gap']:.0f}%")
+        st.caption("Same compute, different hours — and we keep a provable optimum "
+                   "in the loop.")
+
+    elif k == 3:
+        st.header("Who pays — two neighborhoods, one data center")
+        W = run_coordination(50_000, 500, 0, 4)
+        n_b = 50_000
+        home_mwh_mo, scale_mo = 0.7, 10.0
+        ex_mwh = float(W["existing_mw"].sum())
+        up_self = float(((W["p_selfish"] - W["p0"]) * W["existing_mw"]).sum()) / ex_mwh
+        up_joint = float(((W["p_joint"] - W["p0"]) * W["existing_mw"]).sum()) / ex_mwh
+        fleet_rev = max(float((-W["fleet_batt"] * W["p_joint"]).sum()), 0.0) / n_b
+        r1, r2, r3 = st.columns(3)
+        r1.metric("🏚 Home WITHOUT battery",
+                  f"{up_self * home_mwh_mo * scale_mo:+.2f} $/mo",
+                  f"{up_joint * home_mwh_mo * scale_mo:+.2f} $/mo if coordinated",
+                  delta_color="inverse" if up_joint > 0 else "normal")
+        r2.metric("🔋 Home WITH battery",
+                  f"{up_self * home_mwh_mo * scale_mo - fleet_rev * scale_mo:+.2f} $/mo",
+                  f"earns ${fleet_rev * scale_mo:.2f}/mo arbitrage")
+        r3.metric("🏢 The data center", "hedged", "by its own flexibility")
+        st.caption(f"The grid stops being abstract when it's "
+                   f"${abs(up_self * home_mwh_mo * scale_mo):.0f} on a monthly bill.")
+
+    elif k == 4:
+        st.header("The engine writes its own strategies — and keeps the best")
+        pitch_runs = {**dollar_runs(), **euro_runs()}
+        best_run, best_ep, arc, unit = None, None, [], "$M"
+        for name, (rdir, u, _bench) in pitch_runs.items():
+            for ep, recs in load_aps_run(rdir).items():
+                b, steps = float("inf"), []
+                for r in recs:
+                    if r["cost"] is not None and np.isfinite(r["cost"]) and r["cost"] < b:
+                        b = r["cost"]; steps.append(r)
+                if len(steps) > len(arc):
+                    best_run, best_ep, arc, unit = name, ep, steps, u
+        if arc:
+            scale = 1e6 if unit == "$M" else 1.0
+            pcol, ccol = st.columns([2, 3])
+            with pcol:
+                st.line_chart(pd.DataFrame({
+                    "improving round": range(1, len(arc) + 1),
+                    f"best so far ({unit})": [r["cost"]/scale for r in arc],
+                }).set_index("improving round"), height=260, color=[PALETTE["ai"]])
+                st.metric("Best strategy found", f"{arc[-1]['cost']/scale:,.2f} {unit}",
+                          f"{len(arc)} improving rounds — {best_ep}")
+                st.caption(f"Recorded search: {best_run}")
+            with ccol:
+                if arc[-1]["code"]:
+                    st.code("\n".join(arc[-1]["code"].splitlines()[:22]) + "\n…",
+                            language="python")
+        else:
+            st.info("No recorded searches found in results/.")
+        st.caption("The engine writes its own strategies, shows its work, and keeps "
+                   "the best.")
+
+    st.divider()
+    nav_b, nav_n = st.columns([1, 5])
+    if k > 0 and nav_b.button("← Back", key="pitch_back", use_container_width=True):
+        st.session_state["pitch_step"] = k - 1
+        st.rerun()
+    if k < len(PITCH_SCREENS) - 1:
+        if nav_n.button("Next →", type="primary", key="pitch_next",
+                        use_container_width=True):
+            st.session_state["pitch_step"] = k + 1
+            st.rerun()
+    elif nav_n.button("↺ Restart the pitch", key="pitch_restart",
+                      use_container_width=True):
+        st.session_state["pitch_step"] = 0
+        st.rerun()
 
 
 # ================================================================ dispatch
