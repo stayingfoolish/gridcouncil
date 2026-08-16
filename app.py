@@ -228,22 +228,69 @@ control strategy as code → the twin scores it against the market → a *coach*
 score and either sharpens the strategy or orders a rethink. Watch the score, and read the
 coach's calls.""")
 
-    live = st.toggle("🔴 Live mode — watch a run happening right now",
-                     help="Start one in a terminal:  python experiments/driver2.py init "
-                          "--run results/engine_live --episodes 3 --iterations 8  &&  "
-                          "python experiments/worker.py --run results/engine_live")
+    live = st.toggle("🔴 Live mode — run the AI right now and watch it deliberate")
     if live:
+        import signal
+        import subprocess
+        import time as _time
+
+        live_runs = sorted((ROOT / "results").glob("live_*")) + \
+                    ([ROOT / "results/engine_live"] if (ROOT / "results/engine_live").exists() else [])
+        default_dir = st.session_state.get("live_dir") or (str(live_runs[-1]) if live_runs else None)
+
+        cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
+        n_ep = cc1.number_input("Episodes", 1, 5, 2)
+        n_it = cc2.number_input("Rounds each", 3, 10, 6)
+        if cc3.button("🚀 Start new run", type="primary",
+                      help="Sets up the twin and launches the AI worker in the background. "
+                           "Needs an authenticated `claude` CLI or ANTHROPIC_API_KEY in the "
+                           "environment you launched streamlit from."):
+            run_name = f"results/live_{_time.strftime('%m%d_%H%M%S')}"
+            with st.spinner("Calibrating the twin and computing the benchmarks…"):
+                subprocess.run(
+                    [sys.executable, "experiments/driver2.py", "init", "--run", run_name,
+                     "--episodes", str(int(n_ep)), "--iterations", str(int(n_it))],
+                    cwd=ROOT, check=True, capture_output=True)
+            logf = open(ROOT / run_name / "worker.log", "w")
+            proc = subprocess.Popen(
+                [sys.executable, "experiments/worker.py", "--run", run_name],
+                cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            (ROOT / run_name / "worker.pid").write_text(str(proc.pid))
+            st.session_state["live_dir"] = run_name
+            st.rerun()
+        if default_dir and (Path(default_dir) if Path(default_dir).is_absolute()
+                            else ROOT / default_dir).joinpath("worker.pid").exists():
+            if cc4.button("⏹ Stop worker"):
+                pid_file = (Path(default_dir) if Path(default_dir).is_absolute()
+                            else ROOT / default_dir) / "worker.pid"
+                try:
+                    import os as _os
+                    _os.kill(int(pid_file.read_text()), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                pid_file.unlink(missing_ok=True)
+                st.rerun()
+
         @st.fragment(run_every="4s")
         def live_feed():
-            live_dir = ROOT / "results/engine_live"
+            if not default_dir:
+                st.info("No live run yet — press **Start new run** above (or launch "
+                        "`experiments/worker.py` from a terminal).")
+                return
+            live_dir = Path(default_dir) if Path(default_dir).is_absolute() else ROOT / default_dir
+            st.caption(f"Watching `{live_dir.name}`")
             ev_file = live_dir / "events.jsonl"
             if not ev_file.exists():
-                st.info("Waiting for a live run… kick one off in a terminal:")
-                st.code("python experiments/driver2.py init --run results/engine_live --episodes 3 --iterations 8\n"
-                        "python experiments/worker.py --run results/engine_live", language="bash")
+                st.info("Run starting — the first strategies are being written and scored…")
+                log = live_dir / "worker.log"
+                if log.exists():
+                    st.code(log.read_text()[-800:] or "…", language="text")
                 return
             events = [json.loads(l) for l in ev_file.read_text().splitlines()]
             bl = json.loads((live_dir / "baselines.json").read_text())
+            if not (live_dir / "worker.pid").exists():
+                st.success("Run finished — flip Live mode off to replay it round by round "
+                           "(it now appears in the recorded-runs list).")
             scores = [e for e in events if e["kind"] == "score"]
             c1, c2, c3 = st.columns(3)
             c1.metric("Rounds scored so far", len(scores))
@@ -272,6 +319,12 @@ coach's calls.""")
         st.stop()
 
     runs = {}
+    for d in sorted((ROOT / "results").glob("live_*")):
+        if (d / "baselines.json").exists() and list(d.glob("episode_*/state.json")):
+            bl = json.loads((d / "baselines.json").read_text())
+            runs[f"Live run {d.name.replace('live_', '')} — $M added system cost"] = \
+                (d, "$M", {"Do nothing": bl["naive"]/1e6, "Hand-written rules": bl["pfa"]/1e6,
+                           "Best possible (perfect foresight)": bl["dla"]/1e6})
     if (ROOT / "results/run1").exists():
         runs["Home battery (paper replication) — score in €, lower is better"] = \
             (ROOT / "results/run1", "€", EUR_BENCH)

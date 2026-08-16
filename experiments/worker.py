@@ -72,6 +72,7 @@ def main():
         if not pending:
             if step():
                 print("all episodes complete")
+                (run_dir / "worker.pid").unlink(missing_ok=True)
                 return
             time.sleep(1)
             continue
