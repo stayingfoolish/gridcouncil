@@ -415,11 +415,12 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_agents,
+(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_today, t_agents,
  t_live_home, t_live_dc, t_hood) = st.tabs([
     "🎯 Tour", "🛰 Mission Control",
     "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
-    "4 · 🌊 Story: Smoothing the spike", "5 · 🤝 How the agents talk",
+    "4 · 🌊 2035: Why coordination", "4b · 🧘 Today: The calm story",
+    "5 · 🤝 How the agents talk",
     "🔴 Live Lab: Home", "🔴 Live Lab: Data center", "🔍 Under the hood"])
 
 # ---------------------------------------------------------------- the problem
@@ -652,9 +653,10 @@ precisely. The ladder, from worst to best:""")
 
 # ---------------------------------------------------------------- coordination story
 @st.cache_data(show_spinner="Solving the three regimes (selfish, negotiated, coordinated)…")
-def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: int):
+def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: int,
+                     n_evs: int = 0):
     import numpy as _np
-    from engine.coordination import dc_actor, fleet_actor, run_scenario as _run
+    from engine.coordination import dc_actor, ev_actor, fleet_actor, run_scenario as _run
     df, test, twin, _ = load_twin()
     tail = df.iloc[-twin.report.n_test:].reset_index(drop=True)  # twin's held-out tail
     peak = int(tail["net_load_mw"].idxmax())
@@ -669,6 +671,8 @@ def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: in
         base = base + w
     hour_adj = _np.array([twin.hour_adj.get(h, 0.0) for h in win["time"].dt.hour])
     actors = [dc_actor(T, mw=float(dc_mw)), fleet_actor(T, n_homes)]
+    if n_evs:
+        actors.append(ev_actor(T, n_evs, win["time"].dt.hour.values))
     res = _run(actors, base, twin.grid, twin.grid_price, hour_adj, n_rounds=n_rounds)
     price = res["price_fn"]
     out = {
@@ -688,82 +692,79 @@ def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: in
 
 
 with t_coord:
-    st.subheader("🌊 One grid, two flexible actors — smoothing the same spike together")
+    st.subheader("🌊 Fast-forward the grid — when everyone's flexibility collides")
     st.markdown("""
-**The problem.** On the worst stretch of the year, a demand spike hits while a data center
-is connecting *and* tens of thousands of home batteries all try to be smart at once. Good
-intentions are not enough: **if everyone reacts to the same price signal independently, they
-all discharge into the same hour and all recharge in the same trough — creating a brand-new
-peak** (the herding problem). Coordination is not a nicety; it is the product.""")
+**Today, flexible actors are too small to hurt each other** (see the 🧘 Today tab). But
+electrification is compounding: home batteries, EV fleets, data-center clusters. This tab
+**fast-forwards the fleet sizes on today's real grid** and shows the moment selfish
+optimization starts manufacturing new peaks — and how coordination fixes it.""")
 
-    k1, k2, k3, k4 = st.columns(4)
-    n_homes = k1.slider("Home batteries enrolled", 10_000, 100_000, 50_000, 10_000)
-    dc_mw = k2.slider("Data center size (MW)", 200, 1000, 500, 100)
-    extra_spike = k3.slider("Extra heat-wave severity (MW)", 0, 2000, 0, 250,
-                            help="0 = the real worst 3 days as recorded; add MW to stress it further")
-    n_rounds = k4.slider("Negotiation rounds", 2, 8, 5)
+    ERAS = {
+        "2026 — today": dict(homes=50_000, dc=500, evs=200_000),
+        "2030 — the ramp": dict(homes=300_000, dc=1_500, evs=1_500_000),
+        "2035 — full electrification": dict(homes=1_000_000, dc=3_000, evs=4_000_000),
+    }
+    e1, e2, e3 = st.columns([2, 1, 1])
+    era = e1.radio("Choose an era (fleet sizes scale; the grid and prices stay 2026-real)",
+                   list(ERAS), index=2, horizontal=True)
+    extra_spike = e2.slider("Extra heat wave (MW)", 0, 2000, 0, 500)
+    n_rounds = e3.slider("Negotiation rounds", 2, 8, 5)
+    cfg = ERAS[era]
+    st.caption(f"{cfg['homes']:,} battery homes · {cfg['dc']:,} MW of data centers · "
+               f"{cfg['evs']:,} EVs charging overnight — on the real worst 3 days of our year.")
 
-    C = run_coordination(n_homes, dc_mw, extra_spike, n_rounds)
+    C = run_coordination(cfg["homes"], cfg["dc"], extra_spike, n_rounds, cfg["evs"])
+    times = pd.to_datetime(C["times"].values) if hasattr(C["times"], "values") else C["times"]
 
-    st.markdown("#### Act 1 — Everyone for themselves (herding)")
-    st.markdown("Each actor optimizes selfishly against the same forecast. Watch the peak "
-                "*grow* and a rebound appear where they all recharge:")
-    net_df = pd.DataFrame({
-        "time": C["times"],
-        "Grid alone (base)": C["base"],
-        "Selfish flexibility": C["selfish_net"],
-        "Coordinated": C["joint_net"],
-    }).set_index("time")
-    st.line_chart(net_df, height=300)
+    st.markdown("#### Act 1 — What each future *adds to* the grid, hour by hour")
+    st.markdown("Bars above zero are extra draw; below zero is relief. Watch selfish "
+                "flexibility (red) pile everything into the same cheap hours:")
+    delta_df = pd.DataFrame({
+        "Selfish (everyone alone)": C["selfish_net"] - C["base"],
+        "Coordinated": C["joint_net"] - C["base"],
+    }, index=times)
+    st.bar_chart(delta_df, height=280, color=["#e45756", "#54a24b"])
 
-    h1, h2, h3 = st.columns(3)
+    h1, h2, h3, h4 = st.columns(4)
     h1.metric("Base peak", f"{C['base'].max():,.0f} MW")
     h2.metric("Selfish peak", f"{C['selfish_net'].max():,.0f} MW",
               f"{C['selfish_net'].max() - C['base'].max():+,.0f} MW", delta_color="inverse")
     h3.metric("Coordinated peak", f"{C['joint_net'].max():,.0f} MW",
               f"{C['joint_net'].max() - C['base'].max():+,.0f} MW")
-    if C["joint_net"].max() < C["base"].max():
-        st.success(f"**The headline:** coordinated, the grid absorbs a {dc_mw} MW data "
-                   f"center and {n_homes:,} batteries — and the peak ends up "
-                   f"**{C['base'].max() - C['joint_net'].max():,.0f} MW lower than before "
-                   "anyone connected.** New demand, smaller peak.")
+    h4.metric("Peak price, selfish vs coord.",
+              f"${C['p_joint'].max():,.0f}",
+              f"{C['p_joint'].max() - C['p_selfish'].max():+,.0f} $/MWh")
 
-    st.markdown("#### Act 2 — The negotiation (watch coordination emerge)")
-    st.markdown("A coordinator re-prices the system after each round of responses; actors "
-                "adapt with damping. The peak walks down toward the coordinated bound:")
-    rounds_df = pd.DataFrame(C["rounds"]).set_index("round")
-    rounds_df["coordinated bound"] = C["joint_net"].max()
-    st.line_chart(rounds_df[["peak_mw", "coordinated bound"]], height=220)
+    st.markdown("#### Act 2 — The peak hours under a microscope")
+    pk = int(np.argmax(C["selfish_net"]))
+    lo, hi = max(0, pk - 6), min(len(C["base"]), pk + 6)
+    zoom = pd.DataFrame({
+        "Grid alone": C["base"][lo:hi],
+        "Selfish": C["selfish_net"][lo:hi],
+        "Coordinated": C["joint_net"][lo:hi],
+    }, index=[t.strftime("%a %H:%M") for t in times[lo:hi]])
+    st.bar_chart(zoom, height=260, color=["#9d9d9d", "#e45756", "#54a24b"], stack=False)
+    st.caption("Grouped bars, 12 hours around the worst selfish hour — the gap between red "
+               "and green is what coordination is worth.")
 
-    st.markdown("#### Act 3 — Who did what, and who won")
-    d1, d2 = st.columns(2)
-    with d1:
-        st.markdown("**The coordinated plan's moving parts**")
-        parts = pd.DataFrame({
-            "time": C["times"],
-            "Data center draw (MW)": C["dc_draw"],
-            "Home fleet battery (MW, − = discharging)": C["fleet_batt"],
-        }).set_index("time")
-        st.line_chart(parts, height=240)
-    with d2:
-        st.markdown("**The ledger (over these 3 days)**")
-        bill_selfish = float(((C["p_selfish"] - C["p0"]) * C["existing_mw"]).sum())
-        bill_joint = float(((C["p_joint"] - C["p0"]) * C["existing_mw"]).sum())
-        fleet_rev = float((-C["fleet_batt"] * C["p_joint"]).sum())
-        st.metric("Existing consumers, selfish flexibility",
-                  f"${bill_selfish/1e6:+.1f}M", delta_color="inverse")
-        st.metric("Existing consumers, coordinated",
-                  f"${bill_joint/1e6:+.1f}M",
-                  f"{(bill_joint - bill_selfish)/1e6:+.1f}M vs selfish")
-        st.metric("Home fleet arbitrage earnings",
-                  f"${max(fleet_rev, 0)/1e3:,.0f}k",
-                  f"≈ ${max(fleet_rev, 0)/max(n_homes,1):.2f} per home")
-        st.caption("Same physics, same actors — the only difference between the red and "
-                   "green lines is whether anyone coordinates them.")
-    st.info("**How this connects to the agents:** the negotiation above is the coordinator "
-            "layer the agent system plugs into — each actor's strategy can be a hand-built "
-            "optimizer (shown here) or an AI-written policy from the Live Labs. The "
-            "scoreboard doesn't care who wrote the strategy; it prices the outcome.")
+    st.markdown("#### Act 3 — The negotiation walks the peak down")
+    rounds_df = pd.DataFrame(C["rounds"]).set_index("round")[["peak_mw"]]
+    rounds_df.loc["bound"] = C["joint_net"].max()
+    st.bar_chart(rounds_df.rename(columns={"peak_mw": "system peak (MW)"}), height=220,
+                 color=["#4c78a8"])
+
+    bill_selfish = float(((C["p_selfish"] - C["p0"]) * C["existing_mw"]).sum())
+    bill_joint = float(((C["p_joint"] - C["p0"]) * C["existing_mw"]).sum())
+    l1, l2 = st.columns(2)
+    l1.metric("Existing consumers pay (selfish)", f"${bill_selfish/1e6:+.1f}M",
+              "over these 3 days", delta_color="inverse")
+    l2.metric("Existing consumers pay (coordinated)", f"${bill_joint/1e6:+.1f}M",
+              f"{(bill_joint - bill_selfish)/1e6:+.1f}M vs selfish")
+    st.info("**Honest frame:** fleet sizes are projected; the grid, its prices, and its "
+            "worst days are real 2026 data. System base load is held at today's level, so "
+            "this isolates one variable — what synchronized flexibility does at scale. "
+            "The negotiation layer is exactly where the agent strategies from the Live "
+            "Labs plug in.")
 
 # ---------------------------------------------------------------- agents
 with t_agents:
@@ -1151,3 +1152,39 @@ with t_mission:
 | **AI-written rules** | **$14.1M** | **27%** |
 | Hand-written rules | $13.3M | 55% |
 | Optimizer (bound) | $12.0M | 100% |""")
+
+
+# ---------------------------------------------------------------- today (calm)
+with t_today:
+    st.subheader("🧘 Today's grid — the calm, honest story")
+    st.markdown("""
+Run **today's actual fleet sizes** through the same three regimes and the drama vanishes —
+and that's the finding, not a failure: **at 2026 scale, the overnight valley is so deep that
+the grid absorbs everyone's flexibility, selfish or coordinated.**""")
+
+    Ct = run_coordination(50_000, 500, 0, 4)
+    times_t = pd.to_datetime(Ct["times"].values) if hasattr(Ct["times"], "values") else Ct["times"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("What all actors add at the peak",
+              f"{(Ct['selfish_net'] - Ct['base'])[np.argmax(Ct['base'])]:+,.0f} MW",
+              "on a ~20,000 MW system")
+    c2.metric("Peak price change", f"${Ct['p_selfish'].max() - Ct['p0'].max():+,.0f}/MWh",
+              "selfish vs baseline")
+    c3.metric("Overnight headroom", f"{Ct['base'].max() - Ct['base'].min():,.0f} MW",
+              "the valley everyone recharges into")
+
+    st.markdown("#### Everything they add fits in the valley")
+    fit_df = pd.DataFrame({
+        "Grid load (MW)": Ct["base"],
+        "All flexibility, selfish (MW added)": Ct["selfish_net"] - Ct["base"],
+    }, index=times_t)
+    st.bar_chart(fit_df, height=280, color=["#9d9d9d", "#e45756"])
+    st.caption("Gray bars: the real grid over its worst 3 days. Red bars: everything "
+               "today's data center + 50,000 home batteries add or shift. The red never "
+               "reaches the gray peaks — it hides in the valley.")
+
+    st.success("**Why this matters:** (1) Today, interconnection fear is mostly about *rigid* "
+               "load at the peak — flexible load is easy to absorb. (2) The herding problem "
+               "is real but *ahead of us* — open the 🌊 2035 tab to see when it arrives. "
+               "Coordination is infrastructure you build *before* you need it.")

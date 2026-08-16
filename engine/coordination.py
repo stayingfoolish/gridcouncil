@@ -31,6 +31,7 @@ class Actor:
     batt_mwh: float
     batt_mw: float
     eta: float                     # per-leg efficiency
+    max_serve_mw: float = 0.0      # cap on flex service rate (0 = auto)
 
 
 def dc_actor(T: int, mw: float = 500.0, flex_frac: float = 0.5,
@@ -47,6 +48,17 @@ def fleet_actor(T: int, n_homes: int = 50_000, batt_kwh: float = 13.5,
     return Actor(f"{n_homes:,} home batteries", np.zeros(T), np.zeros(T), 24,
                  n_homes * batt_kwh / 1000.0, n_homes * batt_kw / 1000.0,
                  float(np.sqrt(0.90)))
+
+
+def ev_actor(T: int, n_evs: int, hours: np.ndarray,
+             kwh_per_day: float = 10.0, window_h: int = 12) -> Actor:
+    """Aggregated EV fleet: each day's charging energy arrives as deferrable
+    load at 18:00 and must be served within the overnight window."""
+    flex = np.zeros(T)
+    flex[np.asarray(hours) == 18] = n_evs * kwh_per_day / 1000.0  # MWh -> MW-h
+    # diversified fleet charging capacity: ~2 kW average per plugged-in EV
+    return Actor(f"{n_evs:,} EVs", np.zeros(T), flex, window_h, 0.0, 0.0, 1.0,
+                 max_serve_mw=n_evs * 2.0 / 1000.0)
 
 
 @dataclass
@@ -96,7 +108,8 @@ def price_taker_lp(actor: Actor, prices: np.ndarray) -> Dispatch:
         b_ub[r] = actor.batt_mwh / 2.0
         r += 1
 
-    bounds = ([(0, float(max(actor.flex_mw.max() * 4, 1e-6)))] * T
+    s_cap = actor.max_serve_mw or max(actor.flex_mw.max() * 4, 1e-6)
+    bounds = ([(0, float(s_cap))] * T
               + [(0, actor.batt_mw)] * 2 * T)
     res = linprog(cost, A_ub=A_ub.tocsr(), b_ub=b_ub, A_eq=A_eq.tocsr(),
                   b_eq=b_eq, bounds=bounds, method="highs")
@@ -168,7 +181,8 @@ def joint_lp(actors: list, base_net: np.ndarray, stack_x: np.ndarray,
 
     bounds = []
     for a in actors:
-        bounds += ([(0, float(max(a.flex_mw.max() * 4, 1e-6)))] * T
+        s_cap = a.max_serve_mw or max(a.flex_mw.max() * 4, 1e-6)
+        bounds += ([(0, float(s_cap))] * T
                    + [(0, a.batt_mw)] * 2 * T)
     bounds += [(0, w) for _ in range(T) for w in widths]
 
