@@ -415,7 +415,9 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-(t_prob, t_home, t_dc, t_coord, t_agents, t_live_home, t_live_dc, t_hood) = st.tabs([
+(t_tour, t_mission, t_prob, t_home, t_dc, t_coord, t_agents,
+ t_live_home, t_live_dc, t_hood) = st.tabs([
+    "🎯 Tour", "🛰 Mission Control",
     "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
     "4 · 🌊 Story: Smoothing the spike", "5 · 🤝 How the agents talk",
     "🔴 Live Lab: Home", "🔴 Live Lab: Data center", "🔍 Under the hood"])
@@ -921,3 +923,231 @@ with t_hood:
         else:
             st.info("This run predates transcript archiving — prompts/responses were consumed "
                     "in place. Every run started from now on keeps the full verbatim transcript.")
+
+
+# ================================================================ 🎯 guided tour
+ACTS = ["Welcome", "The problem", "The proof", "The fix", "The coordination",
+        "The engine"]
+PERSONAS = {
+    "🏛 I run a city": "city",
+    "🏢 I run a data center": "dc",
+    "⚡ I operate the grid": "grid",
+    "🔧 Show me the engineering": "eng",
+}
+
+TAKEAWAYS = {  # act -> persona -> one-line takeaway
+    3: {"city": "Your residents' bills don't have to rise for the grid to grow.",
+        "dc": "Flexibility cuts your energy bill ~20% **and** is your fastest path through interconnection.",
+        "grid": "The interconnection request can be absorbed without firing peakers — here's the dispatch proof.",
+        "eng": "The LP closes 100% of the achievable gap by construction; every other policy is scored against it."},
+    4: {"city": "Coordinated flexibility protects every consumer — not just the flexible ones.",
+        "dc": "Joining the coordination pool makes your interconnection case stronger than going alone.",
+        "grid": "Price signals alone recover most of the coordination value — no direct control needed.",
+        "eng": "Damped best-response against the repriced stack converges in a handful of rounds."},
+}
+
+
+def tour_ledger(step: int):
+    """Persistent value strip that accumulates as the tour advances."""
+    _, naive5, impact5, opt5, mit5 = run_scenario(500.0, 50, 100, True)
+    items = []
+    if step >= 1:
+        items.append(("The problem", f"+${impact5.consumer_bill_delta/1e6:.0f}M consumer bills"))
+    if step >= 2:
+        _, _, twin, _ = load_twin()
+        items.append(("The proof", f"twin corr {twin.report.corr:.2f} out-of-sample"))
+    if step >= 3:
+        cut = 1 - mit5.consumer_bill_delta / impact5.consumer_bill_delta
+        items.append(("The fix", f"−{cut*100:.0f}% consumer impact"))
+    if step >= 4:
+        items.append(("Coordination", "herding peak eliminated"))
+    if step >= 5:
+        items.append(("The engine", "best strategy kept, always improving"))
+    if items:
+        st.markdown(" → ".join(f"**{k}**: {v}" for k, v in items))
+        st.divider()
+
+
+with t_tour:
+    step = st.session_state.setdefault("tour_step", 0)
+    persona = st.session_state.get("tour_persona", "city")
+
+    st.progress((step + 1) / len(ACTS),
+                text=f"Act {step} of {len(ACTS)-1} — {ACTS[step]}")
+    tour_ledger(step)
+
+    if step == 0:
+        st.title("How much new load can this grid welcome?")
+        st.caption("One year of real market data · NYISO day-ahead · every number out-of-sample")
+        p = st.radio("Who's asking?", list(PERSONAS), horizontal=True, key="tour_who")
+        st.session_state["tour_persona"] = PERSONAS[p]
+        mw = st.slider("Drop a new data center on the grid (MW)", 100, 1500, 500, 100,
+                       key="tour_mw")
+        _, naive_t, impact_t, _, _ = run_scenario(float(mw), 50, 100, False)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Peak clearing-price impact", f"+${impact_t.peak_price_delta:.0f}/MWh",
+                  "every consumer pays this hour", delta_color="inverse")
+        m2.metric("Consumer bill impact (2 weeks)",
+                  f"+${impact_t.consumer_bill_delta/1e6:.0f}M",
+                  "before any intervention", delta_color="inverse")
+        m3.metric("Its own energy bill", f"${naive_t.energy_cost/1e6:.1f}M")
+        st.markdown("**That's the problem.** The next four screens show the proof, "
+                    "the fix, the coordination — and the engine that keeps improving it.")
+
+    elif step == 1:
+        df, test, twin, iso = load_twin()
+        st.header("Electricity is an auction — the priciest plant sets everyone's price")
+        daily = df.set_index("time")["LMP"].resample("D").agg(["median", "max"])
+        st.line_chart(daily.rename(columns={"median": "typical day ($/MWh)",
+                                            "max": "worst hour ($/MWh)"}), height=260)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Typical price", f"${df['LMP'].median():.0f}/MWh")
+        c2.metric("Worst hour this year", f"${df['LMP'].max():.0f}/MWh",
+                  f"{df['LMP'].max()/df['LMP'].median():.0f}x typical", delta_color="inverse")
+        c3.metric("Avg carbon intensity", f"{df['carbon_t_per_mwh'].mean()*1000:.0f} kg/MWh")
+        st.markdown("Scarcity hours are rare — but they set the year's economics. "
+                    "**New demand that lands in those hours is what raises everyone's bills.**")
+        st.caption(f"{iso} day-ahead prices, {YEAR_START} → {YEAR_END}. Real data, no simulation.")
+
+    elif step == 2:
+        df, test, twin, iso = load_twin()
+        st.header("First, earn the right to say “what if” — the digital twin")
+        pred = twin.predict(test["net_load_mw"].values, test["time"])
+        st.line_chart(pd.DataFrame({"actual price": test["LMP"].values,
+                                    "twin's price": pred},
+                                   index=test["time"]), height=260)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Correlation (held-out)", f"{twin.report.corr:.2f}")
+        c2.metric("Typical error", f"${twin.report.mae:.0f}/MWh")
+        c3.metric("Trained on", f"{twin.report.n_train:,} hours")
+        st.markdown("The twin rebuilds the market's supply curve from public data — and is "
+                    "graded on **weeks it never saw**. Only because it tracks reality do the "
+                    "counterfactuals that follow mean anything.")
+        st.caption("Isotonic merit-order reconstruction; scarcity hours are where the error concentrates — shown, not hidden.")
+
+    elif step == 3:
+        st.header("The fix: dispatch the flexibility the load already has")
+        fx1, fx2 = st.columns(2)
+        flex = fx1.slider("Share of compute that can wait up to 24 h", 0, 80, 50, 10,
+                          key="tour_flex", format="%d%%")
+        batt = fx2.slider("Battery size (MW)", 0, 300, 100, 50, key="tour_batt")
+        _, naive_f, impact_f, opt_f, mit_f = run_scenario(500.0, flex, batt, True)
+        l1, l2, l3 = st.columns(3)
+        l1.metric("Do nothing", f"+${impact_f.consumer_bill_delta/1e6:.0f}M",
+                  "consumer bills", delta_color="off")
+        l2.metric("Dispatch its flexibility", f"+${mit_f.consumer_bill_delta/1e6:.0f}M",
+                  f"−{(1-mit_f.consumer_bill_delta/impact_f.consumer_bill_delta)*100:.0f}% consumer impact")
+        l3.metric("Its own bill", f"${opt_f.energy_cost/1e6:.1f}M",
+                  f"−{(1-opt_f.energy_cost/naive_f.energy_cost)*100:.0f}% vs rigid")
+        st.markdown(f"**{TAKEAWAYS[3][st.session_state.get('tour_persona','city')]}**")
+        st.caption("Optimal lookahead dispatch (LP) on the calibrated twin; same compute served, different hours.")
+
+    elif step == 4:
+        st.header("One grid, many good intentions — why coordination is the product")
+        co = run_coordination(50_000, 500, 0, 4)
+        st.line_chart(pd.DataFrame({
+            "baseline net load (MW)": co["base"],
+            "everyone selfish (herding)": co["selfish_net"],
+            "coordinated": co["joint_net"]}, index=co["times"]), height=280)
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Selfish peak", f"{co['selfish_net'].max():,.0f} MW",
+                  f"+{co['selfish_net'].max()-co['base'].max():,.0f} MW rebound",
+                  delta_color="inverse")
+        r2.metric("Coordinated peak", f"{co['joint_net'].max():,.0f} MW",
+                  f"{co['joint_net'].max()-co['base'].max():+,.0f} MW vs baseline")
+        r3.metric("Negotiation", f"{len(co['rounds'])} rounds",
+                  f"peak ${co['rounds'][0]['peak_price']:.0f} → ${co['rounds'][-1]['peak_price']:.0f}/MWh")
+        st.markdown(f"**{TAKEAWAYS[4][st.session_state.get('tour_persona','city')]}**")
+        st.caption("50,000 home batteries + the 500 MW data center on the year's worst 3 days; three solved regimes.")
+
+    elif step == 5:
+        st.header("The engine keeps improving — and shows its work")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Do nothing", "$14.9M", "added system cost", delta_color="off")
+        s2.metric("AI-written rules", "$14.1M", "closed 27% of the gap")
+        s3.metric("Hand-written rules", "$13.3M", "closed 55%")
+        s4.metric("Optimizer (bound)", "$12.0M", "100% — kept in the loop")
+        st.markdown("""
+AI agents **write strategies as plain code**, a simulator scores them, a coach decides
+*refine or rethink* — and the best strategy is always kept. Where classical optimization
+wins, the scoreboard says so; that honesty is the design.
+**Next:** open a 🔴 Live Lab to watch a search happen, or 🔍 Under the hood for every
+prompt and transcript.""")
+        st.caption("Recorded searches; every round, prompt, and score archived and replayable in this app.")
+
+    nav_l, _, nav_r = st.columns([1, 4, 1])
+    if step > 0 and nav_l.button("← Back", key="tour_back"):
+        st.session_state["tour_step"] = step - 1
+        st.rerun()
+    if step < len(ACTS) - 1 and nav_r.button("Next →", type="primary", key="tour_next"):
+        st.session_state["tour_step"] = step + 1
+        st.rerun()
+
+
+# ================================================================ 🛰 mission control
+with t_mission:
+    df_m, test_m, twin_m, iso_m = load_twin()
+    ctrl, center, ledger = st.columns([1, 3, 1], gap="medium")
+
+    with ctrl:
+        st.markdown("##### Scenario")
+        mc_mw = st.slider("Data center (MW)", 100, 1000, 500, 100, key="mc_mw")
+        mc_flex = st.slider("Deferrable compute", 0, 80, 50, 10, key="mc_flex", format="%d%%")
+        mc_batt = st.slider("DC battery (MW)", 0, 300, 100, 50, key="mc_batt")
+        mc_homes = st.select_slider("Home batteries", [10_000, 25_000, 50_000, 100_000],
+                                    50_000, key="mc_homes")
+        mc_spike = st.slider("Heat-wave severity (+MW)", 0, 2000, 0, 500, key="mc_spike")
+        st.caption(f"{iso_m} · twin corr {twin_m.report.corr:.2f} · out-of-sample")
+
+    _, mc_naive, mc_imp, mc_opt, mc_mit = run_scenario(float(mc_mw), mc_flex, mc_batt, True)
+    mc_co = run_coordination(mc_homes, mc_mw, mc_spike, 4)
+
+    with center:
+        st.markdown("##### The worst 3 days — net load under three futures")
+        st.line_chart(pd.DataFrame({
+            "baseline (MW)": mc_co["base"],
+            "selfish flexibility (herding)": mc_co["selfish_net"],
+            "coordinated": mc_co["joint_net"]}, index=mc_co["times"]), height=250)
+        st.markdown("##### Prices those futures produce")
+        st.line_chart(pd.DataFrame({
+            "baseline ($/MWh)": mc_co["p0"],
+            "selfish": mc_co["p_selfish"],
+            "coordinated": mc_co["p_joint"]}, index=mc_co["times"]), height=180)
+
+    with ledger:
+        st.markdown("##### Ledger")
+        st.metric("Peak price impact", f"+${mc_imp.peak_price_delta:.0f}/MWh",
+                  "if rigid", delta_color="inverse")
+        st.metric("Consumer bills", f"+${mc_imp.consumer_bill_delta/1e6:.0f}M",
+                  f"→ +${mc_mit.consumer_bill_delta/1e6:.0f}M dispatched")
+        st.metric("DC bill saving", f"{(1-mc_opt.energy_cost/mc_naive.energy_cost)*100:.0f}%")
+        st.metric("Herding rebound", f"+{mc_co['selfish_net'].max()-mc_co['base'].max():,.0f} MW",
+                  "erased when coordinated", delta_color="inverse")
+        carbon = (mc_opt.served_mw * test_m["carbon_t_per_mwh"].values).sum()
+        st.metric("DC carbon (dispatched)", f"{carbon:,.0f} tCO₂")
+
+    st.divider()
+    feed_c, board_c = st.columns([3, 2])
+    with feed_c:
+        st.markdown("##### Latest agent activity")
+        ev_files = sorted(ROOT.glob("results/*/events.jsonl"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        if ev_files:
+            events = [json.loads(l) for l in ev_files[0].read_text().splitlines()][-6:]
+            for e in events:
+                icon = {"score": "🎯", "crash": "💥", "spike": "⚡"}.get(
+                    e["kind"].split(":")[0], "🗣")
+                st.markdown(f"{icon} `{e['episode']}` · round {e['iteration']} — "
+                            f"{e['detail'][:140]}")
+            st.caption(f"from {ev_files[0].parent.name} — open a 🔴 Live Lab to add to it")
+        else:
+            st.info("No recorded agent activity yet — start a run in a 🔴 Live Lab.")
+    with board_c:
+        st.markdown("##### Strategy scoreboard (recorded)")
+        st.markdown("""
+| Policy | Added system cost | Gap closed |
+|---|---|---|
+| Do nothing | $14.9M | — |
+| **AI-written rules** | **$14.1M** | **27%** |
+| Hand-written rules | $13.3M | 55% |
+| Optimizer (bound) | $12.0M | 100% |""")
