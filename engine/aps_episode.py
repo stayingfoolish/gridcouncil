@@ -147,11 +147,12 @@ class EngineEpisode:
         (self.episode_dir / "pending_prompt.txt").write_text(self.current_prompt())
         (self.episode_dir / "phase.txt").write_text(self.phase)
 
-    def _log_event(self, kind: str, detail: str) -> None:
+    def _log_event(self, kind: str, detail: str, value: float | None = None) -> None:
         with open(self.run_dir / "events.jsonl", "a") as f:
             f.write(json.dumps({"episode": self.episode_dir.name,
                                 "iteration": self.iteration,
-                                "kind": kind, "detail": detail[:600]}) + "\n")
+                                "kind": kind, "detail": detail[:600],
+                                "value": value}) + "\n")
 
     def process_response(self, response: str) -> str:
         if self.phase == "meta_pending":
@@ -205,7 +206,7 @@ class EngineEpisode:
                               "battery_util_pct")}
         msg = (f"iter {self.iteration}: syscost ${cost:,.0f} "
                f"(best ${self.best_cost:,.0f}, LP ${self.lp_bound:,.0f})")
-        self._log_event("score", msg)
+        self._log_event("score", msg, value=cost)
         self.repair_attempts = 0; self.restarts = 0
         self.iteration += 1
         self.phase = "done" if self.iteration >= self.n_iterations else "meta_pending"

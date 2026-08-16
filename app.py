@@ -1,14 +1,15 @@
-"""Grid Optimization Engine — demo app for a non-technical audience.
+"""Grid Optimization Engine — story-first demo for a non-technical audience.
 
     streamlit run app.py
 
-Three-act story:
-  1. The problem   — real electricity prices, and why one big new load raises
-                     everyone's bill (the marginal-price auction).
-  2. The engine    — drop a data center on the grid, watch the counterfactual,
-                     then let the engine dispatch its flexibility.
-  3. The AI loop   — replay a recorded Agentic Policy Search run: an AI writes
-                     a strategy, tests it, reads the score, and rewrites it.
+Information architecture (story-first, live separated):
+  1. The problem            — shared opening: the marginal-price auction, real data
+  2. Story: Home battery    — precomputed narrative (paper replication, EUR)
+  3. Story: Data center     — precomputed narrative + interactive scenario (real NYISO, USD)
+  4. How the agents talk    — the coach / strategy-writer / twin message loop
+  5. Live Lab: Home         — kick off APS on the home battery, watch it deliberate
+  6. Live Lab: Data center  — kick off APS on the dispatch problem, watch it deliberate
+  7. Under the hood         — prompts, data, logs, verbatim transcripts
 """
 
 import json
@@ -31,9 +32,6 @@ st.set_page_config(page_title="Grid Optimization Engine", page_icon="⚡",
                    layout="wide")
 
 EUR_BENCH = {"No battery": 10.64, "Best possible (perfect foresight)": -6.32}
-USD_BENCH_KEYS = {"naive": "Do nothing (inflexible)",
-                  "pfa": "Hand-written rules",
-                  "dla": "Best possible (perfect foresight)"}
 
 
 @st.cache_resource(show_spinner="Loading real market data and calibrating the twin…")
@@ -97,7 +95,7 @@ def run_scenario(mw: float, flex_pct: int, batt_mw: int, use_lookahead: bool):
     return dc, naive, impact, opt, mitigated
 
 
-def load_aps_run(run_dir: Path, currency: str):
+def load_aps_run(run_dir: Path):
     episodes = {}
     for d in sorted(run_dir.glob("episode_*")):
         stf = d / "state.json"
@@ -122,18 +120,277 @@ NARRATION = {
     "explore": "🔄 No progress lately, so the coach says: **throw it out, try something fundamentally different**.",
 }
 
+
+# ================================================================ reusable UI
+
+def replay_ui(runs: dict, keyp: str):
+    """Round-by-round replay of a recorded APS run, with the story of each round."""
+    if not runs:
+        st.info("No recorded runs available yet.")
+        return
+    run_name = st.selectbox("Recorded run", list(runs), key=f"{keyp}_run")
+    run_dir, unit, bench = runs[run_name]
+    episodes = load_aps_run(run_dir)
+    ep_name = st.selectbox("Episode (independent attempt)", list(episodes), key=f"{keyp}_ep")
+    recs = [r for r in episodes[ep_name] if r["cost"] is not None]
+    scale = 1e6 if unit == "$M" else 1.0
+    if not recs:
+        st.info("This episode has no scored rounds yet.")
+        return
+
+    max_iter = len(recs)
+    shown = st.slider("Play through the rounds ▶", 1, max_iter, 1, key=f"{keyp}_round",
+                      help="Drag right to advance the self-improvement loop round by round")
+    hist = recs[:shown]
+    cur = hist[-1]
+    best_so_far = min(h["cost"] for h in hist)
+
+    lc, rc = st.columns([3, 2])
+    with lc:
+        plot_df = pd.DataFrame({
+            "round": [h["iteration"] + 1 for h in hist],
+            "this attempt": [h["cost"]/scale for h in hist],
+            "best so far": [min(x["cost"] for x in hist[:i+1])/scale for i, h in enumerate(hist)],
+        }).set_index("round")
+        for label, val in bench.items():
+            plot_df[label] = val
+        st.line_chart(plot_df, height=300)
+    with rc:
+        mode = cur["mode"] if shown > 1 else "initial"
+        st.markdown(f"### Round {cur['iteration'] + 1}")
+        st.markdown(NARRATION.get(mode, ""))
+        if cur["repairs"]:
+            st.warning(f"🔧 Crashed {cur['repairs']} time(s); the AI read the error and "
+                       "repaired its own code before this score.")
+        st.metric("This attempt's score", f"{cur['cost']/scale:,.2f} {unit}")
+        st.metric("Best so far", f"{best_so_far/scale:,.2f} {unit}",
+                  help="The engine always keeps the best strategy found — bad experiments cost nothing.")
+        gap_target = bench.get("Best possible (perfect foresight)")
+        if gap_target is not None:
+            st.caption(f"Perfect-foresight bound: {gap_target:,.2f} {unit} — no strategy "
+                       "without a crystal ball can beat this.")
+
+    st.markdown("#### 🧵 The story of this round")
+    coach_by_iter = {}
+    ev_file = run_dir / "events.jsonl"
+    if ev_file.exists():
+        for l in ev_file.read_text().splitlines():
+            e = json.loads(l)
+            if e["episode"] == ep_name and e["kind"].startswith("coach"):
+                coach_by_iter[e["iteration"]] = (e["kind"].split(":")[1], e["detail"])
+    tdir = run_dir / ep_name / "transcript"
+    gen_prompts = sorted(tdir.glob("*gen_pending.prompt.txt")) if tdir.exists() else []
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.markdown("**1 · 📥 Instruction given**")
+        it = cur["iteration"]
+        if it in coach_by_iter:
+            st.caption(f"from the coach ({coach_by_iter[it][0]} mode)")
+            st.markdown(coach_by_iter[it][1][:450] + "…")
+        elif it == 0:
+            st.caption("the starting task, no feedback yet")
+            st.markdown("_“Implement a rule-based policy that decides, from the current "
+                        "state, when to act… minimizing total cost.”_")
+        else:
+            st.caption("coach text not archived for this old run — mode was:")
+            st.markdown(f"**{cur['mode']}**")
+        if it < len(gen_prompts):
+            with st.expander("full prompt, verbatim"):
+                st.code(gen_prompts[it].read_text(), language="text")
+    with s2:
+        st.markdown("**2 · 🧠 Strategy produced**")
+        if cur["repairs"]:
+            st.caption(f"crashed {cur['repairs']}×, self-repaired, then ran")
+        if cur["code"]:
+            st.code("\n".join(cur["code"].splitlines()[:16]) + "\n…", language="python")
+    with s3:
+        st.markdown("**3 · 🎯 Result**")
+        st.metric("score", f"{cur['cost']/scale:,.2f} {unit}")
+        prev_best = min((h["cost"] for h in hist[:-1]), default=None)
+        if prev_best is not None:
+            d = (cur["cost"] - prev_best) / scale
+            st.markdown("**new best — kept ✅**" if d < 0
+                        else f"worse than best by {abs(d):,.2f} — discarded 🗑")
+    with s4:
+        st.markdown("**4 · 🗣 Coach's verdict**")
+        nxt = coach_by_iter.get(cur["iteration"] + 1)
+        if nxt:
+            st.caption(f"→ shaped round {cur['iteration'] + 2} ({nxt[0]} mode)")
+            st.markdown(nxt[1][:450] + "…")
+        elif shown < max_iter:
+            st.caption("verdict text not archived; the decision was:")
+            st.markdown(f"**{recs[shown]['mode']}** → round {cur['iteration'] + 2}")
+        else:
+            st.markdown("_final round — search ended, best strategy kept._")
+
+    if cur["code"]:
+        with st.expander("Read the full strategy the AI wrote this round (real code)"):
+            st.code(cur["code"], language="python")
+
+
+def live_lab(flavor: dict, keyp: str):
+    """Start + watch a live APS run. flavor: name, driver, prefix, unit, scale,
+    naive_label, best_label, default_ep, default_it."""
+    import signal
+    import subprocess
+    import time as _time
+
+    st.markdown(f"Start a **real self-improvement run on the {flavor['name']}** and watch "
+                "it deliberate. Requires an authenticated `claude` CLI or "
+                "`ANTHROPIC_API_KEY` in the environment you launched streamlit from.")
+    live_runs = sorted((ROOT / "results").glob(f"{flavor['prefix']}*"))
+    default_dir = st.session_state.get(f"{keyp}_dir") or (str(live_runs[-1]) if live_runs else None)
+
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
+    n_ep = cc1.number_input("Episodes", 1, 5, flavor["default_ep"], key=f"{keyp}_ne")
+    n_it = cc2.number_input("Rounds each", 3, 10, flavor["default_it"], key=f"{keyp}_ni")
+    if cc3.button("🚀 Start new run", type="primary", key=f"{keyp}_start"):
+        run_name = f"results/{flavor['prefix']}{_time.strftime('%m%d_%H%M%S')}"
+        with st.spinner("Setting up the environment and computing the benchmarks…"):
+            subprocess.run(
+                [sys.executable, flavor["driver"], "init", "--run", run_name,
+                 "--episodes", str(int(n_ep)), "--iterations", str(int(n_it))],
+                cwd=ROOT, check=True, capture_output=True)
+        logf = open(ROOT / run_name / "worker.log", "w")
+        proc = subprocess.Popen(
+            [sys.executable, "experiments/worker.py", "--run", run_name,
+             "--driver", flavor["driver"]],
+            cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        (ROOT / run_name / "worker.pid").write_text(str(proc.pid))
+        st.session_state[f"{keyp}_dir"] = run_name
+        st.rerun()
+    if default_dir and (ROOT / default_dir).joinpath("worker.pid").exists():
+        if cc4.button("⏹ Stop worker", key=f"{keyp}_stop"):
+            pid_file = ROOT / default_dir / "worker.pid"
+            try:
+                import os as _os
+                _os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+            pid_file.unlink(missing_ok=True)
+            st.rerun()
+
+    @st.fragment(run_every="4s")
+    def live_feed():
+        if not default_dir:
+            st.info("No live run yet — press **Start new run** above (or launch "
+                    "`experiments/worker.py` from a terminal).")
+            return
+        live_dir = ROOT / default_dir
+        st.caption(f"Watching `{live_dir.name}`")
+        ev_file = live_dir / "events.jsonl"
+        if not ev_file.exists():
+            st.info("Run starting — the first strategies are being written and scored…")
+            log = live_dir / "worker.log"
+            if log.exists():
+                st.code(log.read_text()[-800:] or "…", language="text")
+            return
+        events = [json.loads(l) for l in ev_file.read_text().splitlines()]
+        bl = json.loads((live_dir / "baselines.json").read_text())
+        if not (live_dir / "worker.pid").exists():
+            st.success("Run finished — it now appears in this story's recorded-runs list "
+                       "for round-by-round replay.")
+        scores = [e for e in events if e["kind"] == "score"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rounds scored so far", len(scores))
+        c2.metric("Coach interventions",
+                  sum(1 for e in events if e["kind"].startswith("coach")))
+        c3.metric("Crashes self-repaired",
+                  sum(1 for e in events if e["kind"] == "crash"))
+        vals = [e.get("value") for e in scores if e.get("value") is not None]
+        if vals:
+            sc = flavor["scale"]
+            live_df = pd.DataFrame({
+                "round": range(1, len(vals) + 1),
+                f"attempt ({flavor['unit']})": [v / sc for v in vals]}).set_index("round")
+            live_df[flavor["naive_label"]] = bl["naive"] / sc
+            live_df[flavor["best_label"]] = bl["dla"] / sc
+            st.line_chart(live_df, height=240)
+        st.markdown("**Deliberation feed** (newest first):")
+        icons = {"score": "🎯", "crash": "💥"}
+        for e in reversed(events[-12:]):
+            icon = icons.get(e["kind"], "🧠")
+            who = "Coach" if e["kind"].startswith("coach") else \
+                  ("Score" if e["kind"] == "score" else "Crash")
+            st.markdown(f"{icon} **{e['episode']} · round {e['iteration'] + 1} · {who}** — "
+                        f"{e['detail'][:220]}{'…' if len(e['detail']) > 220 else ''}")
+    live_feed()
+
+
+def dollar_runs():
+    """Recorded $-denominated runs (data-center dispatch + finished live runs)."""
+    runs = {}
+    if (ROOT / "results/engine_aps").exists():
+        bl = json.loads((ROOT / "results/engine_aps/baselines.json").read_text())
+        runs["Data-center dispatch (the original recorded search)"] = \
+            (ROOT / "results/engine_aps", "$M",
+             {"Do nothing": bl["naive"]/1e6, "Hand-written rules": bl["pfa"]/1e6,
+              "Best possible (perfect foresight)": bl["dla"]/1e6})
+    for d in sorted((ROOT / "results").glob("live_*")):
+        has_scores = any(json.loads(f.read_text())["records"]
+                         for f in d.glob("episode_*/state.json"))
+        if (d / "baselines.json").exists() and has_scores:
+            bl = json.loads((d / "baselines.json").read_text())
+            runs[f"Live run {d.name.replace('live_', '')}"] = \
+                (d, "$M", {"Do nothing": bl["naive"]/1e6,
+                           "Best possible (perfect foresight)": bl["dla"]/1e6})
+    return runs
+
+
+def euro_runs():
+    runs = {}
+    if (ROOT / "results/run1").exists():
+        runs["Home battery (the original recorded search, 10 attempts)"] = \
+            (ROOT / "results/run1", "€", EUR_BENCH)
+    for d in sorted((ROOT / "results").glob("bliv_*")):
+        has_scores = any(json.loads(f.read_text())["records"]
+                         for f in d.glob("episode_*/state.json"))
+        if (d / "baselines.json").exists() and has_scores:
+            bl = json.loads((d / "baselines.json").read_text())
+            runs[f"Live run {d.name.replace('bliv_', '')}"] = \
+                (d, "€", {"No battery": bl["naive"],
+                          "Best possible (perfect foresight)": bl["dla"]})
+    return runs
+
+
+AGENT_BOX = """
+<div style="display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;font-size:0.92rem">
+ <div style="flex:1;min-width:180px;border:2px solid #7c4dbe;border-radius:10px;padding:10px">
+   <b>🧑‍🏫 The Coach</b> <i>(meta-level LLM)</i><br>
+   Sees: scores, utilization, history — <b>never raw data</b>.<br>
+   Says: “refine this” or “rethink entirely”.
+ </div>
+ <div style="align-self:center;font-size:1.4rem">→<br><span style="font-size:.7rem">instruction</span></div>
+ <div style="flex:1;min-width:180px;border:2px solid #2c7fb8;border-radius:10px;padding:10px">
+   <b>👩‍💻 The Strategy Writer</b> <i>(code-writing LLM)</i><br>
+   Sees: the task, the rules of the system, the coach's note.<br>
+   Produces: a complete strategy <b>as ordinary code</b>.
+ </div>
+ <div style="align-self:center;font-size:1.4rem">→<br><span style="font-size:.7rem">code</span></div>
+ <div style="flex:1;min-width:180px;border:2px solid #33a02c;border-radius:10px;padding:10px">
+   <b>⚖️ The Grid Twin</b> <i>(simulator — not an AI)</i><br>
+   Runs the code against real market data.<br>
+   Returns: a <b>score</b> — or a crash report.
+ </div>
+ <div style="align-self:center;font-size:1.4rem">↩<br><span style="font-size:.7rem">score / error</span></div>
+</div>
+"""
+
 # ================================================================ layout
 
 st.title("⚡ Grid Optimization Engine")
-st.caption("A live model of a real power grid, an optimizer that keeps new "
-           "demand from raising everyone's bill, and an AI that teaches itself "
-           "control strategies. All numbers below come from real market data.")
+st.caption("A live model of a real power grid, an optimizer that keeps new demand from "
+           "raising everyone's bill, and AI agents that teach themselves control "
+           "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["1 · The problem", "2 · The engine",
-                                  "3 · Watch the AI improve itself", "🔍 Under the hood"])
+(t_prob, t_home, t_dc, t_agents, t_live_home, t_live_dc, t_hood) = st.tabs([
+    "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
+    "4 · 🤝 How the agents talk", "🔴 Live Lab: Home", "🔴 Live Lab: Data center",
+    "🔍 Under the hood"])
 
-# ---------------------------------------------------------------- tab 1
-with tab1:
+# ---------------------------------------------------------------- the problem
+with t_prob:
     df, test, twin, iso = load_twin()
     left, right = st.columns([3, 2])
     with left:
@@ -144,8 +401,12 @@ power as people use. Cheap plants run first; when demand climbs, more expensive
 plants switch on — and **that last, most expensive plant sets the price everyone pays**.
 
 That's why one badly-timed gigawatt — a data center, an EV rush hour — can raise
-the bill of every home on the grid. The question every city and utility is asking:
-**how much new demand can we welcome before prices spike — and what do we do about it?**""")
+the bill of every home on the grid. And the same logic scales down: a single home
+with solar panels faces the same question every hour — **use, store, or sell?**
+
+Two protagonists, same physics: tab 2 follows a **home with a battery**;
+tab 3 follows a **500 MW data center**. In both, AI agents learn the strategy —
+and a calibrated twin of the market keeps the score.""")
         m1, m2, m3 = st.columns(3)
         m1.metric("Typical price", f"${df['LMP'].median():.0f}/MWh")
         m2.metric("Worst hour in the data", f"${df['LMP'].max():.0f}/MWh",
@@ -155,34 +416,84 @@ the bill of every home on the grid. The question every city and utility is askin
         st.markdown("**Real prices, hour by hour** — spikes are expensive plants switching on")
         chart_df = pd.DataFrame({"time": df["time"], "$/MWh": df["LMP"]}).set_index("time")
         st.line_chart(chart_df, height=260)
-    st.info("The engine runs on a **digital twin**: a reconstruction of this auction, "
-            "calibrated until its simulated prices track what the market actually did. "
-            "Once it tracks reality, it can answer *what-if* questions reality never ran.")
-
     st.divider()
     st.markdown("### The grid on a map — one price per region, changing every hour")
     spike_day = str(df.loc[df["LMP"].idxmax(), "time"].date())
     day = st.date_input("Day", value=pd.to_datetime(spike_day).date(),
                         min_value=df["time"].min().date(), max_value=df["time"].max().date())
-    hour = st.slider("Hour of day", 0, 23, 18,
-                     help="Drag through the day — watch prices climb into the evening")
+    hour = st.slider("Hour of day", 0, 23, 18)
     try:
         day_df = load_zonal_day(str(day))
         st.pydeck_chart(price_map(day_df, hour), height=420)
         st.caption("Real NYISO zonal day-ahead prices. Bigger, redder = more expensive. "
-                   f"The preselected day is the most expensive hour in the dataset ({spike_day}).")
+                   f"The preselected day is the most expensive in the dataset ({spike_day}).")
     except Exception as e:
         st.warning(f"Map data unavailable ({e}); the price chart above tells the same story.")
 
-# ---------------------------------------------------------------- tab 2
-with tab2:
-    st.subheader("Drop a data center on the grid — then let the engine fix the damage")
+# ---------------------------------------------------------------- home story
+with t_home:
+    st.subheader("🏠 A home with solar and a battery — can an AI learn to run it?")
+    st.markdown("""
+**The problem.** A family has rooftop solar (5 kW), a 10 kWh battery, and a dynamic
+electricity tariff (~0.35 €/kWh to buy, a fixed 0.08 € to sell back). Every hour someone —
+or something — must decide: *charge the battery, discharge it, or trade with the grid?*
+Get it wrong and solar power is sold cheap at noon and expensive power is bought at dinner.
+This is a faithful replication of a published academic benchmark (Sommer et al.,
+FAU Erlangen-Nürnberg / Princeton), simulated over one week.""")
+
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Doing nothing (no battery)", "10.64 €", help="Cost of the week without any battery")
+    b2.metric("Perfect crystal ball", "−6.32 €", help="A mathematical optimum with perfect foresight — the week turns a profit")
+    b3.metric("Gap the AI must close", "16.96 €")
+
+    st.markdown("""
+**How we address it.** We gave the problem to the three-agent loop (tab 4): a strategy-writer
+AI writes battery-control code, the simulator scores a full week, a coach AI reads the score
+and steers the next attempt. **Ten independent searches**, ten rounds each — one hundred
+strategies written, tested, and judged. No training, no examples of good behavior: only the
+score as feedback.
+
+**What happened.**""")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Searches that found a profitable strategy", "10 / 10")
+    r2.metric("Best strategy found", "−6.08 €", "0.24 € from the theoretical optimum")
+    r3.metric("Rounds needed to get there", "1–3", "not 1,000+ training episodes")
+
+    ep1_trace = ROOT / "results/run1/episode_01/best_trace.json"
+    if ep1_trace.exists():
+        trace = json.loads(ep1_trace.read_text())
+        soc = np.array(trace["soc_kwh"])[:-1]
+        st.markdown("**A week in the life of the winning strategy** — it charges from midday "
+                    "solar, runs the home through the expensive evening, every single day:")
+        st.area_chart(pd.DataFrame({"hour of the week": range(len(soc)),
+                                    "battery charge (kWh)": soc}).set_index("hour of the week"),
+                      height=200)
+    st.info("**The honest finding:** the AI found near-optimal strategies almost immediately — "
+            "and further rounds often made things *worse*, which is why the loop always keeps "
+            "the best strategy found rather than the latest. You can watch that happen below.")
+
+    st.divider()
+    st.markdown("### 🎬 Replay the recorded search, round by round")
+    replay_ui(euro_runs(), "home")
+
+# ---------------------------------------------------------------- dc story
+with t_dc:
+    st.subheader("🏢 A 500 MW data center wants to connect — what happens to everyone's bill?")
+    st.markdown("""
+**The problem.** AI data centers are the fastest-growing load on the grid. A 500 MW campus
+draws as much power as ~400,000 homes — and if it runs flat-out through the evening peak,
+it drags the market price up **for every consumer on the grid**. Utilities must answer:
+*how much can we welcome, and on what terms?*
+
+**How we address it.** The engine's calibrated twin re-runs the market **with** the new
+load — first rigid, then with its own flexibility (deferrable compute, on-site storage)
+dispatched intelligently. Try it yourself:""")
+
     c1, c2, c3, c4 = st.columns(4)
     mw = c1.slider("Data center size (MW)", 100, 1000, 500, 50)
     flex_pct = c2.slider("Compute that can wait a day (%)", 0, 80, 50, 10)
     batt_mw = c3.slider("On-site battery (MW)", 0, 300, 100, 50)
-    use_lookahead = c4.toggle("Smart planner (looks ahead)", value=True,
-                              help="Off = simple price rules. On = the optimizer plans the whole horizon.")
+    use_lookahead = c4.toggle("Smart planner (looks ahead)", value=True)
 
     with st.spinner("Re-running the market with your data center…"):
         dc, naive, impact, opt, mitigated = run_scenario(mw, flex_pct, batt_mw, use_lookahead)
@@ -214,73 +525,143 @@ with tab2:
         "With the engine": mitigated.price_new[a:b],
     }).set_index("time")
     st.line_chart(price_df, height=280)
-    st.success(
-        f"**The lever:** hold the {flex_pct}% of compute that can wait, and move the battery, "
-        "out of the hours when the expensive plants would switch on — then catch up when power "
-        "is cheap. Same computing gets done; it just never sets the price. "
-        "The engine also answers the sizing question: more battery flattens the peak impact further.")
 
-    st.markdown("### 📋 The operational plan the engine hands the data center")
-    firm_mw = dc.profile_mw * (1 - dc.deferrable_frac)
-    arrive_mw = dc.profile_mw * dc.deferrable_frac
-    flex_served = opt.served_mw - firm_mw - opt.battery_mw
-    def compute_action(s, a):
-        if a <= 0: return "▶ run normally"
-        if s < 0.5 * a: return "⏸ PAUSE deferrable compute"
-        if s > 1.25 * a: return "⏩ CATCH UP backlog"
-        return "▶ run normally"
-    def battery_action(x):
-        if x > 5: return "🔋 CHARGE"
-        if x < -5: return "⚡ DISCHARGE"
-        return "— idle"
-    plan = pd.DataFrame({
-        "time": test["time"],
-        "price $/MWh": np.round(impact.price_base, 1),
-        "compute action": [compute_action(s, a) for s, a in zip(flex_served, arrive_mw)],
-        "battery action": [battery_action(x) for x in opt.battery_mw],
-        "grid draw MW": np.round(opt.served_mw, 0),
-        "battery MW": np.round(opt.battery_mw, 0),
-        "backlog MWh": np.round(opt.deferred_backlog, 0),
-    })
+    with st.expander("📋 The operational plan the engine hands the data center", expanded=False):
+        firm_mw = dc.profile_mw * (1 - dc.deferrable_frac)
+        arrive_mw = dc.profile_mw * dc.deferrable_frac
+        flex_served = opt.served_mw - firm_mw - opt.battery_mw
+        def compute_action(s, arr):
+            if arr <= 0: return "▶ run normally"
+            if s < 0.5 * arr: return "⏸ PAUSE deferrable compute"
+            if s > 1.25 * arr: return "⏩ CATCH UP backlog"
+            return "▶ run normally"
+        def battery_action(x):
+            if x > 5: return "🔋 CHARGE"
+            if x < -5: return "⚡ DISCHARGE"
+            return "— idle"
+        plan = pd.DataFrame({
+            "time": test["time"],
+            "price $/MWh": np.round(impact.price_base, 1),
+            "compute action": [compute_action(s, arr) for s, arr in zip(flex_served, arrive_mw)],
+            "battery action": [battery_action(x) for x in opt.battery_mw],
+            "grid draw MW": np.round(opt.served_mw, 0),
+            "battery MW": np.round(opt.battery_mw, 0),
+            "backlog MWh": np.round(opt.deferred_backlog, 0),
+        })
+        hh = test["time"].dt.hour.values
+        dis_hours = sorted(h for h in range(24) if np.median(opt.battery_mw[hh == h]) < -5)
+        chg_hours = sorted(h for h in range(24) if np.median(opt.battery_mw[hh == h]) > 5)
+        catchup_hours = sorted(h for h in range(24)
+                               if np.median(flex_served[hh == h]) > 1.25 * np.median(arrive_mw[hh == h] + 1e-9))
+        def hrs(hs):
+            return ", ".join(f"{h:02d}:00" for h in hs) if hs else "—"
+        st.markdown(f"""
+**Standing orders (typical day):** defer flexible compute through the expensive hours;
+**catch up the backlog** around {hrs(catchup_hours)}; **discharge the battery** around
+{hrs(dis_hours)}, **recharge** around {hrs(chg_hours)}. Nothing waits past its 24 h deadline.
+Bottom line: **${(naive.energy_cost - opt.energy_cost)/1e6:.2f}M saved on its own bill**,
+**${(naive.system_cost_delta - opt.system_cost_delta)/1e6:.2f}M less system cost**, identical compute served.""")
+        prof = pd.DataFrame({
+            "hour": range(24),
+            "avg grid draw MW": [opt.served_mw[hh == h].mean() for h in range(24)],
+            "avg battery MW": [opt.battery_mw[hh == h].mean() for h in range(24)],
+            "avg price $/MWh": [impact.price_base[hh == h].mean() for h in range(24)],
+        }).set_index("hour")
+        pc1, pc2 = st.columns([2, 3])
+        with pc1:
+            st.markdown("**The shape of a typical day**")
+            st.line_chart(prof, height=220)
+        with pc2:
+            worst_day = test["time"].dt.date.iloc[int(np.argmax(impact.price_new - impact.price_base))]
+            st.markdown(f"**Hour-by-hour playbook, hardest day ({worst_day})**")
+            day_plan = plan[test["time"].dt.date.values == worst_day]
+            st.dataframe(day_plan.assign(time=day_plan["time"].dt.strftime("%H:%M")),
+                         height=220, hide_index=True)
+        st.download_button("Download the full dispatch schedule (CSV)",
+                           plan.to_csv(index=False).encode(), "dispatch_plan.csv", "text/csv")
 
-    hh = test["time"].dt.hour.values
-    pause_hours = sorted(h for h in range(24)
-                         if np.median(flex_served[hh == h]) < 0.5 * np.median(arrive_mw[hh == h] + 1e-9))
-    catchup_hours = sorted(h for h in range(24)
-                           if np.median(flex_served[hh == h]) > 1.25 * np.median(arrive_mw[hh == h] + 1e-9))
-    dis_hours = sorted(h for h in range(24) if np.median(opt.battery_mw[hh == h]) < -5)
-    chg_hours = sorted(h for h in range(24) if np.median(opt.battery_mw[hh == h]) > 5)
-    def hrs(hs):
-        return ", ".join(f"{h:02d}:00" for h in hs) if hs else "—"
-    st.markdown(f"""
-**Standing orders (typical day):**
-- **Pause deferrable compute** around: {hrs(pause_hours)} (the price-setting hours)
-- **Catch up the backlog** around: {hrs(catchup_hours)} (cheap hours; nothing waits past its 24 h deadline)
-- **Discharge the battery** around: {hrs(dis_hours)} · **recharge** around: {hrs(chg_hours)}
-- Battery active {(np.abs(opt.battery_mw) > 5).mean() * 100:.0f}% of hours; max backlog reached {opt.deferred_backlog.max():.0f} MWh
-- Bottom line: **${(naive.energy_cost - opt.energy_cost)/1e6:.2f}M saved on its own bill** and **${(naive.system_cost_delta - opt.system_cost_delta)/1e6:.2f}M less system cost** over the period, serving identical compute.
-""")
-    prof = pd.DataFrame({
-        "hour": range(24),
-        "avg grid draw MW": [opt.served_mw[hh == h].mean() for h in range(24)],
-        "avg battery MW": [opt.battery_mw[hh == h].mean() for h in range(24)],
-        "avg price $/MWh": [impact.price_base[hh == h].mean() for h in range(24)],
-    }).set_index("hour")
-    pc1, pc2 = st.columns([2, 3])
-    with pc1:
-        st.markdown("**The shape of a typical day** (draw follows cheap hours)")
-        st.line_chart(prof, height=240)
-    with pc2:
-        worst_day = test["time"].dt.date.iloc[int(np.argmax(impact.price_new - impact.price_base))]
-        st.markdown(f"**Hour-by-hour playbook for the hardest day ({worst_day})**")
-        day_plan = plan[test["time"].dt.date.values == worst_day]
-        st.dataframe(day_plan.assign(time=day_plan["time"].dt.strftime("%H:%M")),
-                     height=240, hide_index=True)
-    st.download_button("Download the full dispatch schedule (CSV)",
-                       plan.to_csv(index=False).encode(), "dispatch_plan.csv", "text/csv")
+    st.markdown("### And can the AI agents learn this job too?")
+    st.markdown("""We ran the same three-agent search on this problem — with a twist: here we
+**know the mathematically best answer** (a perfect-foresight optimizer), so we can grade the AI
+precisely. The ladder, from worst to best:""")
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("Do nothing", "$14.9M", help="Added system cost, rigid data center")
+    l2.metric("AI-searched strategy", "$14.1M", "closed 27% of the gap")
+    l3.metric("Hand-written rules", "$13.3M", "closed 55%")
+    l4.metric("Perfect foresight", "$12.0M", "the bound — 100%")
+    st.info("**The honest finding:** on this harder problem the AI's reactive rules plateau "
+            "well above the optimizer — timing a 24-hour backlog against price spikes needs "
+            "foresight a simple rule can't express. That's exactly why the engine keeps a "
+            "classical optimizer in the room and lets the scoreboard pick the winner.")
 
-# ---------------------------------------------------------------- tab 4
-with tab4:
+    st.divider()
+    st.markdown("### 🎬 Replay the recorded search, round by round")
+    replay_ui(dollar_runs(), "dc")
+
+# ---------------------------------------------------------------- agents
+with t_agents:
+    st.subheader("🤝 Three agents, one loop — who talks to whom")
+    st.markdown("""Every strategy you see in this demo was produced by the same conversation
+between three specialists. None of them can do the job alone — and that's deliberate.""")
+    st.markdown(AGENT_BOX, unsafe_allow_html=True)
+    st.markdown("""
+**Why the information walls matter:**
+- The **coach never sees raw market data** — only aggregate scores. It can't overfit to the
+  week or "cheat" by memorizing prices; it can only reason about strategy.
+- The **strategy writer never sees the score history** — it gets one clean instruction per
+  round. Every strategy is a fresh, auditable piece of code, not an accumulated blob.
+- The **twin is not an AI** — it's a deterministic simulator calibrated on real data. The
+  agents can propose anything; only the twin decides what works. AI suggests, physics disposes.
+- A fourth specialist, the **🔧 bug fixer**, is summoned only when code crashes: it receives
+  the error message and the broken code, and returns a repaired version (up to 5 tries).
+
+**How the messages actually travel:** every message is a file on disk — prompts in, code and
+verdicts out. That's why everything you see in this app is replayable and auditable: the
+conversation *is* the record. (See 🔍 Under the hood for the verbatim transcripts.)""")
+
+    st.markdown("#### 📜 A real conversation, reconstructed from the logs")
+    conv_runs = {**dollar_runs(), **euro_runs()}
+    conv_runs = {k: v for k, v in conv_runs.items() if (v[0] / "events.jsonl").exists()}
+    if conv_runs:
+        pick = st.selectbox("Run", list(conv_runs), key="agents_run")
+        run_dir, unit, _ = conv_runs[pick]
+        events = [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()]
+        eps = sorted({e["episode"] for e in events})
+        epk = st.selectbox("Episode", eps, key="agents_ep")
+        for e in [e for e in events if e["episode"] == epk][:14]:
+            if e["kind"].startswith("coach"):
+                with st.chat_message("user", avatar="🧑‍🏫"):
+                    st.markdown(f"**Coach → Writer** (round {e['iteration'] + 1}, "
+                                f"{e['kind'].split(':')[1]} mode): {e['detail'][:280]}…")
+            elif e["kind"] == "score":
+                with st.chat_message("assistant", avatar="⚖️"):
+                    st.markdown(f"**Twin → Coach**: {e['detail']}")
+            elif e["kind"] == "crash":
+                with st.chat_message("assistant", avatar="💥"):
+                    st.markdown(f"**Twin → Bug fixer**: `{e['detail'][:160]}…`")
+    else:
+        st.info("Run a Live Lab to generate a conversation with full coach text — "
+                "the original recorded runs predate full event logging.")
+
+# ---------------------------------------------------------------- live labs
+with t_live_home:
+    st.subheader("🔴 Live Lab — home battery")
+    live_lab({"name": "home battery (one simulated week, score in €)",
+              "driver": "experiments/driver.py", "prefix": "bliv_",
+              "unit": "€", "scale": 1.0, "naive_label": "No battery",
+              "best_label": "Best possible", "default_ep": 2, "default_it": 6},
+             "lh")
+
+with t_live_dc:
+    st.subheader("🔴 Live Lab — data center dispatch")
+    live_lab({"name": "data-center dispatch problem (real market weeks, score in $M)",
+              "driver": "experiments/driver2.py", "prefix": "live_",
+              "unit": "$M", "scale": 1e6, "naive_label": "Do nothing",
+              "best_label": "Best possible", "default_ep": 2, "default_it": 6},
+             "ld")
+
+# ---------------------------------------------------------------- under the hood
+with t_hood:
     st.subheader("Full transparency: prompts, data, and logs")
     sec = st.radio("What do you want to inspect?",
                    ["Prompt templates", "Initial data & assumptions", "Run logs & transcripts"],
@@ -301,7 +682,7 @@ with tab4:
             st.code(_P.META_PROMPT, language="text")
             st.markdown("**Required code structure** (the contract every strategy must fit)")
             st.code(_P.POLICY_SIGNATURE, language="python")
-        with st.expander("Battery-paper replication prompts (aps/prompts.py)"):
+        with st.expander("Home-battery replication prompts (aps/prompts.py)"):
             from aps import prompts as _BP
             st.code(_BP.GENERATION_PROMPT, language="text")
             st.code(_BP.META_PROMPT, language="text")
@@ -324,7 +705,7 @@ with tab4:
                      "train hours": twin.report.n_train, "test hours": twin.report.n_test})
         with c2:
             st.markdown("**Scenario assumptions (data center)**")
-            st.json({"size": "set by the Act-2 slider (default 500 MW)",
+            st.json({"size": "set by the story-tab slider (default 500 MW)",
                      "firm load": "50% (cannot move)",
                      "deferrable compute window": "24 h deadline, enforced",
                      "battery round-trip efficiency": "88%",
@@ -374,231 +755,4 @@ with tab4:
                     st.code(rf.read_text(), language="text")
         else:
             st.info("This run predates transcript archiving — prompts/responses were consumed "
-                    "in place. Every run started from now on keeps the full verbatim transcript. "
-                    "Available for old runs: per-round strategy code (Act 3), event log, and state.")
-
-# ---------------------------------------------------------------- tab 3
-with tab3:
-    st.subheader("An AI that writes its own strategy, gets a score, and rewrites itself")
-    st.markdown(
-        """This is a **recording of a real run** (nothing staged). Each round: an AI writes a
-control strategy as code → the twin scores it against the market → a *coach* AI reads the
-score and either sharpens the strategy or orders a rethink. Watch the score, and read the
-coach's calls.""")
-
-    live = st.toggle("🔴 Live mode — run the AI right now and watch it deliberate")
-    if live:
-        import signal
-        import subprocess
-        import time as _time
-
-        live_runs = sorted((ROOT / "results").glob("live_*")) + \
-                    ([ROOT / "results/engine_live"] if (ROOT / "results/engine_live").exists() else [])
-        default_dir = st.session_state.get("live_dir") or (str(live_runs[-1]) if live_runs else None)
-
-        cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
-        n_ep = cc1.number_input("Episodes", 1, 5, 2)
-        n_it = cc2.number_input("Rounds each", 3, 10, 6)
-        if cc3.button("🚀 Start new run", type="primary",
-                      help="Sets up the twin and launches the AI worker in the background. "
-                           "Needs an authenticated `claude` CLI or ANTHROPIC_API_KEY in the "
-                           "environment you launched streamlit from."):
-            run_name = f"results/live_{_time.strftime('%m%d_%H%M%S')}"
-            with st.spinner("Calibrating the twin and computing the benchmarks…"):
-                subprocess.run(
-                    [sys.executable, "experiments/driver2.py", "init", "--run", run_name,
-                     "--episodes", str(int(n_ep)), "--iterations", str(int(n_it))],
-                    cwd=ROOT, check=True, capture_output=True)
-            logf = open(ROOT / run_name / "worker.log", "w")
-            proc = subprocess.Popen(
-                [sys.executable, "experiments/worker.py", "--run", run_name],
-                cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
-            (ROOT / run_name / "worker.pid").write_text(str(proc.pid))
-            st.session_state["live_dir"] = run_name
-            st.rerun()
-        if default_dir and (Path(default_dir) if Path(default_dir).is_absolute()
-                            else ROOT / default_dir).joinpath("worker.pid").exists():
-            if cc4.button("⏹ Stop worker"):
-                pid_file = (Path(default_dir) if Path(default_dir).is_absolute()
-                            else ROOT / default_dir) / "worker.pid"
-                try:
-                    import os as _os
-                    _os.kill(int(pid_file.read_text()), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                pid_file.unlink(missing_ok=True)
-                st.rerun()
-
-        @st.fragment(run_every="4s")
-        def live_feed():
-            if not default_dir:
-                st.info("No live run yet — press **Start new run** above (or launch "
-                        "`experiments/worker.py` from a terminal).")
-                return
-            live_dir = Path(default_dir) if Path(default_dir).is_absolute() else ROOT / default_dir
-            st.caption(f"Watching `{live_dir.name}`")
-            ev_file = live_dir / "events.jsonl"
-            if not ev_file.exists():
-                st.info("Run starting — the first strategies are being written and scored…")
-                log = live_dir / "worker.log"
-                if log.exists():
-                    st.code(log.read_text()[-800:] or "…", language="text")
-                return
-            events = [json.loads(l) for l in ev_file.read_text().splitlines()]
-            bl = json.loads((live_dir / "baselines.json").read_text())
-            if not (live_dir / "worker.pid").exists():
-                st.success("Run finished — flip Live mode off to replay it round by round "
-                           "(it now appears in the recorded-runs list).")
-            scores = [e for e in events if e["kind"] == "score"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Rounds scored so far", len(scores))
-            c2.metric("Coach interventions",
-                      sum(1 for e in events if e["kind"].startswith("coach")))
-            c3.metric("Crashes self-repaired",
-                      sum(1 for e in events if e["kind"] == "crash"))
-            if scores:
-                costs = [float(e["detail"].split("$")[1].split(" ")[0].replace(",", ""))
-                         for e in scores]
-                live_df = pd.DataFrame({
-                    "round": range(1, len(costs) + 1),
-                    "attempt ($M)": [c / 1e6 for c in costs]}).set_index("round")
-                live_df["Do nothing"] = bl["naive"] / 1e6
-                live_df["Best possible"] = bl["dla"] / 1e6
-                st.line_chart(live_df, height=240)
-            st.markdown("**Deliberation feed** (newest first):")
-            icons = {"score": "🎯", "crash": "💥"}
-            for e in reversed(events[-12:]):
-                icon = icons.get(e["kind"], "🧠")
-                who = "Coach" if e["kind"].startswith("coach") else \
-                      ("Score" if e["kind"] == "score" else "Crash")
-                st.markdown(f"{icon} **{e['episode']} · round {e['iteration'] + 1} · {who}** — "
-                            f"{e['detail'][:220]}{'…' if len(e['detail']) > 220 else ''}")
-        live_feed()
-        st.stop()
-
-    runs = {}
-    for d in sorted((ROOT / "results").glob("live_*")):
-        has_scores = any(json.loads(f.read_text())["records"]
-                         for f in d.glob("episode_*/state.json"))
-        if (d / "baselines.json").exists() and has_scores:
-            bl = json.loads((d / "baselines.json").read_text())
-            runs[f"Live run {d.name.replace('live_', '')} — $M added system cost"] = \
-                (d, "$M", {"Do nothing": bl["naive"]/1e6, "Hand-written rules": bl["pfa"]/1e6,
-                           "Best possible (perfect foresight)": bl["dla"]/1e6})
-    if (ROOT / "results/run1").exists():
-        runs["Home battery (paper replication) — score in €, lower is better"] = \
-            (ROOT / "results/run1", "€", EUR_BENCH)
-    if (ROOT / "results/engine_aps").exists():
-        bl = json.loads((ROOT / "results/engine_aps/baselines.json").read_text())
-        runs["Data-center dispatch (real market) — score in $M added system cost"] = \
-            (ROOT / "results/engine_aps", "$M",
-             {"Do nothing": bl["naive"]/1e6, "Hand-written rules": bl["pfa"]/1e6,
-              "Best possible (perfect foresight)": bl["dla"]/1e6})
-
-    run_name = st.selectbox("Choose a recorded run", list(runs))
-    run_dir, unit, bench = runs[run_name]
-    episodes = load_aps_run(run_dir, unit)
-    ep_name = st.selectbox("Episode (independent attempt)", list(episodes))
-    recs = [r for r in episodes[ep_name] if r["cost"] is not None]
-    scale = 1e6 if unit == "$M" else 1.0
-
-    if not recs:
-        st.info("This episode has no scored rounds yet — pick another, or check Live mode.")
-        st.stop()
-
-    max_iter = len(recs)
-    shown = st.slider("Play through the rounds ▶", 1, max_iter, 1,
-                      help="Drag right to advance the self-improvement loop round by round")
-
-    hist = recs[:shown]
-    cur = hist[-1]
-    best_so_far = min(h["cost"] for h in hist)
-
-    lc, rc = st.columns([3, 2])
-    with lc:
-        plot_df = pd.DataFrame({
-            "round": [h["iteration"] + 1 for h in hist],
-            "this attempt": [h["cost"]/scale for h in hist],
-            "best so far": [min(x["cost"] for x in hist[:i+1])/scale for i, h in enumerate(hist)],
-        }).set_index("round")
-        for label, val in bench.items():
-            plot_df[label] = val
-        st.line_chart(plot_df, height=320)
-    with rc:
-        mode = cur["mode"] if shown > 1 else "initial"
-        st.markdown(f"### Round {cur['iteration'] + 1}")
-        st.markdown(NARRATION.get(mode, ""))
-        if cur["repairs"]:
-            st.warning(f"🔧 The strategy crashed {cur['repairs']} time(s); the AI read the "
-                       "error and repaired its own code before this score.")
-        st.metric("This attempt's score", f"{cur['cost']/scale:,.2f} {unit}")
-        st.metric("Best so far", f"{best_so_far/scale:,.2f} {unit}",
-                  help="The engine always keeps the best strategy found — bad experiments cost nothing.")
-        gap_target = bench.get("Best possible (perfect foresight)")
-        if gap_target is not None:
-            st.caption(f"Perfect-foresight bound: {gap_target:,.2f} {unit} — no strategy "
-                       "without a crystal ball can beat this.")
-    # ---- the story of this round: instruction -> strategy -> score -> verdict
-    st.markdown("#### 🧵 The story of this round")
-    coach_by_iter = {}
-    ev_file = run_dir / "events.jsonl"
-    if ev_file.exists():
-        for l in ev_file.read_text().splitlines():
-            e = json.loads(l)
-            if e["episode"] == ep_name and e["kind"].startswith("coach"):
-                coach_by_iter[e["iteration"]] = (e["kind"].split(":")[1], e["detail"])
-    tdir = run_dir / ep_name / "transcript"
-    gen_prompts = sorted(tdir.glob("*gen_pending.prompt.txt")) if tdir.exists() else []
-
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        st.markdown("**1 · 📥 Instruction given**")
-        it = cur["iteration"]
-        if it in coach_by_iter:
-            st.caption(f"from the coach ({coach_by_iter[it][0]} mode)")
-            st.markdown(coach_by_iter[it][1][:450] + "…")
-        elif it == 0:
-            st.caption("the starting task, no feedback yet")
-            st.markdown("_“Implement a rule-based dispatch policy that decides, from the "
-                        "current price and local state, when to run deferrable compute… "
-                        "minimizing the added system dispatch cost.”_")
-        else:
-            st.caption("coach text not archived for this old run — mode was:")
-            st.markdown(f"**{cur['mode']}**")
-        if it < len(gen_prompts):
-            with st.expander("full prompt, verbatim"):
-                st.code(gen_prompts[it].read_text(), language="text")
-    with s2:
-        st.markdown("**2 · 🧠 Strategy produced**")
-        if cur["repairs"]:
-            st.caption(f"crashed {cur['repairs']}×, self-repaired, then ran")
-        if cur["code"]:
-            st.code("\n".join(cur["code"].splitlines()[:16]) + "\n…", language="python")
-    with s3:
-        st.markdown("**3 · 🎯 Result**")
-        st.metric("score", f"{cur['cost']/scale:,.2f} {unit}")
-        prev_best = min((h["cost"] for h in hist[:-1]), default=None)
-        if prev_best is not None:
-            d = (cur["cost"] - prev_best) / scale
-            st.markdown("**new best — kept ✅**" if d < 0 else f"worse than best by {abs(d):,.2f} — discarded 🗑")
-    with s4:
-        st.markdown("**4 · 🗣 Coach's verdict**")
-        nxt = coach_by_iter.get(cur["iteration"] + 1)
-        if nxt:
-            st.caption(f"→ shaped round {cur['iteration'] + 2} ({nxt[0]} mode)")
-            st.markdown(nxt[1][:450] + "…")
-        elif shown < max_iter:
-            st.caption("verdict text not archived; the decision was:")
-            st.markdown(f"**{recs[shown]['mode']}** → round {cur['iteration'] + 2}")
-        else:
-            st.markdown("_final round — search ended, best strategy kept._")
-
-    if cur["code"]:
-        with st.expander("Read the full strategy the AI wrote this round (real code)"):
-            st.code(cur["code"], language="python")
-    st.info(
-        "**Why this matters:** the strategies are ordinary, readable code — an engineer can audit "
-        "every rule. And the whole search you just replayed cost a few dozen AI calls, not weeks "
-        "of training. The honest finding is also on screen: the AI plateaus above the perfect-"
-        "foresight line — which is why the engine keeps a classical optimizer in the room and "
-        "lets the scoreboard pick the winner.")
+                    "in place. Every run started from now on keeps the full verbatim transcript.")

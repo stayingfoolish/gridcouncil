@@ -35,6 +35,12 @@ def cmd_init(args):
     (run_dir / "config.json").write_text(json.dumps(
         {"episodes": args.episodes, "iterations": args.iterations,
          "params": params.__dict__}, indent=2))
+    from aps.benchmark import solve_optimal
+    from aps.simulation import NoBatteryPolicy, simulate
+    (run_dir / "baselines.json").write_text(json.dumps({
+        "naive": round(simulate(NoBatteryPolicy(), series, params).total_cost, 2),
+        "dla": round(solve_optimal(series, params).total_cost, 2),
+        "unit": "EUR"}, indent=2))
     for e in range(1, args.episodes + 1):
         ep_dir = run_dir / f"episode_{e:02d}"
         ep_dir.mkdir(exist_ok=True)

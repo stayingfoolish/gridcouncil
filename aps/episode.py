@@ -75,6 +75,13 @@ class EpisodeState:
 
     # ---------------- prompt construction ----------------
 
+    def _log_event(self, kind: str, detail: str, value: float | None = None) -> None:
+        with open(self.episode_dir.parent / "events.jsonl", "a") as f:
+            f.write(json.dumps({"episode": self.episode_dir.name,
+                                "iteration": self.iteration,
+                                "kind": kind, "detail": detail[:600],
+                                "value": value}) + "\n")
+
     def current_prompt(self) -> str:
         if self.phase == "gen_pending":
             return prompts.GENERATION_PROMPT.format(
@@ -130,6 +137,7 @@ class EpisodeState:
         if self.phase == "meta_pending":
             self.task_description = response.strip()
             self.phase = "gen_pending"
+            self._log_event(f"coach:{self.mode}", response.strip())
             return f"iter {self.iteration}: meta -> {self.mode} instruction ({len(response)} chars)"
         raise RuntimeError(f"unexpected response in phase {self.phase}")
 
@@ -148,6 +156,7 @@ class EpisodeState:
                 self.phase = "gen_pending"   # restart iteration (paper 7.2.2)
                 return f"iter {self.iteration}: {MAX_REPAIR_ATTEMPTS} repairs failed -> restart {self.restarts}"
             self.phase = "repair_pending"
+            self._log_event("crash", outcome.error[-300:])
             return f"iter {self.iteration}: eval error -> repair attempt {self.repair_attempts}"
 
         # success: record the iteration
@@ -185,6 +194,7 @@ class EpisodeState:
             f"iter {self.iteration}: cost {outcome.total_cost:.2f} "
             f"(best {self.best_cost:.2f}, {self.repair_attempts} repairs)"
         )
+        self._log_event("score", msg, value=outcome.total_cost)
         self.repair_attempts = 0
         self.restarts = 0
         self.iteration += 1
