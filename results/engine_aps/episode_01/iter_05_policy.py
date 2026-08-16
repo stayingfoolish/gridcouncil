@@ -1,0 +1,140 @@
+class DispatchPolicy:
+  def __init__(self):
+    self.price_history = {}
+    self.price_stats = {}
+    self.dispatch_plan = {}
+    self.plan_timestamp = -7
+    self.episodes = 0
+
+  def _update_price_stats(self, hour_of_day: int, current_price: float):
+    if hour_of_day not in self.price_history:
+      self.price_history[hour_of_day] = []
+    self.price_history[hour_of_day].append(current_price)
+
+    if len(self.price_history[hour_of_day]) > 30:
+      self.price_history[hour_of_day].pop(0)
+
+    prices = self.price_history[hour_of_day]
+    mean = sum(prices) / len(prices)
+    variance = sum((p - mean)**2 for p in prices) / len(prices)
+    std_dev = variance ** 0.5
+
+    self.price_stats[hour_of_day] = {'mean': mean, 'std': std_dev}
+
+  def _compute_dispatch_plan(self, current_hour: int, backlog_mwh: float,
+                             oldest_age_h: float, battery_soc_mwh: float,
+                             battery_capacity_mwh: float, battery_power_mw: float) -> dict:
+    plan = {}
+    planning_window = 24
+
+    force_serve_from_hour = max(0, int(oldest_age_h - 4))
+    min_serve_rate = backlog_mwh / max(1, 24 - force_serve_from_hour)
+
+    base_reserve = 0.15 * battery_capacity_mwh
+    aging_reserve = 0.05 * battery_capacity_mwh * (min(oldest_age_h, 24) / 24)
+    total_reserve = min(base_reserve + aging_reserve, 0.50 * battery_capacity_mwh)
+
+    available_battery_soc = battery_soc_mwh - total_reserve
+
+    hourly_costs = []
+    for offset in range(planning_window):
+      h = (current_hour + offset) % 24
+      expected_price = self.price_stats.get(h, {}).get('mean', 50.0)
+      hourly_costs.append((expected_price, h, offset))
+
+    hourly_costs.sort()
+
+    cumulative_served = 0
+    cumulative_charged = 0
+    temp_soc = battery_soc_mwh
+
+    for expected_price, hour, offset in hourly_costs:
+      if cumulative_served < backlog_mwh:
+        if offset < force_serve_from_hour or cumulative_served < backlog_mwh * 0.6:
+          serve_qty = 0
+        else:
+          serve_qty = min(50, backlog_mwh - cumulative_served, 250)
+          cumulative_served += serve_qty
+      else:
+        serve_qty = 0
+
+      charge_qty = 0
+      if expected_price < self.price_stats.get(hour, {}).get('mean', 50.0) * 0.85:
+        charge_available = battery_capacity_mwh - temp_soc
+        charge_qty = min(charge_available * 0.6, battery_power_mw)
+        cumulative_charged += charge_qty
+        temp_soc += charge_qty
+
+      plan[hour] = {'serve_mwh': serve_qty, 'battery_mw': 0}
+      temp_soc -= serve_qty
+
+    if cumulative_served < backlog_mwh:
+      deficit = backlog_mwh - cumulative_served
+      for offset in range(force_serve_from_hour, planning_window):
+        h = (current_hour + offset) % 24
+        if h not in plan:
+          plan[h] = {'serve_mwh': 0, 'battery_mw': 0}
+        added_serve = min(deficit, 250)
+        plan[h]['serve_mwh'] += added_serve
+        deficit -= added_serve
+        if deficit <= 0:
+          break
+
+    expensive_hours = sorted(hourly_costs, key=lambda x: -x[0])[:6]
+    discharge_needed = max(0, backlog_mwh * 0.3)
+    for _, hour, _ in expensive_hours:
+      if discharge_needed > 0 and hour in plan:
+        discharge_qty = min(discharge_needed, available_battery_soc * 0.5, battery_power_mw)
+        plan[hour]['battery_mw'] = -discharge_qty
+        discharge_needed -= discharge_qty
+        available_battery_soc -= discharge_qty
+
+    return plan
+
+  def take_action(self, hour_of_day: int, current_price: float, firm_load_mw: float,
+                  arriving_flex_mw: float, backlog_mwh: float, oldest_backlog_age_h: float,
+                  battery_soc_mwh: float, battery_capacity_mwh: float,
+                  battery_power_mw: float) -> tuple:
+
+    self._update_price_stats(hour_of_day, current_price)
+
+    should_replan = (hour_of_day % 6 == 0) or (oldest_backlog_age_h > 18) or (self.episodes == 0)
+
+    if should_replan:
+      self.dispatch_plan = self._compute_dispatch_plan(
+        hour_of_day, backlog_mwh, oldest_backlog_age_h,
+        battery_soc_mwh, battery_capacity_mwh, battery_power_mw
+      )
+      self.plan_timestamp = hour_of_day
+
+    plan_entry = self.dispatch_plan.get(hour_of_day, {'serve_mwh': 0, 'battery_mw': 0})
+
+    expected_price = self.price_stats.get(hour_of_day, {}).get('mean', current_price)
+    std_dev = self.price_stats.get(hour_of_day, {}).get('std', 5.0)
+
+    if std_dev > 0 and expected_price > 1:
+      cv = std_dev / expected_price
+      margin = cv * 0.5
+    else:
+      margin = 0.1
+
+    if current_price < expected_price * (1 - margin):
+      flex_serve_mw = min(arriving_flex_mw + plan_entry['serve_mwh'] * 1.3, 250)
+      available_charge = battery_capacity_mwh - battery_soc_mwh
+      battery_mw = min(available_charge * 0.8, battery_power_mw * 0.9)
+
+    elif current_price > expected_price * (1 + margin):
+      flex_serve_mw = min(arriving_flex_mw + plan_entry['serve_mwh'] * 0.7, 250)
+      available_discharge = min(battery_soc_mwh * 0.6, battery_power_mw)
+      battery_mw = -available_discharge if available_discharge > 5 else 0
+
+    else:
+      flex_serve_mw = min(arriving_flex_mw + plan_entry['serve_mwh'], 250)
+      battery_mw = plan_entry['battery_mw']
+
+    if oldest_backlog_age_h >= 22:
+      flex_serve_mw = min(arriving_flex_mw + backlog_mwh * 0.9, 250)
+      available_discharge = min(battery_soc_mwh * 0.7, battery_power_mw)
+      battery_mw = -available_discharge * 0.8 if available_discharge > 5 else 0
+
+    return flex_serve_mw, battery_mw

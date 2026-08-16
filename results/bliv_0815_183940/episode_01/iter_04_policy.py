@@ -1,0 +1,357 @@
+from collections import deque
+import math
+from dataclasses import dataclass
+from typing import Tuple, List
+
+@dataclass
+class PriceRegime:
+    volatility: float
+    trend_strength: float
+    mean_reversion_strength: float
+    regime_type: str
+
+class Policy:
+    def __init__(self):
+        self.max_charge_power = 10
+        self.max_discharge_power = 5
+        self.battery_capacity = 50
+        
+        self.price_history = deque(maxlen=120)
+        self.recent_actions = deque(maxlen=30)
+        self.realized_outcomes = deque(maxlen=30)
+        
+        self.volatility_window = 20
+        self.base_margin_threshold = 0.06
+        self.margin_multiplier = 1.0
+        
+        self.current_action = "IDLE"
+        self.action_entry_time = 0
+        self.action_entry_price = 0
+        self.action_entry_soc = 0
+        
+        self.performance_by_regime = {}
+        self.action_success_rate = {}
+        self.price_range_memory = deque(maxlen=50)
+        
+        self.horizons = [5, 15, 30]
+        self.horizon_predictions = {}
+        
+        self.emergency_soc_high = 0.95
+        self.emergency_soc_low = 0.10
+        self.safety_margin = 0.03
+        
+        self.step_counter = 0
+
+    def _analyze_price_regime(self) -> PriceRegime:
+        if len(self.price_history) < 20:
+            return PriceRegime(
+                volatility=0.05,
+                trend_strength=0.0,
+                mean_reversion_strength=0.0,
+                regime_type="insufficient_data"
+            )
+        
+        recent = list(self.price_history)[-20:]
+        older = list(self.price_history)[-60:-20] if len(self.price_history) >= 60 else recent
+        
+        recent_returns = [
+            (recent[i] - recent[i-1]) / (recent[i-1] + 1e-6) 
+            for i in range(1, len(recent))
+        ]
+        volatility = math.sqrt(sum(r**2 for r in recent_returns) / len(recent_returns))
+        
+        recent_slope = (recent[-1] - recent[0]) / (recent[0] + 1e-6)
+        older_slope = (older[-1] - older[0]) / (older[0] + 1e-6) if older else 0
+        trend_strength = abs(recent_slope)
+        
+        long_mean = sum(self.price_history) / len(self.price_history)
+        deviations = [(p - long_mean) / (long_mean + 1e-6) for p in recent]
+        mean_reversion_strength = abs(sum(deviations) / len(deviations))
+        
+        if volatility > 0.08 and trend_strength > 0.05:
+            regime_type = "high_vol_trending"
+        elif volatility < 0.04 and mean_reversion_strength > 0.08:
+            regime_type = "low_vol_mean_reverting"
+        else:
+            regime_type = "volatile_choppy"
+        
+        return PriceRegime(
+            volatility=volatility,
+            trend_strength=trend_strength,
+            mean_reversion_strength=mean_reversion_strength,
+            regime_type=regime_type
+        )
+    
+    def _multi_horizon_prediction(self, price_history: deque) -> dict:
+        if len(price_history) < 5:
+            current = price_history[-1] if price_history else 0
+            return {h: [current] * 3 for h in self.horizons}
+        
+        predictions = {}
+        recent_prices = list(price_history)[-30:]
+        long_mean = sum(price_history) / len(price_history)
+        
+        for horizon in self.horizons:
+            alpha = 2.0 / (horizon + 1)
+            forecast = []
+            current_pred = recent_prices[-1]
+            trend = (recent_prices[-1] - recent_prices[-min(5, len(recent_prices))]) / max(1, len(recent_prices)-1)
+            
+            for step in range(3):
+                reversion_factor = min(0.3 * (step + 1) / 3, 0.3)
+                current_pred = (alpha * current_pred + 
+                               (1 - alpha) * long_mean * (1 + reversion_factor * 
+                               (long_mean - current_pred) / (long_mean + 1e-6)))
+                current_pred = max(0.1, current_pred)
+                forecast.append(current_pred)
+                trend *= (1 - 0.1 * (step + 1))
+            
+            predictions[horizon] = forecast
+        
+        return predictions
+    
+    def _calculate_arbitrage_opportunity(self,
+        current_price: float,
+        predictions: dict,
+        action_type: str,
+        soc: float,
+        regime: PriceRegime
+    ) -> dict:
+        
+        opportunities = []
+        
+        for horizon, forecasts in predictions.items():
+            if action_type == "charge":
+                future_prices = forecasts
+                best_future = max(future_prices)
+                worst_future = min(future_prices)
+                expected_future = sum(future_prices) / len(future_prices)
+                
+                time_decay = 1.0 - (0.01 * horizon)
+                
+                best_margin = ((best_future * time_decay - current_price) / 
+                              (current_price + 1e-6))
+                expected_margin = ((expected_future * time_decay - current_price) / 
+                                  (current_price + 1e-6))
+                worst_margin = ((worst_future * time_decay - current_price) / 
+                               (current_price + 1e-6))
+                
+            else:
+                future_prices = forecasts
+                best_future = min(future_prices)
+                worst_future = max(future_prices)
+                expected_future = sum(future_prices) / len(future_prices)
+                
+                time_decay = 1.0 - (0.01 * horizon)
+                
+                best_margin = ((current_price * time_decay - best_future) / 
+                              (current_price + 1e-6))
+                expected_margin = ((current_price * time_decay - expected_future) / 
+                                  (current_price + 1e-6))
+                worst_margin = ((current_price * time_decay - worst_future) / 
+                               (current_price + 1e-6))
+            
+            confidence = 0.9 if horizon <= 5 else (0.7 if horizon <= 15 else 0.5)
+            
+            opportunities.append({
+                'horizon': horizon,
+                'expected_margin': expected_margin,
+                'best_margin': best_margin,
+                'worst_margin': worst_margin,
+                'confidence': confidence,
+                'upside': best_margin - expected_margin,
+                'downside': expected_margin - worst_margin,
+                'sharpe_ratio': (expected_margin / (abs(worst_margin - best_margin) + 1e-6))
+            })
+        
+        weighted_margin = sum(
+            opp['expected_margin'] * opp['confidence'] 
+            for opp in opportunities
+        ) / sum(opp['confidence'] for opp in opportunities)
+        
+        best_opp = max(opportunities, key=lambda x: x['sharpe_ratio'])
+        
+        return {
+            'weighted_expected_margin': weighted_margin,
+            'best_opportunity': best_opp,
+            'all_opportunities': opportunities,
+            'signal_strength': max(abs(best_opp['expected_margin']), 0) * best_opp['confidence']
+        }
+    
+    def _adaptive_threshold(self, regime: PriceRegime, soc: float) -> float:
+        base = self.base_margin_threshold
+        
+        if regime.regime_type == "high_vol_trending":
+            base *= 1.3
+        elif regime.regime_type == "low_vol_mean_reverting":
+            base *= 0.7
+        else:
+            base *= 1.1
+        
+        if soc < 0.3:
+            base *= 0.75
+        elif soc > 0.8:
+            base *= 0.75
+        
+        vol_adjustment = 1.0 + (regime.volatility / 0.10)
+        base *= vol_adjustment
+        
+        return max(0.02, min(0.20, base))
+    
+    def _should_exit_action(self, 
+        current_price: float, 
+        steps_elapsed: int,
+        regime: PriceRegime,
+        current_margin_realized: float
+    ) -> bool:
+        
+        if self.current_action == "IDLE":
+            return False
+        
+        action_type = self.current_action
+        margin_target = 0.10 if regime.regime_type == "high_vol_trending" else 0.12
+        
+        if abs(current_margin_realized) > margin_target:
+            return True
+        
+        if regime.regime_type == "volatile_choppy":
+            max_steps = 5
+        elif regime.regime_type == "high_vol_trending":
+            max_steps = 10
+        else:
+            max_steps = 7
+        
+        if steps_elapsed > max_steps:
+            return True
+        
+        if regime.regime_type == "volatile_choppy":
+            if action_type == "CHARGING" and current_margin_realized < -0.05:
+                return True
+            if action_type == "DISCHARGING" and current_margin_realized < -0.05:
+                return True
+        
+        return False
+    
+    def _update_learning(self, action: str, outcome: float, regime: str):
+        if regime not in self.performance_by_regime:
+            self.performance_by_regime[regime] = deque(maxlen=50)
+            self.action_success_rate[regime] = {}
+        
+        self.performance_by_regime[regime].append(outcome)
+        
+        if action not in self.action_success_rate[regime]:
+            self.action_success_rate[regime][action] = deque(maxlen=20)
+        
+        success = 1 if outcome > 0 else 0
+        self.action_success_rate[regime][action].append(success)
+        
+        if len(self.performance_by_regime[regime]) > 0:
+            regime_avg_outcome = sum(self.performance_by_regime[regime]) / len(self.performance_by_regime[regime])
+            
+            if regime_avg_outcome > 0.08:
+                self.base_margin_threshold *= 0.98
+            elif regime_avg_outcome < -0.05:
+                self.base_margin_threshold *= 1.02
+            
+            self.base_margin_threshold = max(0.04, min(0.12, self.base_margin_threshold))
+
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> float:
+        
+        self.battery_capacity = battery_capacity_kwh
+        self.price_history.append(current_grid_buy_price)
+        self.step_counter += 1
+        
+        soc = current_energy_stored_kwh / battery_capacity_kwh
+        excess_pv = max(0, current_pv_generation_kw - current_demand_kw)
+        deficit = max(0, current_demand_kw - current_pv_generation_kw)
+        
+        energy_to_full = battery_capacity_kwh - current_energy_stored_kwh
+        max_charge_available = min(self.max_charge_power, energy_to_full)
+        max_discharge_available = min(self.max_discharge_power, current_energy_stored_kwh)
+        
+        regime = self._analyze_price_regime()
+        predictions = self._multi_horizon_prediction(self.price_history)
+        
+        steps_in_action = len(self.recent_actions)
+        
+        if self.current_action != "IDLE":
+            current_margin_realized = 0
+            if self.current_action == "CHARGING":
+                current_margin_realized = ((current_grid_sell_price - self.action_entry_price) / 
+                                          (self.action_entry_price + 1e-6))
+            else:
+                current_margin_realized = ((self.action_entry_price - current_grid_sell_price) / 
+                                          (self.action_entry_price + 1e-6))
+            
+            if self._should_exit_action(current_grid_buy_price, steps_in_action, regime, current_margin_realized):
+                self._update_learning(self.current_action, current_margin_realized, regime.regime_type)
+                self.current_action = "IDLE"
+        
+        emergency_charge = soc < self.emergency_soc_low and deficit > 0
+        emergency_discharge = soc > self.emergency_soc_high and excess_pv > 0
+        
+        if emergency_charge:
+            action_kw = min(max_charge_available, deficit)
+            self.current_action = "CHARGING"
+            self.action_entry_price = current_grid_buy_price
+            self.action_entry_time = self.step_counter
+            self.action_entry_soc = soc
+            return action_kw
+        
+        if emergency_discharge:
+            action_kw = -min(max_discharge_available, excess_pv)
+            self.current_action = "DISCHARGING"
+            self.action_entry_price = current_grid_sell_price
+            self.action_entry_time = self.step_counter
+            self.action_entry_soc = soc
+            return action_kw
+        
+        if self.current_action == "IDLE":
+            threshold = self._adaptive_threshold(regime, soc)
+            
+            charge_opportunity = self._calculate_arbitrage_opportunity(
+                current_grid_buy_price, predictions, "charge", soc, regime
+            )
+            
+            discharge_opportunity = self._calculate_arbitrage_opportunity(
+                current_grid_sell_price, predictions, "discharge", soc, regime
+            )
+            
+            can_charge = max_charge_available > 0.1 and soc < 0.95
+            can_discharge = max_discharge_available > 0.1 and soc > 0.15
+            
+            charge_signal = charge_opportunity['weighted_expected_margin']
+            discharge_signal = discharge_opportunity['weighted_expected_margin']
+            
+            if can_discharge and discharge_signal > threshold and excess_pv > 0:
+                power_to_discharge = min(
+                    max_discharge_available,
+                    excess_pv * 0.8
+                )
+                self.current_action = "DISCHARGING"
+                self.action_entry_price = current_grid_sell_price
+                self.action_entry_time = self.step_counter
+                self.action_entry_soc = soc
+                self.recent_actions.append("DISCHARGING")
+                return -power_to_discharge
+            
+            if can_charge and charge_signal > threshold:
+                power_to_charge = min(
+                    max_charge_available,
+                    self.max_charge_power * 0.8
+                )
+                self.current_action = "CHARGING"
+                self.action_entry_price = current_grid_buy_price
+                self.action_entry_time = self.step_counter
+                self.action_entry_soc = soc
+                self.recent_actions.append("CHARGING")
+                return power_to_charge
+        
+        return 0.0

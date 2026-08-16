@@ -1,0 +1,182 @@
+import numpy as np
+from collections import deque
+from typing import Tuple
+
+class DispatchPolicy:
+    def __init__(self):
+        self.price_history = deque(maxlen=720)  # 30 days of hourly prices
+        self.last_24h_prices = deque(maxlen=24)
+        self.hour_of_day_prices = {}
+        self.step_count = 0
+
+    def _get_price_stats(self):
+        if len(self.price_history) < 12:
+            return 50.0, 20.0, 30.0, 80.0
+        prices = list(self.price_history)
+        mean = np.mean(prices)
+        std = np.std(prices)
+        min_price = np.min(prices)
+        max_price = np.max(prices)
+        return mean, std, min_price, max_price
+
+    def _forecast_price_48h(self, current_hour_of_day: int):
+        if len(self.price_history) < 168:
+            return [self._get_hour_forecast(h) for h in range(48)]
+
+        seasonal_prices = {}
+        for hod in range(24):
+            hists = self.hour_of_day_prices.get(hod, [])
+            if len(hists) > 3:
+                seasonal_prices[hod] = np.median(hists[-14:])
+            else:
+                seasonal_prices[hod] = np.mean(list(self.price_history))
+
+        if len(self.last_24h_prices) >= 6:
+            recent_avg = np.mean(list(self.last_24h_prices)[-6:])
+            global_avg = np.mean(list(self.price_history))
+            momentum = (recent_avg - global_avg) * 0.5
+        else:
+            momentum = 0.0
+
+        forecast = []
+        for offset in range(48):
+            hod = (current_hour_of_day + offset) % 24
+            base_price = seasonal_prices.get(hod, 50.0)
+            forecast.append(base_price + momentum * (1 - offset/48))
+
+        return forecast
+
+    def _get_hour_forecast(self, hour_offset: int):
+        if len(self.price_history) == 0:
+            return 50.0
+        mean, std, _, _ = self._get_price_stats()
+        return mean
+
+    def _compute_flex_scheduling_optimized(self,
+                                          arriving_flex_mw: float,
+                                          backlog_mwh: float,
+                                          oldest_backlog_age_h: float,
+                                          current_price: float,
+                                          forecast_48h: list) -> float:
+        if oldest_backlog_age_h >= 18.0:
+            return arriving_flex_mw + min(backlog_mwh / max(1.0, 25.0 - oldest_backlog_age_h), backlog_mwh)
+
+        if backlog_mwh <= 0 and arriving_flex_mw <= 0:
+            return 0.0
+
+        future_24h_prices = forecast_48h[1:25]
+        if len(future_24h_prices) == 0:
+            return arriving_flex_mw
+
+        min_future_price = min(future_24h_prices)
+        max_future_price = max(future_24h_prices)
+
+        regret_forward = min_future_price - current_price
+        regret_opportunity = (max_future_price - current_price) * 0.3
+
+        regret_score = regret_forward + regret_opportunity
+
+        total_flex_available = arriving_flex_mw + (backlog_mwh / 1.0 if backlog_mwh > 0 else 0)
+
+        regret_threshold = 8.0
+
+        if regret_score < -regret_threshold:
+            serve_fraction = 0.3
+        elif regret_score > regret_threshold:
+            serve_fraction = 1.0
+        else:
+            serve_fraction = 0.5 + 0.1 * regret_score / regret_threshold
+
+        flex_serve_mw = min(arriving_flex_mw * serve_fraction + max(0, backlog_mwh * 0.2), total_flex_available)
+
+        return max(0.0, flex_serve_mw)
+
+    def _compute_battery_action_proactive(self,
+                                         current_price: float,
+                                         battery_soc_mwh: float,
+                                         battery_capacity_mwh: float,
+                                         battery_power_mw: float,
+                                         hour_of_day: int,
+                                         forecast_48h: list) -> float:
+        if len(self.price_history) < 12:
+            return 0.0
+
+        mean, std, _, _ = self._get_price_stats()
+
+        next_12h = forecast_48h[:12]
+        next_6h = forecast_48h[:6]
+
+        if len(next_12h) == 0 or len(next_6h) == 0:
+            return 0.0
+
+        min_12h_price = min(next_12h)
+        max_6h_price = max(next_6h)
+
+        valley_signal = (mean - min_12h_price) / (std + 1.0)
+        peak_signal = (max_6h_price - mean) / (std + 1.0)
+
+        next_24h = forecast_48h[:24]
+        if len(next_24h) > 0:
+            price_range_24h = max(next_24h) - min(next_24h)
+        else:
+            price_range_24h = 40.0
+
+        if price_range_24h > 80:
+            target_soc = 0.75 * battery_capacity_mwh
+        elif price_range_24h > 40:
+            target_soc = 0.50 * battery_capacity_mwh
+        else:
+            target_soc = 0.35 * battery_capacity_mwh
+
+        target_soc = np.clip(target_soc, 0.20 * battery_capacity_mwh, 0.85 * battery_capacity_mwh)
+
+        soc_error = target_soc - battery_soc_mwh
+
+        if valley_signal > 1.5 and soc_error > 20:
+            charge_rate = min(battery_power_mw,
+                            battery_power_mw * 0.8 * (1 + valley_signal / 5.0))
+            return charge_rate
+
+        elif peak_signal > 1.5 and soc_error < -20:
+            discharge_rate = -min(battery_power_mw,
+                                battery_power_mw * 0.8 * (1 + peak_signal / 5.0))
+            return discharge_rate
+
+        elif abs(soc_error) > 30:
+            correction = battery_power_mw * 0.25 * (soc_error / target_soc)
+            return np.clip(correction, -battery_power_mw, battery_power_mw)
+
+        else:
+            return 0.0
+
+    def take_action(self,
+                   hour_of_day: int,
+                   current_price: float,
+                   firm_load_mw: float,
+                   arriving_flex_mw: float,
+                   backlog_mwh: float,
+                   oldest_backlog_age_h: float,
+                   battery_soc_mwh: float,
+                   battery_capacity_mwh: float,
+                   battery_power_mw: float) -> tuple:
+
+        self.price_history.append(current_price)
+        self.last_24h_prices.append(current_price)
+        self.step_count += 1
+
+        if hour_of_day not in self.hour_of_day_prices:
+            self.hour_of_day_prices[hour_of_day] = []
+        self.hour_of_day_prices[hour_of_day].append(current_price)
+
+        forecast_48h = self._forecast_price_48h(hour_of_day)
+
+        flex_serve_mw = self._compute_flex_scheduling_optimized(
+            arriving_flex_mw, backlog_mwh, oldest_backlog_age_h, current_price, forecast_48h
+        )
+
+        battery_mw = self._compute_battery_action_proactive(
+            current_price, battery_soc_mwh, battery_capacity_mwh,
+            battery_power_mw, hour_of_day, forecast_48h
+        )
+
+        return flex_serve_mw, battery_mw

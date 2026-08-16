@@ -1,0 +1,104 @@
+class DispatchPolicy:
+    def __init__(self):
+        """Initializes the policy with price history tracking and state management."""
+        self.price_history = []
+        self.hour_counter = 0
+        self.history_window = 168  # 7 days in hours
+
+    def take_action(self,
+                    hour_of_day: int,
+                    current_price: float,
+                    firm_load_mw: float,
+                    arriving_flex_mw: float,
+                    backlog_mwh: float,
+                    oldest_backlog_age_h: float,
+                    battery_soc_mwh: float,
+                    battery_capacity_mwh: float,
+                    battery_power_mw: float) -> tuple:
+        
+        self.price_history.append(current_price)
+        if len(self.price_history) > self.history_window:
+            self.price_history.pop(0)
+        
+        self.hour_counter += 1
+        
+        current_hour_prices = []
+        for i in range(len(self.price_history)):
+            historical_hour = (self.hour_counter - len(self.price_history) + i) % 24
+            if historical_hour == hour_of_day:
+                current_hour_prices.append(self.price_history[i])
+        
+        if len(current_hour_prices) >= 3:
+            sorted_hour_prices = sorted(current_hour_prices)
+            price_median_this_hour = sorted_hour_prices[len(sorted_hour_prices) // 2]
+            price_std_this_hour = (max(current_hour_prices) - min(current_hour_prices)) / 2.0
+        else:
+            if len(self.price_history) > 0:
+                sorted_all_prices = sorted(self.price_history)
+                price_median_this_hour = sorted_all_prices[len(sorted_all_prices) // 2]
+                price_std_this_hour = (max(self.price_history) - min(self.price_history)) / 4.0
+            else:
+                price_median_this_hour = current_price
+                price_std_this_hour = 10.0
+        
+        cheap_threshold = price_median_this_hour - 1.2 * price_std_this_hour
+        expensive_threshold = price_median_this_hour + 1.2 * price_std_this_hour
+        
+        is_cheap = current_price < cheap_threshold
+        is_expensive = current_price > expensive_threshold
+        
+        urgency_factor = 0.0
+        if backlog_mwh > 0:
+            urgency_factor = min(1.0, oldest_backlog_age_h / 24.0)
+        
+        flex_serve_mw = 0.0
+        
+        if is_cheap or urgency_factor > 0.7:
+            flex_serve_mw = arriving_flex_mw
+            if backlog_mwh > 0 and urgency_factor > 0.7:
+                additional_capacity = min(250.0 - arriving_flex_mw, backlog_mwh / 1.0)
+                flex_serve_mw += additional_capacity
+        elif is_expensive:
+            flex_serve_mw = 0.0
+        else:
+            serve_threshold = arriving_flex_mw * (0.3 + 0.5 * urgency_factor)
+            flex_serve_mw = serve_threshold
+        
+        if backlog_mwh > 0 and oldest_backlog_age_h > 23.0:
+            flex_serve_mw = min(250.0, arriving_flex_mw + backlog_mwh / 1.0)
+        
+        flex_serve_mw = max(0.0, min(250.0, flex_serve_mw))
+        
+        battery_mw = 0.0
+        
+        firm_and_flex = firm_load_mw + flex_serve_mw
+        total_potential_load = firm_and_flex
+        
+        if is_cheap and battery_soc_mwh < battery_capacity_mwh * 0.8:
+            charge_available = battery_capacity_mwh - battery_soc_mwh
+            charge_rate = min(battery_power_mw, charge_available / 1.0)
+            battery_mw = charge_rate
+        
+        elif is_expensive and battery_soc_mwh > battery_capacity_mwh * 0.2:
+            discharge_available = battery_soc_mwh
+            discharge_rate = min(battery_power_mw, discharge_available / 1.0)
+            battery_mw = -discharge_rate
+        
+        else:
+            if total_potential_load > 400.0 and battery_soc_mwh > battery_capacity_mwh * 0.3:
+                discharge_available = battery_soc_mwh
+                discharge_rate = min(battery_power_mw, discharge_available / 1.0)
+                battery_mw = -discharge_rate
+            
+            elif total_potential_load < 250.0 and battery_soc_mwh < battery_capacity_mwh * 0.7:
+                charge_available = battery_capacity_mwh - battery_soc_mwh
+                charge_rate = min(battery_power_mw, charge_available / 1.0)
+                battery_mw = charge_rate
+        
+        soc_after_charge = battery_soc_mwh + battery_mw * 1.0
+        if soc_after_charge < 0:
+            battery_mw = -battery_soc_mwh
+        elif soc_after_charge > battery_capacity_mwh:
+            battery_mw = battery_capacity_mwh - battery_soc_mwh
+        
+        return flex_serve_mw, battery_mw

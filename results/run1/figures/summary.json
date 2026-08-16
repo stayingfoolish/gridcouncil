@@ -1,0 +1,54 @@
+{
+  "benchmarks": {
+    "no_battery": {
+      "ours": 10.64,
+      "reference": 10.7
+    },
+    "finite_horizon_opt": {
+      "ours": -6.32,
+      "reference": -6.67
+    },
+    "steady_state_opt": {
+      "ours": -5.55,
+      "reference": -5.2
+    },
+    "price_volatility_pct": 10.1
+  },
+  "episodes": 10,
+  "iterations": 10,
+  "outliers_removed": [],
+  "median_per_iteration": [
+    -2.92,
+    3.79,
+    10.92,
+    11.86,
+    24.4,
+    15.7,
+    19.69,
+    11.29,
+    30.1,
+    20.58
+  ],
+  "best_cost_per_episode": {
+    "episode_01": -6.08,
+    "episode_02": -5.55,
+    "episode_03": -6.04,
+    "episode_04": -4.52,
+    "episode_05": -5.97,
+    "episode_06": -1.32,
+    "episode_07": -6.04,
+    "episode_08": -5.17,
+    "episode_09": -6.04,
+    "episode_10": -5.58
+  },
+  "best_overall": {
+    "cost": -6.08,
+    "episode": "episode_01",
+    "iteration": 0,
+    "gap_to_fh_opt": 0.24
+  },
+  "repair_stats": {
+    "total_repairs": 10,
+    "failed_iterations": 0
+  }
+}

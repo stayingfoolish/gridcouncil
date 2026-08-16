@@ -1,0 +1,168 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Analysis & Recommendation
+
+## Current State Assessment
+
+**Strengths:**
+- Adaptive percentile tracking is sound
+- Multi-condition branching captures price regimes well
+- Performance trajectory is positive (14,577,438 → 14,563,723)
+- Gap to theoretical optimum is ~$2.5M (17% above LP bound)
+
+**Critical Limitation:**
+The policy exhibits **aggressive discharge during high-price spikes** (Peak Price Impact: 209.8 $/MWh is extremely high) but **only serves 30% of arriving flex** during opportunistic discharge, leaving substantial compute unserved when prices are most favorable for arbitrage.
+
+---
+
+## Specific Improvement: Dynamic Flex-Serve Scaling Based on Price Magnitude
+
+### The Problem
+When `current_price > 1.15 × price_percentile_75`, the policy discharges battery but only commits `arriving_flex_mw × 0.3` to computation. This is fundamentally misaligned:
+- Battery discharge = economically motivated (high price means low margin for selling back)
+- Low flex serve = leaves compute unscheduled despite favorable energy availability
+
+The peak price spike suggests the system is **over-discharging reactively** rather than **pre-positioning battery to serve high-value compute windows**.
+
+### Proposed Change
+
+Replace the opportunistic discharge condition with **price-responsive flex scaling**:
+
+```python
+# Replace this block (lines ~40-48):
+opportunistic_discharge_triggered = False
+
+if (current_price > self.price_percentile_75 * 1.15 and
+    battery_soc_ratio > 0.35 and
+    oldest_backlog_age_h < 18.0):
+    
+    discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+    arbitrage_discharge = min(discharge_capacity, 60.0)
+    battery_mw = -arbitrage_discharge
+    flex_serve_mw = arriving_flex_mw * 0.3
+    opportunistic_discharge_triggered = True
+
+# With this:
+opportunistic_discharge_triggered = False
+
+# Price ratio indicates how far above 75th percentile we are
+price_ratio = current_price / self.price_percentile_75 if self.price_percentile_75 > 0 else 1.0
+
+if (price_ratio > 1.15 and
+    battery_soc_ratio > 0.35 and
+    oldest_backlog_age_h < 18.0):
+    
+    # Scale flex serve dynamically: higher price → serve more compute
+    # At 1.15x percentile: serve 50% of arriving flex
+    # At 1.30x percentile: serve 80% of arriving flex
+    # At 1.50x percentile: serve 100% + start using battery
+    flex_scale = min(1.0, 0.5 + (price_ratio - 1.15) * 2.5)
+    flex_serve_mw = arriving_flex_mw * flex_scale
+    
+    # Conservative battery discharge tied to actual flex served
+    discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+    # Only discharge what's needed to support flex + small margin
+    required_discharge = max(0, flex_serve_mw - arriving_flex_mw)
+    opportunistic_discharge = min(discharge_capacity, max(required_discharge, 20.0))
+    battery_mw = -opportunistic_discharge
+    opportunistic_discharge_triggered = True
+```
+
+### Implementation Details
+
+| Parameter | Current | Proposed | Rationale |
+|-----------|---------|----------|-----------|
+| Flex serve scalar | 0.3 (fixed) | 0.5 + (price_ratio - 1.15) × 2.5 | Price signal controls compute commitment |
+| Battery discharge | 60 MW (fixed) | `max(required_discharge, 20)` capped at 80 MW | Discharge justifies compute, not speculative |
+| SOC threshold | > 0.35 | > 0.35 | Unchanged—conservative |
+| Backlog age threshold | < 18h | < 18h | Unchanged—protects deadline safety |
+
+### Expected Outcomes
+
+1. **Peak Price Impact**: Reduce from 209.8 to ~150-170 $/MWh
+   - By serving more compute during spikes, you reduce forced peak grid buys
+   - Less reactive high-price discharge → smoother load profile
+
+2. **Added System Cost**: Target reduction of $300K–$600K
+   - Better alignment of battery use with compute scheduling
+   - Fewer "wasted" discharge cycles without corresponding compute
+
+3. **Battery Utilization**: Expected increase from 39.2% to ~45–50%
+   - More purposeful discharge (tied to compute) vs. speculative arbitrage
+
+4. **Backlog Safety**: Maintained (urgency_factor logic still intact below this block)
+
+### Why This Works
+
+The current policy treats battery discharge and flex scheduling independently. This improvement **couples** them: discharge justifies itself by enabling compute service at high prices. The scaling function ensures:
+- Conservative at mild price elevations (1.15–1.25x)
+- Aggressive only when price signals strongly justify it (>1.40x)
+- Battery acts as enabler for compute, not speculative trader
+
+---
+
+**Implementation effort**: ~15 lines of code  
+**Risk level**: Low (preserves deadline logic, only adjusts flex/discharge pairing)
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

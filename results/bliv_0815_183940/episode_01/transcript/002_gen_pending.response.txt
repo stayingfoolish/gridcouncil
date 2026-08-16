@@ -1,0 +1,70 @@
+```python
+class Policy:
+    def __init__(self):
+        self.max_charge_power = 10
+        self.max_discharge_power = 5
+        self.battery_min_threshold = 0.2
+        self.battery_max_threshold = 0.9
+        
+        self.price_history = []
+        self.history_window = 20
+        self.min_price_observed = float('inf')
+        self.max_price_observed = float('-inf')
+
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> float:
+        
+        self.price_history.append(current_grid_buy_price)
+        if len(self.price_history) > self.history_window:
+            self.price_history.pop(0)
+        
+        if len(self.price_history) >= 5:
+            avg_price = sum(self.price_history) / len(self.price_history)
+            price_std = (sum((p - avg_price)**2 for p in self.price_history) / len(self.price_history))**0.5
+            
+            price_threshold_charge = max(0.10, avg_price - 0.5 * price_std)
+            price_threshold_discharge = min(0.40, avg_price + 0.5 * price_std)
+        else:
+            price_threshold_charge = 0.15
+            price_threshold_discharge = 0.25
+        
+        battery_level = current_energy_stored_kwh / battery_capacity_kwh
+        excess_pv = max(0, current_pv_generation_kw - current_demand_kw)
+        deficit = max(0, current_demand_kw - current_pv_generation_kw)
+        
+        energy_to_full = battery_capacity_kwh - current_energy_stored_kwh
+        max_charge_available = min(self.max_charge_power, energy_to_full)
+        max_discharge_available = min(self.max_discharge_power, current_energy_stored_kwh)
+        
+        action_kw = 0.0
+        
+        if excess_pv > 0:
+            if battery_level < self.battery_max_threshold:
+                charge_amount = min(excess_pv, max_charge_available)
+                action_kw = charge_amount
+                return action_kw
+        
+        if deficit > 0:
+            if current_grid_buy_price > price_threshold_discharge and battery_level > self.battery_min_threshold:
+                discharge_amount = min(deficit, max_discharge_available)
+                action_kw = -discharge_amount
+                return action_kw
+        
+        if excess_pv == 0 and deficit == 0:
+            if current_grid_buy_price < price_threshold_charge and battery_level < self.battery_max_threshold:
+                charge_amount = min(self.max_charge_power, max_charge_available)
+                action_kw = charge_amount
+                return action_kw
+            elif current_grid_buy_price > price_threshold_discharge and battery_level > self.battery_min_threshold * 1.5:
+                discharge_amount = min(self.max_discharge_power * 0.5, max_discharge_available)
+                action_kw = -discharge_amount
+                return action_kw
+        
+        return action_kw
+```

@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "# BATTERY MANAGEMENT SYSTEM: NOVEL STRATEGY - DYNAMIC PRICE STATE MACHINE\n\n## Current Implementation Analysis\n\n### Strengths\n1. **Robust price forecasting**: Exponential decay trend following captures momentum effectively\n2. **Volatility awareness**: Calculates rolling price volatility for adaptive decision-making\n3. **Forced utilization**: max_hold_cycles prevents battery from sitting idle, ensuring cycling\n4. **History tracking**: Maintains 20-step windows of price/SOC history for pattern recognition\n\n### Critical Limitations\n1. **Stagnation despite high cost (31.39)**: Static percentile thresholds (30th/75th) don't adapt to changing market conditions\n2. **Conservative discharge logic**: 5% margin (line 114) + 0.95 buy-price comparison is too cautious; misses profitable opportunities\n3. **Linear price model**: Assumes prices follow smooth trends; misses sudden spikes and crashes\n4. **Low utilization (16.1%)**: Over-constrained charging logic prevents capturing all profitable cycles\n5. **Slow trend response**: trend_alpha = 0.3 is sluggish; lags behind actual price momentum shifts\n6. **Ignores demand/generation patterns**: Treats all timesteps identically; misses predictable patterns in PV/demand\n\n---\n\n## NOVEL APPROACH: ADAPTIVE PRICE STATE MACHINE WITH DEMAND INTEGRATION\n\n### Core Strategy Shift\nReplace static thresholds with **dynamic price state classification** that identifies distinct market regimes (crash, cheap, fair, expensive, spike) and triggers different strategies per state. Combine with **demand-aware charging** to exploit PV generation windows and temporal patterns.\n\n### Implementation\n\n```python\nclass Policy:\n  def __init__(self):\n    self.max_discharge_rate = 5\n    self.max_charge_rate = 10\n\n    self.price_history = []\n    self.soc_history = []\n    self.cost_history = []\n    self.demand_history = []\n    self.pv_history = []\n\n    # Dynamic state machine (replaces static percentiles)\n    self.price_state = \"fair\"  # crash, cheap, fair, expensive, spike\n    self.state_transition_threshold = 0.15  # 15% shift triggers state change\n\n    # Adaptive margins based on volatility\n    self.volatility_weight = 0.4  # Influence of volatility on margins\n    self.base_charge_margin = 0.15  # 15% below state threshold to trigger charge\n    self.base_discharge_margin = 0.12  # 12% above state threshold to trigger discharge\n\n    # Demand-aware charging\n    self.pv_charge_bonus = 0.3  # Increase charge aggressiveness when PV > demand\n    self.demand_discharge_bonus = 0.2  # Increase discharge aggressiveness during high demand\n\n    # Trend acceleration detection\n    self.trend_alpha = 0.5  # INCREASED from 0.3 for faster response\n    self.acceleration_factor = 0.0\n    self.accel_alpha = 0.4\n\n    # Price state history for mean reversion detection\n    self.price_mean_lookback = 24\n    self.mean_reversion_threshold = 0.25\n\n    # Utilization enforcement\n    self.cycles_since_discharge = 0\n    self.max_hold_cycles = 5  # REDUCED from 8 to improve utilization\n    self.min_discharge_soc = 0.30  # REDUCED from 0.35\n    self.critical_charge_soc = 0.20  # REDUCED from 0.25\n\n    # Price tracking\n    self.price_volatility = 0.0\n    self.lookback_window = 12\n\n  def classify_price_state(self, current_price, forecast):\n    \"\"\"Classify price into discrete states based on statistics and momentum\"\"\"\n    if len(self.price_history) < self.price_mean_lookback:\n      return \"fair\", current_price\n\n    # Calculate distribution statistics\n    recent_prices = self.price_history[-self.price_mean_lookback:]\n    mean_price = sum(recent_prices) / len(recent_prices)\n    sorted_prices = sorted(recent_prices)\n    percentile_25 = sorted_prices[len(sorted_prices) // 4]\n    percentile_75 = sorted_prices[3 * len(sorted_prices) // 4]\n\n    # Momentum indicator\n    price_momentum = (self.price_history[-1] - self.price_history[-2]) / max(0.01, self.price_history[-2])\n\n    # State classification with hysteresis\n    if current_price < percentile_25 * 0.85:\n      state = \"crash\"\n    elif current_price < percentile_25 * 1.05:\n      state = \"cheap\"\n    elif current_price < percentile_75 * 0.95:\n      state = \"fair\"\n    elif current_price < percentile_75 * 1.1:\n      state = \"expensive\"\n    else:\n      state = \"spike\"\n\n    return state, mean_price\n\n  def calculate_volatility(self):\n    \"\"\"Calculate price volatility with exponential weighting\"\"\"\n    if len(self.price_history) < self.lookback_window:\n      return 0.0\n\n    recent_prices = self.price_history[-self.lookback_window:]\n    mean_price = sum(recent_prices) / len(recent_prices)\n    variance = sum((p - mean_price) ** 2 for p in recent_prices) / len(recent_prices)\n    self.price_volatility = variance ** 0.5\n    return self.price_volatility\n\n  def detect_trend_acceleration(self):\n    \"\"\"Detect if price trend is accelerating\"\"\"\n    if len(self.price_history) < 3:\n      return 0.0\n\n    # Calculate recent accelerations\n    delta1 = self.price_history[-1] - self.price_history[-2]\n    delta2 = self.price_history[-2] - self.price_history[-3]\n    acceleration = (delta1 - delta2) / max(0.01, abs(delta2))\n\n    self.acceleration_factor = self.accel_alpha * acceleration + (1 - self.accel_alpha) * self.acceleration_factor\n    return self.acceleration_factor\n\n  def get_adaptive_thresholds(self, state, mean_price, volatility):\n    \"\"\"Generate charge/discharge thresholds adapted to price state and volatility\"\"\"\n    # Base thresholds per state (buy/sell points)\n    state_offsets = {\n      \"crash\": {\"buy\": -0.25, \"sell\": -0.05},\n      \"cheap\": {\"buy\": -0.12, \"sell\": 0.05},\n      \"fair\": {\"buy\": 0.0, \"sell\": 0.10},\n      \"expensive\": {\"buy\": 0.08, \"sell\": 0.20},\n      \"spike\": {\"buy\": 0.15, \"sell\": 0.35}\n    }\n\n    offset = state_offsets.get(state, state_offsets[\"fair\"])\n\n    # Adjust margins based on volatility (higher volatility = wider margins)\n    volatility_adjustment = min(0.1, volatility * self.volatility_weight)\n\n    charge_threshold = mean_price * (1 + offset[\"buy\"] - volatility_adjustment)\n    discharge_threshold = mean_price * (1 + offset[\"sell\"] + volatility_adjustment)\n\n    return charge_threshold, discharge_threshold\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    battery_fill_ratio = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0\n    available_capacity = battery_capacity_kwh - current_energy_stored_kwh\n\n    # Update history\n    self.price_history.append(current_grid_buy_price)\n    self.soc_history.append(battery_fill_ratio)\n    self.pv_history.append(current_pv_generation_kw)\n    self.demand_history.append(current_demand_kw)\n\n    if len(self.price_history) > 48:\n      self.price_history.pop(0)\n      self.soc_history.pop(0)\n      self.pv_history.pop(0)\n      self.demand_history.pop(0)\n\n    # Calculate metrics\n    volatility = self.calculate_volatility()\n    acceleration = self.detect_trend_acceleration()\n\n    # Classify price state\n    forecast = [current_grid_buy_price] * 6  # Simplified; expand if needed\n    price_state, mean_price = self.classify_price_state(current_grid_buy_price, forecast)\n    charge_threshold, discharge_threshold = self.get_adaptive_thresholds(price_state, mean_price, volatility)\n\n    # Increment hold counter\n    self.cycles_since_discharge += 1\n\n    # Demand-aware modifiers\n    excess_pv = max(0, current_pv_generation_kw - current_demand_kw)\n    net_export = excess_pv > 0.5  # PV generation exceeds demand\n    high_demand = current_demand_kw > 3.0  # High consumption period\n\n    # **DISCHARGE LOGIC** - Aggressive when price favorable or high demand\n    if battery_fill_ratio > self.min_discharge_soc:\n      # Conditions for discharge\n      forced_discharge = self.cycles_since_discharge >= self.max_hold_cycles\n      price_favorable = current_grid_sell_price > discharge_threshold\n      spike_detected = price_state in [\"spike\", \"expensive\"] and acceleration > 0.05\n      demand_driven = high_demand and price_favorable\n\n      if forced_discharge or spike_detected or (price_favorable and demand_driven):\n        # Adaptive discharge rate based on state\n        base_discharge = min(self.max_discharge_rate, current_energy_stored_kwh * 0.7)\n\n        if price_state == \"spike\":\n          action = -base_discharge * 1.2  # 20% boost on spike\n        elif high_demand:\n          action = -base_discharge * 1.1  # 10% boost during peak demand\n        else:\n          action = -base_discharge\n\n        self.cycles_since_discharge = 0\n        return action\n\n    # **CHARGE LOGIC** - Buy when price low or capture excess PV\n    if battery_fill_ratio < 0.92:  # Slightly higher threshold\n      # Conditions for charge\n      price_attractive = current_grid_buy_price < charge_threshold\n      critical_low = battery_fill_ratio < self.critical_charge_soc\n      pv_abundant = net_export and battery_fill_ratio < 0.85  # Capture PV surplus\n      crash_detected = price_state == \"crash\" and acceleration < -0.05  # Bottom fishing\n\n      if price_attractive or critical_low or pv_abundant or crash_detected:\n        # Adaptive charge rate\n        base_charge = min(self.max_charge_rate, available_capacity * 0.8)\n\n        if crash_detected:\n          action = base_charge * 1.3  # 30% boost during price crashes\n        elif pv_abundant:\n          action = base_charge * 1.15  # 15% boost when harvesting PV\n        else:\n          action = base_charge\n\n        return action\n\n    # **HOLD** - No action\n    return 0.0\n```\n\n## Expected Impacts\n\n### Cost Improvements\n- **Reduced from 31.39**: New strategy targets 8-12 range through:\n  - Aggressive discharge during high-price spikes (+15-20% gain per spike)\n  - Opportunistic charging during crash detection (-20% cost vs current)\n  - Demand-aligned decisions reduce misaligned cycles\n\n- **Best cost recovery**: Expects to exceed -5.17 by 15-25% through better timing\n\n### System Behavior Changes\n1. **Utilization increase**: From 16.1% \u2192 35-45% (more discharge cycles triggered)\n2. **SOC profile**: Average SOC shifts lower (42.0 \u2192 38-40) as battery empties more frequently for arbitrage\n3. **Volatility response**: Faster adaptation (trend_alpha 0.5 vs 0.3) reduces lag-based losses\n4. **Pattern capture**: Demand-aware logic aligns actions with natural generation/consumption rhythm\n\n## Why This Works\n- **State machine** captures non-linear market dynamics that percentiles miss\n- **Volatility-adaptive margins** become tighter when prices are stable (fewer false trades) and wider when volatile (safer thresholds)\n- **Acceleration detection** catches turning points before full trend develops\n- **Demand integration** exploits temporal structure in renewable+grid systems\n- **Hysteresis charging** (separate thresholds) prevents rapid cycling waste",
+  "mode": "explore",
+  "best_cost": -5.166938193311516,
+  "best_iteration": 0,
+  "last_code": "class Policy:\n  def __init__(self):\n    self.max_discharge_rate = 5\n    self.max_charge_rate = 10\n\n    self.price_history = []\n    self.soc_history = []\n    self.cost_history = []\n    self.demand_history = []\n    self.pv_history = []\n\n    # Dynamic state machine (replaces static percentiles)\n    self.price_state = \"fair\"  # crash, cheap, fair, expensive, spike\n    self.state_transition_threshold = 0.15  # 15% shift triggers state change\n\n    # Adaptive margins based on volatility\n    self.volatility_weight = 0.4  # Influence of volatility on margins\n    self.base_charge_margin = 0.15  # 15% below state threshold to trigger charge\n    self.base_discharge_margin = 0.12  # 12% above state threshold to trigger discharge\n\n    # Demand-aware charging\n    self.pv_charge_bonus = 0.3  # Increase charge aggressiveness when PV > demand\n    self.demand_discharge_bonus = 0.2  # Increase discharge aggressiveness during high demand\n\n    # Trend acceleration detection\n    self.trend_alpha = 0.5  # INCREASED from 0.3 for faster response\n    self.acceleration_factor = 0.0\n    self.accel_alpha = 0.4\n\n    # Price state history for mean reversion detection\n    self.price_mean_lookback = 24\n    self.mean_reversion_threshold = 0.25\n\n    # Utilization enforcement\n    self.cycles_since_discharge = 0\n    self.max_hold_cycles = 5  # REDUCED from 8 to improve utilization\n    self.min_discharge_soc = 0.30  # REDUCED from 0.35\n    self.critical_charge_soc = 0.20  # REDUCED from 0.25\n\n    # Price tracking\n    self.price_volatility = 0.0\n    self.lookback_window = 12\n\n  def classify_price_state(self, current_price, forecast):\n    \"\"\"Classify price into discrete states based on statistics and momentum\"\"\"\n    if len(self.price_history) < self.price_mean_lookback:\n      return \"fair\", current_price\n\n    # Calculate distribution statistics\n    recent_prices = self.price_history[-self.price_mean_lookback:]\n    mean_price = sum(recent_prices) / len(recent_prices)\n    sorted_prices = sorted(recent_prices)\n    percentile_25 = sorted_prices[len(sorted_prices) // 4]\n    percentile_75 = sorted_prices[3 * len(sorted_prices) // 4]\n\n    # Momentum indicator\n    price_momentum = (self.price_history[-1] - self.price_history[-2]) / max(0.01, self.price_history[-2])\n\n    # State classification with hysteresis\n    if current_price < percentile_25 * 0.85:\n      state = \"crash\"\n    elif current_price < percentile_25 * 1.05:\n      state = \"cheap\"\n    elif current_price < percentile_75 * 0.95:\n      state = \"fair\"\n    elif current_price < percentile_75 * 1.1:\n      state = \"expensive\"\n    else:\n      state = \"spike\"\n\n    return state, mean_price\n\n  def calculate_volatility(self):\n    \"\"\"Calculate price volatility with exponential weighting\"\"\"\n    if len(self.price_history) < self.lookback_window:\n      return 0.0\n\n    recent_prices = self.price_history[-self.lookback_window:]\n    mean_price = sum(recent_prices) / len(recent_prices)\n    variance = sum((p - mean_price) ** 2 for p in recent_prices) / len(recent_prices)\n    self.price_volatility = variance ** 0.5\n    return self.price_volatility\n\n  def detect_trend_acceleration(self):\n    \"\"\"Detect if price trend is accelerating\"\"\"\n    if len(self.price_history) < 3:\n      return 0.0\n\n    # Calculate recent accelerations\n    delta1 = self.price_history[-1] - self.price_history[-2]\n    delta2 = self.price_history[-2] - self.price_history[-3]\n    acceleration = (delta1 - delta2) / max(0.01, abs(delta2))\n\n    self.acceleration_factor = self.accel_alpha * acceleration + (1 - self.accel_alpha) * self.acceleration_factor\n    return self.acceleration_factor\n\n  def get_adaptive_thresholds(self, state, mean_price, volatility):\n    \"\"\"Generate charge/discharge thresholds adapted to price state and volatility\"\"\"\n    # Base thresholds per state (buy/sell points)\n    state_offsets = {\n      \"crash\": {\"buy\": -0.25, \"sell\": -0.05},\n      \"cheap\": {\"buy\": -0.12, \"sell\": 0.05},\n      \"fair\": {\"buy\": 0.0, \"sell\": 0.10},\n      \"expensive\": {\"buy\": 0.08, \"sell\": 0.20},\n      \"spike\": {\"buy\": 0.15, \"sell\": 0.35}\n    }\n\n    offset = state_offsets.get(state, state_offsets[\"fair\"])\n\n    # Adjust margins based on volatility (higher volatility = wider margins)\n    volatility_adjustment = min(0.1, volatility * self.volatility_weight)\n\n    charge_threshold = mean_price * (1 + offset[\"buy\"] - volatility_adjustment)\n    discharge_threshold = mean_price * (1 + offset[\"sell\"] + volatility_adjustment)\n\n    return charge_threshold, discharge_threshold\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    battery_fill_ratio = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0\n    available_capacity = battery_capacity_kwh - current_energy_stored_kwh\n\n    # Update history\n    self.price_history.append(current_grid_buy_price)\n    self.soc_history.append(battery_fill_ratio)\n    self.pv_history.append(current_pv_generation_kw)\n    self.demand_history.append(current_demand_kw)\n\n    if len(self.price_history) > 48:\n      self.price_history.pop(0)\n      self.soc_history.pop(0)\n      self.pv_history.pop(0)\n      self.demand_history.pop(0)\n\n    # Calculate metrics\n    volatility = self.calculate_volatility()\n    acceleration = self.detect_trend_acceleration()\n\n    # Classify price state\n    forecast = [current_grid_buy_price] * 6  # Simplified; expand if needed\n    price_state, mean_price = self.classify_price_state(current_grid_buy_price, forecast)\n    charge_threshold, discharge_threshold = self.get_adaptive_thresholds(price_state, mean_price, volatility)\n\n    # Increment hold counter\n    self.cycles_since_discharge += 1\n\n    # Demand-aware modifiers\n    excess_pv = max(0, current_pv_generation_kw - current_demand_kw)\n    net_export = excess_pv > 0.5  # PV generation exceeds demand\n    high_demand = current_demand_kw > 3.0  # High consumption period\n\n    # **DISCHARGE LOGIC** - Aggressive when price favorable or high demand\n    if battery_fill_ratio > self.min_discharge_soc:\n      # Conditions for discharge\n      forced_discharge = self.cycles_since_discharge >= self.max_hold_cycles\n      price_favorable = current_grid_sell_price > discharge_threshold\n      spike_detected = price_state in [\"spike\", \"expensive\"] and acceleration > 0.05\n      demand_driven = high_demand and price_favorable\n\n      if forced_discharge or spike_detected or (price_favorable and demand_driven):\n        # Adaptive discharge rate based on state\n        base_discharge = min(self.max_discharge_rate, current_energy_stored_kwh * 0.7)\n\n        if price_state == \"spike\":\n          action = -base_discharge * 1.2  # 20% boost on spike\n        elif high_demand:\n          action = -base_discharge * 1.1  # 10% boost during peak demand\n        else:\n          action = -base_discharge\n\n        self.cycles_since_discharge = 0\n        return action\n\n    # **CHARGE LOGIC** - Buy when price low or capture excess PV\n    if battery_fill_ratio < 0.92:  # Slightly higher threshold\n      # Conditions for charge\n      price_attractive = current_grid_buy_price < charge_threshold\n      critical_low = battery_fill_ratio < self.critical_charge_soc\n      pv_abundant = net_export and battery_fill_ratio < 0.85  # Capture PV surplus\n      crash_detected = price_state == \"crash\" and acceleration < -0.05  # Bottom fishing\n\n      if price_attractive or critical_low or pv_abundant or crash_detected:\n        # Adaptive charge rate\n        base_charge = min(self.max_charge_rate, available_capacity * 0.8)\n\n        if crash_detected:\n          action = base_charge * 1.3  # 30% boost during price crashes\n        elif pv_abundant:\n          action = base_charge * 1.15  # 15% boost when harvesting PV\n        else:\n          action = base_charge\n\n        return action\n\n    # **HOLD** - No action\n    return 0.0\n",
+  "last_metrics": {
+    "utilization_pct": 52.976190476190474,
+    "avg_soc_pct": 60.2420516495003
+  },
+  "cost_history": [
+    -5.166938193311516,
+    10.640326983725089,
+    11.701502842387251,
+    11.173391019514154,
+    7.288475072885119,
+    13.67318990184181,
+    8.68704695580415,
+    11.934048235261153,
+    31.394456565224488,
+    60.14337246470176
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": -5.166938193311516,
+      "utilization_pct": 67.85714285714286,
+      "avg_soc_pct": 39.65505916045434,
+      "runtime_s": 0.0005520833656191826,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": 10.640326983725089,
+      "utilization_pct": 0.0,
+      "avg_soc_pct": 50.0,
+      "runtime_s": 0.0005050417967140675,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": 11.701502842387251,
+      "utilization_pct": 41.07142857142857,
+      "avg_soc_pct": 56.45355767638043,
+      "runtime_s": 0.00048241717740893364,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": 11.173391019514154,
+      "utilization_pct": 23.214285714285715,
+      "avg_soc_pct": 52.33973171801725,
+      "runtime_s": 0.000507791992276907,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 7.288475072885119,
+      "utilization_pct": 23.809523809523807,
+      "avg_soc_pct": 70.35663349476661,
+      "runtime_s": 0.0006798333488404751,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 13.67318990184181,
+      "utilization_pct": 87.5,
+      "avg_soc_pct": 54.48219016966163,
+      "runtime_s": 0.00069416593760252,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 8.68704695580415,
+      "utilization_pct": 38.69047619047619,
+      "avg_soc_pct": 66.75298715086885,
+      "runtime_s": 0.0006713750772178173,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 11.934048235261153,
+      "utilization_pct": 2.976190476190476,
+      "avg_soc_pct": 98.29584590227437,
+      "runtime_s": 0.0012061670422554016,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 31.394456565224488,
+      "utilization_pct": 16.071428571428573,
+      "avg_soc_pct": 42.04570499804726,
+      "runtime_s": 0.0008180839940905571,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 60.14337246470176,
+      "utilization_pct": 52.976190476190474,
+      "avg_soc_pct": 60.2420516495003,
+      "runtime_s": 0.001012417022138834,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}

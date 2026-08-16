@@ -1,0 +1,105 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+## Suggested Improvement: Aggressive Dynamic Battery Arbitrage with Price-Threshold Charging
+
+**Core Problem Identified:** Battery utilization is critically low at 1.1%, indicating the battery charging/discharging logic is too conservative. The system is leaving significant arbitrage profit on the table.
+
+**Specific Implementation:**
+
+Replace the current battery logic (lines 76-92) with dynamic price-threshold charging:
+
+```python
+# Compute recent price statistics for dynamic thresholds
+recent_20h = self.price_history[-20:] if len(self.price_history) >= 20 else self.price_history
+price_20th_percentile = sorted(recent_20h)[int(len(recent_20h) * 0.2)] if recent_20h else 60.0
+price_80th_percentile = sorted(recent_20h)[int(len(recent_20h) * 0.8)] if recent_20h else 80.0
+price_mean = sum(recent_20h) / len(recent_20h) if recent_20h else 60.0
+
+# Aggressive charging at low prices
+target_soc = self.arbitrage_soc_target * battery_capacity_mwh
+if current_price < price_20th_percentile * 1.02 and soc_ratio < self.arbitrage_soc_target:
+    charge_amount = min(self.battery_charge_rate * 3.0, target_soc - battery_soc_mwh)
+    battery_mw = charge_amount
+# Aggressive discharge at high prices
+elif current_price > price_80th_percentile * 0.95 and soc_ratio > self.hedge_reserve:
+    discharge_amount = battery_power_mw * 1.5
+    available_discharge = battery_soc_mwh * (1.0 - self.hedge_reserve)
+    battery_mw = -min(discharge_amount, available_discharge)
+```
+
+**Parameter Changes:**
+- Change `arbitrage_soc_target` from 0.70 to 0.80 (more aggressive target)
+- Change `hedge_reserve` from 0.20 to 0.15 (freer discharge availability)
+- Change `battery_charge_rate` from 8 to 10 (slightly higher baseline)
+
+**Expected Impact:**
+- Battery utilization: 1.1% → 15-25% (primary cost reduction driver)
+- Added system cost reduction: ~$400K-$600K annually
+- Mechanism: More frequent arbitrage captures cheap-to-peak price spreads; current thresholds are so restrictive that opportunities pass without exploitation
+- Risk mitigation: Dynamic thresholds adapt to market volatility; hedge_reserve still prevents over-discharge
+
+**Why This Specific Improvement:**
+This directly addresses the fundamental inefficiency (low battery utilization) with minimal code changes and immediate implementability. The other parameters (serve_fraction, volatility estimation) are secondary—the battery is where the profit leakage occurs.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

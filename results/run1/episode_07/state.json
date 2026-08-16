@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "# Novel Battery Management Strategy: Predictive Regime-Based Arbitrage\n\n## Current Implementation Analysis\n\n### Strengths:\n- Volatility-responsive thresholds that adapt to market conditions\n- Momentum tracking for trend detection\n- Dual time-window tracking (20 and 60 periods) for multi-scale analysis\n- Fast state switching for opportunity capture\n\n### Critical Limitations:\n1. **Reactive Lag**: Decisions based only on current spread and volatility\u2014misses directional opportunities\n2. **High Performance Variance**: Costs ranging from -6.04 to 81.50 indicate strategy instability\n3. **Underutilized Battery**: 60.1% utilization suggests excessive caution despite aggressive SOC targets (0.88/0.12)\n4. **Weak Directional Signals**: Momentum is too simple (3-period up/down count) to capture real trends\n5. **No Lookahead**: Charging/discharging based only on current conditions, not predicted future prices\n\n## Proposed Approach: Predictive Regime-Based Arbitrage\n\n### Core Innovation: Three-Strategy Regime Switcher\n\nInstead of uniform rules, detect market regime and apply regime-specific strategies:\n\n#### Regime 1: MEAN-REVERTING (High volatility + prices oscillating)\n- Quick profit-taking on small spreads (threshold: 1%)\n- Tight SOC targets (0.20-0.80) for rapid cycling\n- Shorter hold periods, frequent small trades\n\n#### Regime 2: TRENDING (Lower volatility + directional movement)\n- Hold positions longer to capture trends\n- Asymmetric charge/discharge triggers\n- Build up battery against trend direction\n\n#### Regime 3: FLAT (Low volatility + neutral momentum)\n- Minimum activity threshold to avoid dead trades\n- Conservative positioning (0.40-0.60 SOC)\n- Wait for regime change\n\n### Key Implementation Details\n\n```python\nclass Policy:\n  def __init__(self):\n    \"\"\"Predictive regime-based arbitrage system.\"\"\"\n    self.max_charge_rate = 12.0\n    self.max_discharge_rate = 10.0\n\n    # Price prediction buffers\n    self.price_history = []\n    self.history_length = 40  # Extended for trend analysis\n\n    # Regime detection\n    self.regime = \"FLAT\"\n    self.regime_confidence = 0.5\n    self.regime_age = 0\n\n    # Predictive signals\n    self.price_trend = 0  # -1, 0, 1\n    self.price_acceleration = 0  # Is trend strengthening?\n    self.predicted_next_price = None\n\n    # Adaptive thresholds per regime\n    self.regime_thresholds = {\n      \"MEAN_REVERTING\": {\"spread\": 0.008, \"charge_soc\": 0.20, \"discharge_soc\": 0.80},\n      \"TRENDING\": {\"spread\": 0.015, \"charge_soc\": 0.10, \"discharge_soc\": 0.90},\n      \"FLAT\": {\"spread\": 0.025, \"charge_soc\": 0.40, \"discharge_soc\": 0.60}\n    }\n\n    self.min_state_duration = 1\n    self.state = \"NEUTRAL\"\n    self.state_age = 0\n\n  def calculate_trend_strength(self):\n    \"\"\"Extract directional signal using dual moving averages.\"\"\"\n    if len(self.price_history) < 15:\n      return 0, 0\n\n    prices = self.price_history\n    ma_short = sum(prices[-5:]) / 5\n    ma_long = sum(prices[-15:]) / 15\n\n    trend = ma_short - ma_long\n    trend_strength = abs(trend) / ma_long if ma_long > 0 else 0\n\n    # Acceleration: is trend increasing?\n    if len(prices) >= 20:\n      prev_ma_short = sum(prices[-10:-5]) / 5\n      prev_ma_long = sum(prices[-20:-5]) / 15\n      prev_trend = prev_ma_short - prev_ma_long\n      acceleration = (trend - prev_trend) / abs(prev_trend + 1e-6)\n    else:\n      acceleration = 0\n\n    direction = 1 if trend > 0 else (-1 if trend < 0 else 0)\n    return direction, min(trend_strength * 3, 1.0), acceleration\n\n  def predict_next_price(self):\n    \"\"\"Simple linear extrapolation for next price.\"\"\"\n    if len(self.price_history) < 5:\n      return self.price_history[-1] if self.price_history else None\n\n    recent = self.price_history[-5:]\n    slope = (recent[-1] - recent[0]) / 4  # 4-period change rate\n    predicted = recent[-1] + slope\n    return predicted\n\n  def detect_regime(self, volatility, trend_strength, momentum_direction):\n    \"\"\"Classify current market regime.\"\"\"\n    if volatility > 0.08 and trend_strength < 0.15:\n      new_regime = \"MEAN_REVERTING\"\n    elif trend_strength > 0.08:\n      new_regime = \"TRENDING\"\n    else:\n      new_regime = \"FLAT\"\n\n    # Smooth regime transitions (require regime to persist 2+ periods)\n    if new_regime != self.regime:\n      self.regime_age = 0\n    else:\n      self.regime_age += 1\n      if self.regime_age >= 2:\n        self.regime = new_regime\n\n  def calculate_volatility(self, prices):\n    \"\"\"Rolling volatility (coefficient of variation).\"\"\"\n    if len(prices) < 3:\n      return 0.01\n    mean_price = sum(prices) / len(prices)\n    if mean_price < 1e-6:\n      return 0.01\n    variance = sum((p - mean_price) ** 2 for p in prices) / len(prices)\n    volatility = (variance ** 0.5) / mean_price\n    return volatility\n\n  def evaluate_charge_action(self, current_soc, spread, regime, trend, available_to_charge):\n    \"\"\"Charge decision with predictive and regime components.\"\"\"\n    if available_to_charge < 0.1:\n      return 0.0\n\n    config = self.regime_thresholds.get(regime, self.regime_thresholds[\"FLAT\"])\n    threshold = config[\"spread\"]\n    charge_soc_min = config[\"charge_soc\"]\n\n    if spread < threshold:\n      return 0.0\n\n    # Boost charging if prices predicted to rise (buy low before rise)\n    trend_bonus = 1.0\n    if trend < 0:  # Prices trending down\u2014good entry\n      trend_bonus = 1.4\n\n    # Accelerate if SOC much below target\n    energy_gap = max(0, (charge_soc_min - current_soc) * 100)\n    rate = self.max_charge_rate * (0.5 + energy_gap / 150) * trend_bonus\n\n    return min(rate, available_to_charge)\n\n  def evaluate_discharge_action(self, current_soc, spread, regime, trend, available_to_discharge):\n    \"\"\"Discharge decision with predictive and regime components.\"\"\"\n    if available_to_discharge < 0.1:\n      return 0.0\n\n    config = self.regime_thresholds.get(regime, self.regime_thresholds[\"FLAT\"])\n    threshold = config[\"spread\"]\n    discharge_soc_max = config[\"discharge_soc\"]\n\n    if spread < threshold:\n      return 0.0\n\n    # Boost discharging if prices predicted to fall (sell high before fall)\n    trend_bonus = 1.0\n    if trend > 0:  # Prices trending up\u2014good exit\n      trend_bonus = 1.4\n\n    # Accelerate if SOC much above target\n    energy_gap = max(0, (current_soc - discharge_soc_max) * 100)\n    rate = self.max_discharge_rate * (0.5 + energy_gap / 150) * trend_bonus\n\n    return min(rate, available_to_discharge)\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n    \"\"\"Main control loop with regime-based decisions.\"\"\"\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0\n\n    # Update price history\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > self.history_length:\n      self.price_history.pop(0)\n\n    # Calculate signals\n    trend_direction, trend_strength, trend_accel = self.calculate_trend_strength()\n    volatility = self.calculate_volatility(self.price_history)\n    spread = max(0.0, (current_grid_buy_price - current_grid_sell_price) / max(current_grid_buy_price, 1e-6))\n\n    # Detect regime\n    self.detect_regime(volatility, trend_strength, trend_direction)\n\n    # Energy constraints\n    min_energy = battery_capacity_kwh * 0.05\n    max_energy = battery_capacity_kwh * 0.95\n    available_to_discharge = max(0, current_energy_stored_kwh - min_energy)\n    available_to_charge = max(0, max_energy - current_energy_stored_kwh)\n\n    # Evaluate actions\n    charge_rate = self.evaluate_charge_action(current_soc, spread, self.regime, trend_direction, available_to_charge)\n    discharge_rate = self.evaluate_discharge_action(current_soc, spread, self.regime, trend_direction, available_to_discharge)\n\n    # State machine: prioritize signals\n    if discharge_rate > 0.5 and (self.state != \"CHARGING\" or self.state_age > self.min_state_duration):\n      self.state = \"DISCHARGING\"\n      self.state_age = 0\n      return -discharge_rate\n\n    elif charge_rate > 0.5 and (self.state != \"DISCHARGING\" or self.state_age > self.min_state_duration):\n      self.state = \"CHARGING\"\n      self.state_age = 0\n      return charge_rate\n\n    else:\n      self.state = \"NEUTRAL\"\n      self.state_age += 1\n      return 0.0\n```\n\n## Expected Impact\n\n### Immediate Improvements:\n1. **Trend Following**: Capture sustained price movements rather than just oscillations\n2. **Regime Adaptation**: Use tighter spreads in mean-reverting regimes, exploit trends in trending regimes\n3. **Predictive Positioning**: Build battery position before predicted price movements\n4. **Stabilized Performance**: Reduced variance by switching strategies rather than forcing single approach\n5. **Higher Utilization**: More aggressive SOC targets when trends are strong, conservative when flat\n\n### Projected Outcomes:\n- **Cost Reduction**: Target best cost < -15 (from current -6.04) through better directional capture\n- **Lower Variance**: Performance history stabilization through regime-specific thresholds\n- **Battery Utilization**: Expected 75-85% utilization through regime-driven positioning\n- **Reduced Dead Periods**: Flat regime detection minimizes loss-making low-spread trades\n\n## Implementation Notes:\n- Trend strength calculation uses dual MAs for both direction and magnitude\n- Acceleration detection identifies strengthening trends for higher confidence\n- Regime persistence (2-period requirement) prevents whipsaws\n- Config-driven thresholds make live tuning possible without code changes\n- Price prediction is deliberately simple (linear) for robustness\u2014more complex models risk overfitting",
+  "mode": "explore",
+  "best_cost": -6.044736254386303,
+  "best_iteration": 2,
+  "last_code": "class Policy:\n  def __init__(self):\n    \"\"\"Predictive regime-based arbitrage system.\"\"\"\n    self.max_charge_rate = 12.0\n    self.max_discharge_rate = 10.0\n\n    # Price prediction buffers\n    self.price_history = []\n    self.history_length = 40  # Extended for trend analysis\n\n    # Regime detection\n    self.regime = \"FLAT\"\n    self.regime_confidence = 0.5\n    self.regime_age = 0\n\n    # Predictive signals\n    self.price_trend = 0  # -1, 0, 1\n    self.price_acceleration = 0  # Is trend strengthening?\n    self.predicted_next_price = None\n\n    # Adaptive thresholds per regime\n    self.regime_thresholds = {\n      \"MEAN_REVERTING\": {\"spread\": 0.008, \"charge_soc\": 0.20, \"discharge_soc\": 0.80},\n      \"TRENDING\": {\"spread\": 0.015, \"charge_soc\": 0.10, \"discharge_soc\": 0.90},\n      \"FLAT\": {\"spread\": 0.025, \"charge_soc\": 0.40, \"discharge_soc\": 0.60}\n    }\n\n    self.min_state_duration = 1\n    self.state = \"NEUTRAL\"\n    self.state_age = 0\n\n  def calculate_trend_strength(self):\n    \"\"\"Extract directional signal using dual moving averages.\"\"\"\n    if len(self.price_history) < 15:\n      return 0, 0, 0\n\n    prices = self.price_history\n    ma_short = sum(prices[-5:]) / 5\n    ma_long = sum(prices[-15:]) / 15\n\n    trend = ma_short - ma_long\n    trend_strength = abs(trend) / ma_long if ma_long > 0 else 0\n\n    # Acceleration: is trend increasing?\n    if len(prices) >= 20:\n      prev_ma_short = sum(prices[-10:-5]) / 5\n      prev_ma_long = sum(prices[-20:-5]) / 15\n      prev_trend = prev_ma_short - prev_ma_long\n      acceleration = (trend - prev_trend) / abs(prev_trend + 1e-6)\n    else:\n      acceleration = 0\n\n    direction = 1 if trend > 0 else (-1 if trend < 0 else 0)\n    return direction, min(trend_strength * 3, 1.0), acceleration\n\n  def predict_next_price(self):\n    \"\"\"Simple linear extrapolation for next price.\"\"\"\n    if len(self.price_history) < 5:\n      return self.price_history[-1] if self.price_history else None\n\n    recent = self.price_history[-5:]\n    slope = (recent[-1] - recent[0]) / 4  # 4-period change rate\n    predicted = recent[-1] + slope\n    return predicted\n\n  def detect_regime(self, volatility, trend_strength, momentum_direction):\n    \"\"\"Classify current market regime.\"\"\"\n    if volatility > 0.08 and trend_strength < 0.15:\n      new_regime = \"MEAN_REVERTING\"\n    elif trend_strength > 0.08:\n      new_regime = \"TRENDING\"\n    else:\n      new_regime = \"FLAT\"\n\n    # Smooth regime transitions (require regime to persist 2+ periods)\n    if new_regime != self.regime:\n      self.regime_age = 0\n    else:\n      self.regime_age += 1\n      if self.regime_age >= 2:\n        self.regime = new_regime\n\n  def calculate_volatility(self, prices):\n    \"\"\"Rolling volatility (coefficient of variation).\"\"\"\n    if len(prices) < 3:\n      return 0.01\n    mean_price = sum(prices) / len(prices)\n    if mean_price < 1e-6:\n      return 0.01\n    variance = sum((p - mean_price) ** 2 for p in prices) / len(prices)\n    volatility = (variance ** 0.5) / mean_price\n    return volatility\n\n  def evaluate_charge_action(self, current_soc, spread, regime, trend, available_to_charge):\n    \"\"\"Charge decision with predictive and regime components.\"\"\"\n    if available_to_charge < 0.1:\n      return 0.0\n\n    config = self.regime_thresholds.get(regime, self.regime_thresholds[\"FLAT\"])\n    threshold = config[\"spread\"]\n    charge_soc_min = config[\"charge_soc\"]\n\n    if spread < threshold:\n      return 0.0\n\n    # Boost charging if prices predicted to rise (buy low before rise)\n    trend_bonus = 1.0\n    if trend < 0:  # Prices trending down\u2014good entry\n      trend_bonus = 1.4\n\n    # Accelerate if SOC much below target\n    energy_gap = max(0, (charge_soc_min - current_soc) * 100)\n    rate = self.max_charge_rate * (0.5 + energy_gap / 150) * trend_bonus\n\n    return min(rate, available_to_charge)\n\n  def evaluate_discharge_action(self, current_soc, spread, regime, trend, available_to_discharge):\n    \"\"\"Discharge decision with predictive and regime components.\"\"\"\n    if available_to_discharge < 0.1:\n      return 0.0\n\n    config = self.regime_thresholds.get(regime, self.regime_thresholds[\"FLAT\"])\n    threshold = config[\"spread\"]\n    discharge_soc_max = config[\"discharge_soc\"]\n\n    if spread < threshold:\n      return 0.0\n\n    # Boost discharging if prices predicted to fall (sell high before fall)\n    trend_bonus = 1.0\n    if trend > 0:  # Prices trending up\u2014good exit\n      trend_bonus = 1.4\n\n    # Accelerate if SOC much above target\n    energy_gap = max(0, (current_soc - discharge_soc_max) * 100)\n    rate = self.max_discharge_rate * (0.5 + energy_gap / 150) * trend_bonus\n\n    return min(rate, available_to_discharge)\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n    \"\"\"Main control loop with regime-based decisions.\"\"\"\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0\n\n    # Update price history\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > self.history_length:\n      self.price_history.pop(0)\n\n    # Calculate signals\n    trend_direction, trend_strength, trend_accel = self.calculate_trend_strength()\n    volatility = self.calculate_volatility(self.price_history)\n    spread = max(0.0, (current_grid_buy_price - current_grid_sell_price) / max(current_grid_buy_price, 1e-6))\n\n    # Detect regime\n    self.detect_regime(volatility, trend_strength, trend_direction)\n\n    # Energy constraints\n    min_energy = battery_capacity_kwh * 0.05\n    max_energy = battery_capacity_kwh * 0.95\n    available_to_discharge = max(0, current_energy_stored_kwh - min_energy)\n    available_to_charge = max(0, max_energy - current_energy_stored_kwh)\n\n    # Evaluate actions\n    charge_rate = self.evaluate_charge_action(current_soc, spread, self.regime, trend_direction, available_to_charge)\n    discharge_rate = self.evaluate_discharge_action(current_soc, spread, self.regime, trend_direction, available_to_discharge)\n\n    # State machine: prioritize signals\n    if discharge_rate > 0.5 and (self.state != \"CHARGING\" or self.state_age > self.min_state_duration):\n      self.state = \"DISCHARGING\"\n      self.state_age = 0\n      return -discharge_rate\n\n    elif charge_rate > 0.5 and (self.state != \"DISCHARGING\" or self.state_age > self.min_state_duration):\n      self.state = \"CHARGING\"\n      self.state_age = 0\n      return charge_rate\n\n    else:\n      self.state = \"NEUTRAL\"\n      self.state_age += 1\n      return 0.0\n",
+  "last_metrics": {
+    "utilization_pct": 63.69047619047619,
+    "avg_soc_pct": 49.617858769190434
+  },
+  "cost_history": [
+    10.220634755508168,
+    8.901047668924654,
+    -6.044736254386303,
+    -3.1864847793834494,
+    11.71198314508311,
+    9.762545569388081,
+    45.127879201449346,
+    54.77748684541767,
+    81.49912173315505,
+    78.96157157015443
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": 10.220634755508168,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 0.2958579881656805,
+      "runtime_s": 0.00048054102808237076,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": 8.901047668924654,
+      "utilization_pct": 6.547619047619048,
+      "avg_soc_pct": 3.8518410298001364,
+      "runtime_s": 0.0004787920042872429,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": -6.044736254386303,
+      "utilization_pct": 87.5,
+      "avg_soc_pct": 52.58571452722531,
+      "runtime_s": 0.0004879999905824661,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": -3.1864847793834494,
+      "utilization_pct": 60.11904761904761,
+      "avg_soc_pct": 57.748089548206416,
+      "runtime_s": 0.0005072499625384808,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 11.71198314508311,
+      "utilization_pct": 12.5,
+      "avg_soc_pct": 83.72478332671912,
+      "runtime_s": 0.000633749645203352,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 9.762545569388081,
+      "utilization_pct": 29.166666666666668,
+      "avg_soc_pct": 52.357744608180276,
+      "runtime_s": 0.0006828750483691692,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 45.127879201449346,
+      "utilization_pct": 72.02380952380952,
+      "avg_soc_pct": 58.45228234152412,
+      "runtime_s": 0.0009977500885725021,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 54.77748684541767,
+      "utilization_pct": 47.023809523809526,
+      "avg_soc_pct": 45.70169797122211,
+      "runtime_s": 0.000676875002682209,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 81.49912173315505,
+      "utilization_pct": 60.11904761904761,
+      "avg_soc_pct": 44.72512857533129,
+      "runtime_s": 0.0009068329818546772,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 78.96157157015443,
+      "utilization_pct": 63.69047619047619,
+      "avg_soc_pct": 49.617858769190434,
+      "runtime_s": 0.0011494578793644905,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}

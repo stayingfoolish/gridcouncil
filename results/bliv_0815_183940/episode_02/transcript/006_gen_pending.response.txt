@@ -1,0 +1,277 @@
+```python
+import numpy as np
+from collections import deque
+from enum import Enum
+from dataclasses import dataclass
+from typing import Tuple
+
+class BatteryState(Enum):
+    ARBITRAGE_READY = 1
+    ACCUMULATE = 2
+    HOLD = 3
+    EMERGENCY_DISCHARGE = 4
+    OPPORTUNISTIC = 5
+
+@dataclass
+class PriceMetrics:
+    buy_z_score: float
+    sell_z_score: float
+    spread_pct: float
+    cycle_phase: float
+    volatility: float
+    trend_strength: float
+
+class Policy:
+    def __init__(self):
+        self.price_window = 48
+        self.buy_price_history = deque(maxlen=self.price_window)
+        self.sell_price_history = deque(maxlen=self.price_window)
+        self.soc_history = deque(maxlen=self.price_window)
+        self.demand_history = deque(maxlen=self.price_window)
+        
+        self.current_state = BatteryState.HOLD
+        self.state_duration = 0
+        self.last_action = 0.0
+        
+        self.base_charge_threshold = 35
+        self.base_discharge_threshold = 65
+        self.charge_threshold = self.base_charge_threshold
+        self.discharge_threshold = self.base_discharge_threshold
+        
+        self.min_soc_hard = 0.08
+        self.max_soc_hard = 0.97
+        self.min_soc_operational = 0.15
+        self.max_soc_operational = 0.90
+        
+        self.max_charge_power = 8.0
+        self.max_discharge_power = 8.0
+        
+        self.min_spread_to_arbitrage = 0.08
+        self.cycle_detection_sensitivity = 0.15
+        
+        self.volatility_safety_margin = 0.7
+        self.demand_forecast_horizon = 12
+        
+        self.successful_arbitrage_count = 0
+        self.missed_opportunity_count = 0
+        self.last_buy_price = None
+        self.last_sell_price = None
+        self.recent_pnl = deque(maxlen=20)
+
+    def _calculate_z_score(self, current_price: float, price_history: deque) -> float:
+        if len(price_history) < 3:
+            return 0.0
+        
+        prices = np.array(list(price_history))
+        mean_price = np.mean(prices)
+        std_price = np.std(prices)
+        
+        if std_price < 0.001:
+            return 0.0
+        
+        z_score = (current_price - mean_price) / std_price
+        return np.clip(z_score, -3, 3)
+    
+    def _calculate_volatility(self, price_history: deque) -> float:
+        if len(price_history) < 2:
+            return 0.0
+        
+        prices = np.array(list(price_history))
+        returns = np.diff(prices) / prices[:-1]
+        volatility = np.std(returns) * 100
+        return volatility
+    
+    def _detect_price_cycle_phase(self, price_history: deque) -> Tuple[float, float]:
+        if len(price_history) < 12:
+            return 0.5, 0.0
+        
+        prices = np.array(list(price_history))
+        ma_long = np.convolve(prices, np.ones(6)/6, mode='same')
+        detrended = prices - ma_long
+        
+        half_window = len(prices) // 2
+        if half_window < 3:
+            return 0.5, 0.0
+        
+        correlation_12 = 0.0
+        if len(detrended) > 12:
+            correlation_12 = np.corrcoef(detrended[:-12], detrended[12:])[0, 1]
+        
+        cycle_strength = max(0, correlation_12)
+        
+        recent_3 = detrended[-3:]
+        phase = 0.5 + (0.25 * np.mean(np.sign(recent_3)))
+        
+        return np.clip(phase, 0, 1), cycle_strength
+    
+    def _analyze_spread_opportunity(self, current_buy: float, current_sell: float,
+                                   buy_history: deque, sell_history: deque) -> Tuple[float, float, float]:
+        if current_buy <= 0 or current_sell <= 0:
+            return 0.0, 0.0, 0.0
+        
+        spread_pct = (current_buy - current_sell) / current_sell if current_sell > 0 else 0
+        
+        buy_z = self._calculate_z_score(current_buy, buy_history)
+        sell_z = self._calculate_z_score(current_sell, sell_history)
+        
+        buy_attractiveness = -buy_z
+        sell_attractiveness = sell_z
+        
+        return spread_pct, buy_attractiveness, sell_attractiveness
+    
+    def _forecast_demand(self, demand_history: deque, horizon: int = 12) -> float:
+        if len(demand_history) < 3:
+            return 0.0
+        
+        demands = np.array(list(demand_history))
+        recent_trend = (demands[-1] - demands[0]) / max(len(demands), 1)
+        avg_demand = np.mean(demands[-6:]) if len(demands) >= 6 else np.mean(demands)
+        
+        forecasted = avg_demand + recent_trend * (horizon / 12)
+        return max(0, forecasted)
+    
+    def _calculate_volatility_adjusted_power(self, volatility: float, base_power: float) -> float:
+        volatility_pct = volatility / 100.0
+        
+        if volatility_pct > 0.15:
+            adjustment = self.volatility_safety_margin
+        else:
+            adjustment = 0.85 + 0.15 * (0.15 - volatility_pct) / 0.15
+        
+        return base_power * adjustment
+    
+    def _update_thresholds(self, volatility: float):
+        volatility_factor = min(volatility / 20.0, 1.0)
+        self.charge_threshold = self.base_charge_threshold * (0.8 + 0.4 * volatility_factor)
+        self.discharge_threshold = self.base_discharge_threshold * (0.6 + 0.4 * volatility_factor)
+    
+    def _determine_state(self, soc: float, spread_pct: float, buy_attract: float,
+                        sell_attract: float, volatility: float, 
+                        net_generation: float, demand_forecast: float) -> BatteryState:
+        
+        if net_generation < -3.0 and soc > self.min_soc_hard:
+            return BatteryState.EMERGENCY_DISCHARGE
+        
+        if (spread_pct > self.min_spread_to_arbitrage and 
+            soc > self.min_soc_operational and
+            sell_attract > 0.5):
+            return BatteryState.ARBITRAGE_READY
+        
+        if (soc < self.min_soc_operational * 1.5 and 
+            buy_attract > 0.3 and
+            demand_forecast > 0.5):
+            return BatteryState.ACCUMULATE
+        
+        if (soc > self.max_soc_operational * 0.85 and 
+            sell_attract > 0.2 and
+            spread_pct > 0.02):
+            return BatteryState.OPPORTUNISTIC
+        
+        return BatteryState.HOLD
+    
+    def take_action(self,
+                    current_energy_stored_kwh: float,
+                    current_pv_generation_kw: float,
+                    current_demand_kw: float,
+                    current_grid_buy_price: float,
+                    current_grid_sell_price: float,
+                    battery_capacity_kwh: float) -> float:
+        
+        self.buy_price_history.append(current_grid_buy_price)
+        self.sell_price_history.append(current_grid_sell_price)
+        self.demand_history.append(current_demand_kw)
+        
+        soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+        self.soc_history.append(soc)
+        
+        net_generation = current_pv_generation_kw - current_demand_kw
+        
+        buy_z = self._calculate_z_score(current_grid_buy_price, self.buy_price_history)
+        sell_z = self._calculate_z_score(current_grid_sell_price, self.sell_price_history)
+        spread_pct, buy_attract, sell_attract = self._analyze_spread_opportunity(
+            current_grid_buy_price, current_grid_sell_price,
+            self.buy_price_history, self.sell_price_history
+        )
+        
+        cycle_phase, cycle_strength = self._detect_price_cycle_phase(self.buy_price_history)
+        volatility = self._calculate_volatility(self.buy_price_history)
+        
+        demand_forecast = self._forecast_demand(self.demand_history, self.demand_forecast_horizon)
+        
+        self._update_thresholds(volatility)
+        
+        new_state = self._determine_state(
+            soc, spread_pct, buy_attract, sell_attract,
+            volatility, net_generation, demand_forecast
+        )
+        
+        if new_state == self.current_state:
+            self.state_duration += 1
+        else:
+            self.state_duration = 1
+            self.current_state = new_state
+        
+        action_kw = 0.0
+        
+        if self.current_state == BatteryState.EMERGENCY_DISCHARGE:
+            deficit = abs(min(net_generation, 0))
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_hard) / (1/60)
+            action_kw = -min(deficit * 1.1, self.max_discharge_power, max_available)
+        
+        elif self.current_state == BatteryState.ARBITRAGE_READY:
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_operational) / (1/60)
+            base_discharge = self.max_discharge_power * 0.85
+            adjusted_discharge = self._calculate_volatility_adjusted_power(volatility, base_discharge)
+            action_kw = -min(adjusted_discharge, max_available)
+            self.successful_arbitrage_count += 1
+        
+        elif self.current_state == BatteryState.ACCUMULATE:
+            if buy_attract > 0.3:
+                max_available = (battery_capacity_kwh * self.max_soc_operational - current_energy_stored_kwh) / (1/60)
+                base_charge = self.max_charge_power * 0.8
+                adjusted_charge = self._calculate_volatility_adjusted_power(volatility, base_charge)
+                action_kw = min(adjusted_charge, max_available)
+            
+            if net_generation > 0:
+                max_available = (battery_capacity_kwh * self.max_soc_hard - current_energy_stored_kwh) / (1/60)
+                pv_charge = min(net_generation, self.max_charge_power, max_available)
+                action_kw = max(action_kw, pv_charge)
+        
+        elif self.current_state == BatteryState.OPPORTUNISTIC:
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_operational) / (1/60)
+            opportunistic_power = self.max_discharge_power * 0.4
+            adjusted_power = self._calculate_volatility_adjusted_power(volatility, opportunistic_power)
+            action_kw = -min(adjusted_power, max_available)
+        
+        elif self.current_state == BatteryState.HOLD:
+            if net_generation > 0.5 and soc < self.max_soc_hard:
+                max_available = (battery_capacity_kwh * self.max_soc_hard - current_energy_stored_kwh) / (1/60)
+                action_kw = min(net_generation, self.max_charge_power, max_available)
+            
+            elif net_generation < -0.5 and soc > self.min_soc_hard:
+                deficit = abs(net_generation)
+                max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_hard) / (1/60)
+                action_kw = -min(deficit, self.max_discharge_power, max_available)
+        
+        max_charge_rate = self.max_charge_power
+        max_discharge_rate = -self.max_discharge_power
+        
+        action_kw = np.clip(action_kw, max_discharge_rate, max_charge_rate)
+        
+        energy_after_action = current_energy_stored_kwh + action_kw * (1/60)
+        
+        if action_kw > 0:
+            max_energy = battery_capacity_kwh * self.max_soc_hard
+            if energy_after_action > max_energy:
+                action_kw = (max_energy - current_energy_stored_kwh) * 60
+        elif action_kw < 0:
+            min_energy = battery_capacity_kwh * self.min_soc_hard
+            if energy_after_action < min_energy:
+                action_kw = (min_energy - current_energy_stored_kwh) * 60
+        
+        action_kw = np.clip(action_kw, max_discharge_rate, max_charge_rate)
+        
+        self.last_action = action_kw
+        
+        return action_kw
+```

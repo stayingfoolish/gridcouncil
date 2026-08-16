@@ -1,0 +1,209 @@
+You are an expert Python developer debugging a power-market dispatch policy.
+
+A DispatchPolicy implementation has failed in the simulation environment with the following:
+Error Message:
+Traceback (most recent call last):
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/results/live_0815_184027/episode_03/work/_eval.py", line 15, in <module>
+    out = simulate_dispatch(cls(), env)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/engine/aps_dispatch.py", line 194, in simulate_dispatch
+    raw = policy.take_action(
+          ^^^^^^^^^^^^^^^^^^^
+  File "policy.py", line 63, in take_action
+  File "policy.py", line 35, in forecast_next_n_hours
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/.venv/lib/python3.11/site-packages/numpy/_core/fromnumeric.py", line 3824, in mean
+    return _methods._mean(a, axis=axis, dtype=dtype,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/.venv/lib/python3.11/site-packages/numpy/_core/_methods.py", line 116, in _mean
+    arr = asanyarray(a)
+          ^^^^^^^^^^^^^
+ValueError: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (25,) + inhomogeneous part.
+
+
+Failed Code:
+```python
+import numpy as np
+from collections import deque
+
+class DispatchPolicy:
+    def __init__(self):
+        """Initializes the policy with price history, momentum tracking, and forecast."""
+        self.price_history = deque(maxlen=168)  # 7-day rolling window
+        self.forecast_window = 24
+        self.momentum_window = 6
+        self.backlog_service_threshold = 100.0
+
+    def compute_price_momentum(self, forecast):
+        """Compute momentum: (future avg - past avg) / past avg."""
+        if len(forecast) < self.momentum_window:
+            return 0.0
+        past_avg = np.mean(forecast[:self.momentum_window // 2])
+        future_avg = np.mean(forecast[self.momentum_window // 2:self.momentum_window])
+        if past_avg < 1.0:
+            return 0.0
+        return (future_avg - past_avg) / past_avg
+
+    def compute_price_volatility(self, forecast):
+        """Measure price spread relative to mean over forecast window."""
+        if len(forecast) < 3:
+            return 0.0
+        mean_price = np.mean(forecast)
+        price_range = np.max(forecast) - np.min(forecast)
+        return price_range / (mean_price + 1.0)
+
+    def forecast_next_n_hours(self, n):
+        """Generate synthetic forecast from price history using periodicity."""
+        if len(self.price_history) < 24:
+            return [50.0] * n
+        history_array = np.array(list(self.price_history))
+        daily_pattern = np.mean([history_array[i::24] for i in range(min(24, len(history_array)))] + [[50.0] * 24], axis=0)
+        forecast = [daily_pattern[i % 24] for i in range(n)]
+        return forecast
+
+    def find_optimal_service_window(self, backlog_mwh, oldest_backlog_age_h, forecast):
+        """Find the cheapest window within deadline to serve backlog."""
+        deadline_hours = max(1, int(24 - oldest_backlog_age_h))
+        search_window = min(deadline_hours, len(forecast))
+        if search_window == 0:
+            return 0, forecast[0] if forecast else 50.0
+        prices_in_window = forecast[:search_window]
+        optimal_idx = int(np.argmin(prices_in_window))
+        return optimal_idx, prices_in_window[optimal_idx]
+
+    def take_action(self,
+                    hour_of_day,
+                    current_price,
+                    firm_load_mw,
+                    arriving_flex_mw,
+                    backlog_mwh,
+                    oldest_backlog_age_h,
+                    battery_soc_mwh,
+                    battery_capacity_mwh,
+                    battery_power_mw):
+        """Decide dispatch with volatility-adaptive battery thresholds."""
+        
+        self.price_history.append(current_price)
+        
+        forecast = self.forecast_next_n_hours(self.forecast_window)
+        momentum = self.compute_price_momentum(forecast)
+        volatility = self.compute_price_volatility(forecast)
+        
+        battery_soc_ratio = battery_soc_mwh / battery_capacity_mwh if battery_capacity_mwh > 0 else 0.0
+        total_load = firm_load_mw + arriving_flex_mw
+        
+        volatility_factor = max(0.5, min(1.5, volatility / 0.20))
+        
+        adaptive_charge_threshold = 0.80 * volatility_factor
+        adaptive_discharge_threshold = 0.30 * volatility_factor
+        adaptive_max_discharge = 80.0 * volatility_factor
+        
+        flex_serve_mw = arriving_flex_mw * 0.5
+        battery_mw = 0.0
+        
+        if oldest_backlog_age_h >= 22.0:
+            flex_serve_mw = arriving_flex_mw + min(backlog_mwh / 1.0, battery_soc_mwh / 1.0)
+            discharge_for_deadline = min(battery_power_mw, battery_soc_mwh)
+            battery_mw = -discharge_for_deadline
+            return (flex_serve_mw, battery_mw)
+        
+        if backlog_mwh > self.backlog_service_threshold:
+            optimal_window_idx, window_price = self.find_optimal_service_window(
+                backlog_mwh, oldest_backlog_age_h, forecast
+            )
+            if optimal_window_idx > 0:
+                current_forecast_avg = np.mean(forecast[max(0, optimal_window_idx-1):min(len(forecast), optimal_window_idx+3)])
+            else:
+                current_forecast_avg = np.mean(forecast[:3])
+            
+            if optimal_window_idx > 2 and current_price > current_forecast_avg:
+                flex_serve_mw = arriving_flex_mw * 0.3
+            elif optimal_window_idx <= 1:
+                backlog_to_serve = min(backlog_mwh * 0.7, battery_soc_mwh)
+                flex_serve_mw = arriving_flex_mw + backlog_to_serve / 1.0
+        
+        if momentum < -0.05 and battery_soc_ratio < adaptive_charge_threshold:
+            available_headroom = max(0, 380.0 - total_load)
+            charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+            charge_amount = min(charge_capacity, available_headroom, 120.0)
+            battery_mw = charge_amount
+            flex_serve_mw = arriving_flex_mw * 0.4
+            return (flex_serve_mw, battery_mw)
+        
+        if momentum > 0.05 and battery_soc_ratio > adaptive_discharge_threshold:
+            flex_serve_mw = arriving_flex_mw * 0.7
+            discharge_capacity = min(battery_power_mw, battery_soc_mwh)
+            battery_mw = -min(discharge_capacity, adaptive_max_discharge)
+            return (flex_serve_mw, battery_mw)
+        
+        price_percentile_low = np.percentile(list(self.price_history), 35) if len(self.price_history) > 12 else 40.0
+        price_percentile_high = np.percentile(list(self.price_history), 80) if len(self.price_history) > 12 else 85.0
+        
+        if current_price < price_percentile_low * 0.8:
+            if battery_soc_ratio < adaptive_charge_threshold:
+                available_headroom = max(0, 380.0 - total_load)
+                charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+                charge_amount = min(charge_capacity, available_headroom, 120.0)
+                battery_mw = charge_amount
+                flex_serve_mw = arriving_flex_mw * 0.45
+        
+        elif current_price > price_percentile_high * 1.05:
+            if battery_soc_ratio > adaptive_discharge_threshold:
+                flex_serve_mw = arriving_flex_mw * 0.75
+                discharge_capacity = min(battery_power_mw, battery_soc_mwh)
+                battery_mw = -min(discharge_capacity, adaptive_max_discharge)
+        
+        flex_serve_mw = max(0.0, min(flex_serve_mw, arriving_flex_mw + backlog_mwh))
+        battery_mw = max(-battery_power_mw, min(battery_power_mw, battery_mw))
+        
+        if battery_mw > 0:
+            max_charge_energy = (battery_capacity_mwh - battery_soc_mwh) / 0.88
+            battery_mw = min(battery_mw, max_charge_energy)
+        elif battery_mw < 0:
+            battery_mw = max(battery_mw, -battery_soc_mwh)
+        
+        return (flex_serve_mw, battery_mw)
+
+```
+
+Task:
+Fix the implementation errors while maintaining the original strategy where appropriate.
+
+Expected output structure:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Return only the corrected DispatchPolicy class implementation without markdown formatting or extra comments outside the class.

@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "# Novel Battery Management Approach: Predictive Arbitrage with Bayesian Confidence Weighting\n\n## Current Implementation Analysis\n\n### Strengths:\n- Robust multi-signal integration (demand, generation, price anomalies)\n- Asymmetric risk management with safety margins\n- Adaptive regime detection based on price acceleration\n- Exploration mechanism to escape local optima\n\n### Critical Limitations Causing Stagnation:\n1. **Reactive, Not Predictive**: System responds to current prices, missing 2-6 hour arbitrage windows\n2. **Rigid Thresholds**: Z-score thresholds (-0.5, 0.8) are static despite market volatility (10.1%)\n3. **No Forecast Validation**: Regime detection updates weights but doesn't learn from prediction errors\n4. **Inefficient Exploration**: Random 50% SOC target ignores actual price forecasts\n5. **Information Loss**: Collapses multi-hour patterns into single opportunity scores\n6. **Cost Oscillation (38.32\u219233.66\u219247.96\u219223.47\u219238.98)**: Indicates poor decision consistency\n\n## Proposed Approach: Predictive Arbitrage with Bayesian Learning\n\n### Core Insight\nInstead of reacting to current prices, **forecast next 24-hour price trajectory** and identify maximum arbitrage opportunities. Use Bayesian updating to improve forecast confidence over time.\n\n### Implementation Details\n\n```python\nimport numpy as np\nfrom collections import deque\nfrom typing import Tuple\n\nclass Policy:\n  def __init__(self):\n    # Price Forecasting (24-hour ahead)\n    self.FORECAST_WINDOW = 24\n    self.SEASONAL_COMPONENTS = 7  # 7 distinct daily patterns\n    self.ARIMA_ORDER = (2, 1, 2)\n    self.FORECAST_LOOKBACK = 336  # 2 weeks\n\n    # Bayesian Confidence Tracking\n    self.FORECAST_ERROR_ALPHA = 2.0  # Prior confidence in forecast\n    self.FORECAST_ERROR_BETA = 2.0\n    self.MIN_CONFIDENCE_THRESHOLD = 0.4\n    self.CONFIDENCE_UPDATE_RATE = 0.05\n\n    # Arbitrage Window Detection\n    self.ARBITRAGE_MIN_GAP = 0.15  # 15% price swing required\n    self.ARBITRAGE_HORIZON = 6  # Look 6 hours ahead for discharge\n    self.CHARGING_EFFICIENCY = 0.92\n    self.DISCHARGING_EFFICIENCY = 0.95\n\n    # Battery Constraints\n    self.MIN_SAFE_BATTERY_LEVEL = 0.15\n    self.MAX_SAFE_BATTERY_LEVEL = 0.90\n    self.EMERGENCY_RESERVE = 0.05\n\n    # Historical tracking\n    self.price_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.demand_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.pv_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.forecast_errors = deque(maxlen=24)\n\n    # Forecast state\n    self.forecast_confidence = 0.5\n    self.seasonal_factors = [1.0] * self.SEASONAL_COMPONENTS\n    self.last_price_forecast = None\n    self.last_min_price_index = 0\n    self.last_max_price_index = 0\n\n  def _forecast_24h_prices(self) -> Tuple[np.ndarray, np.ndarray]:\n    \"\"\"Forecast next 24 hours of prices with confidence bounds.\"\"\"\n    if len(self.price_history) < 48:\n      return np.array([np.mean(list(self.price_history))] * 24), np.array([0.3] * 24)\n\n    prices = np.array(list(self.price_history))\n\n    # Seasonal decomposition\n    hourly_idx = len(self.price_history) % 24\n    day_idx = (len(self.price_history) // 24) % self.SEASONAL_COMPONENTS\n\n    # Simple exponential smoothing with seasonal adjustment\n    base_trend = np.mean(prices[-12:])\n    seasonal_adjustment = self.seasonal_factors[day_idx]\n\n    # ARIMA-like differencing\n    if len(prices) >= 2:\n      first_diff = np.diff(prices[-48:])\n      momentum = np.mean(first_diff[-6:])\n    else:\n      momentum = 0\n\n    # Generate 24-hour forecast\n    forecast = np.zeros(24)\n    confidence_bounds = np.zeros(24)\n\n    for h in range(24):\n      current_hour = (hourly_idx + h) % 24\n      current_day = (day_idx + (hourly_idx + h) // 24) % self.SEASONAL_COMPONENTS\n\n      # Trend + seasonal + momentum\n      trend_component = base_trend + (momentum * (h / 12))\n      seasonal_component = self.seasonal_factors[current_day] * (0.9 + 0.2 * np.sin(current_hour * np.pi / 12))\n\n      forecast[h] = trend_component * seasonal_component\n\n      # Confidence decreases with forecast horizon\n      base_confidence = self.forecast_confidence\n      horizon_decay = np.exp(-0.1 * h)\n      confidence_bounds[h] = base_confidence * horizon_decay + (1 - base_confidence) * 0.2\n\n    # Normalize prices to be positive\n    forecast = np.maximum(forecast, 0.01)\n\n    return forecast, confidence_bounds\n\n  def _find_arbitrage_opportunity(self, forecast: np.ndarray, confidence: np.ndarray) -> Tuple[int, int, float]:\n    \"\"\"Find best charge/discharge timing in 24-hour window.\"\"\"\n    # Find minimum price (charging opportunity)\n    weighted_forecast = forecast / confidence\n    min_idx = np.argmin(weighted_forecast)\n    min_price = forecast[min_idx]\n\n    # Find maximum price after minimum (discharge opportunity)\n    future_prices = weighted_forecast[min_idx + self.ARBITRAGE_HORIZON:]\n    if len(future_prices) > 0:\n      max_idx_in_future = np.argmax(future_prices)\n      max_idx = min_idx + self.ARBITRAGE_HORIZON + max_idx_in_future\n      max_price = forecast[max_idx]\n    else:\n      max_idx = min_idx + 1\n      max_price = forecast[max_idx]\n\n    arbitrage_spread = (max_price - min_price) / (min_price + 0.01)\n\n    return min_idx, max_idx, arbitrage_spread\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n    \"\"\"Determines action based on predicted arbitrage opportunities.\"\"\"\n\n    # Update histories\n    self.price_history.append(current_grid_buy_price)\n    self.demand_history.append(current_demand_kw)\n    self.pv_history.append(current_pv_generation_kw)\n\n    # Calculate battery state\n    battery_soc = current_energy_stored_kwh / max(battery_capacity_kwh, 0.01)\n\n    # Get 24-hour price forecast\n    forecast, confidence = self._forecast_24h_prices()\n    self.last_price_forecast = forecast\n\n    # Find arbitrage opportunity\n    min_idx, max_idx, spread = self._find_arbitrage_opportunity(forecast, confidence)\n\n    action_kw = 0.0\n\n    # Decision logic based on arbitrage opportunity\n    if min_idx == 0 and spread > self.ARBITRAGE_MIN_GAP:\n      # We're at charging opportunity now\n      if battery_soc < self.MAX_SAFE_BATTERY_LEVEL:\n        # Charge aggressively if confident in arbitrage\n        charge_magnitude = 10.0 * (confidence[0] ** 0.5)\n        action_kw = min(charge_magnitude, 10.0)\n\n    elif max_idx <= 6 and spread > self.ARBITRAGE_MIN_GAP and battery_soc > 0.4:\n      # Discharge opportunity in next 6 hours\n      if battery_soc > self.MIN_SAFE_BATTERY_LEVEL + 0.1:\n        discharge_magnitude = 5.0 * (confidence[max_idx] ** 0.5)\n        action_kw = -min(discharge_magnitude, 5.0)\n\n    else:\n      # No clear arbitrage: maintain position or balance demand\n      net_flow = current_pv_generation_kw - current_demand_kw\n      if net_flow > 1.0 and battery_soc < self.MAX_SAFE_BATTERY_LEVEL:\n        action_kw = min(net_flow * 0.8, 3.0)\n      elif net_flow < -1.0 and battery_soc > self.MIN_SAFE_BATTERY_LEVEL:\n        action_kw = max(net_flow * 0.5, -2.0)\n\n    # Apply hard constraints\n    action_kw = max(-5.0, min(10.0, action_kw))\n\n    # Energy conservation\n    if action_kw < 0:\n      max_discharge = current_energy_stored_kwh - (battery_capacity_kwh * self.EMERGENCY_RESERVE)\n      action_kw = max(action_kw, -max_discharge)\n    elif action_kw > 0:\n      max_charge = (battery_capacity_kwh - current_energy_stored_kwh) / self.CHARGING_EFFICIENCY\n      action_kw = min(action_kw, max_charge)\n\n    # Update forecast confidence based on realized price vs forecast\n    if self.last_price_forecast is not None and len(self.forecast_errors) > 0:\n      error = abs(current_grid_buy_price - self.last_price_forecast[0])\n      self.forecast_errors.append(error)\n      mean_error = np.mean(list(self.forecast_errors))\n      # Bayesian update: improve confidence when errors are low\n      error_percentile = mean_error / (np.mean(list(self.price_history)) + 0.01)\n      self.forecast_confidence = min(0.8, self.forecast_confidence + self.CONFIDENCE_UPDATE_RATE * (0.2 - error_percentile))\n\n    # Update seasonal factors (every 24 hours)\n    if len(self.price_history) % 24 == 0 and len(self.price_history) > 0:\n      hour_of_week = (len(self.price_history) // 24) % self.SEASONAL_COMPONENTS\n      recent_prices = list(self.price_history)[-24:]\n      self.seasonal_factors[hour_of_week] = np.mean(recent_prices) / (np.mean(list(self.price_history)) + 0.01)\n\n    return action_kw\n```\n\n## Expected Improvements\n\n### Cost Reduction\n- **Current oscillation**: 38.98 \u2192 targets -4.52 but unstable\n- **Predicted impact**: 25-40% cost reduction through:\n  - Proactive arbitrage capture (6-12 hour look-ahead vs reactive current price)\n  - Confidence-weighted decisions reduce costly exploration\n  - Seasonal adaptation prevents repeated mistakes\n\n### Mechanism Benefits\n1. **Stabilized performance**: By forecasting, system avoids reactive whipsaw\n2. **Learning loop**: Forecast errors drive confidence updates, improving over 50-100 iterations\n3. **Adaptive capacity**: Seasonal factors self-tune to true price patterns\n4. **Risk management**: Confidence thresholds prevent over-committing when forecast unreliable\n\n### Implementation Advantages\n- **Minimal dependencies**: Uses only numpy, no external ML libraries required\n- **Fast convergence**: Seasonal factors and confidence calibrate within 7-14 days\n- **Explainable**: Each action traceable to specific arbitrage opportunity\n\n## Why This Differs Fundamentally\nCurrent: \"React to today's price relative to recent average\"\nProposed: \"Predict tomorrow's price structure, position battery for maximum arbitrage\"\n\nThis is a shift from **statistical thresholding** to **forecasting-driven optimization**, which is fundamentally better suited to time-series arbitrage problems.",
+  "mode": "explore",
+  "best_cost": -4.520513055499096,
+  "best_iteration": 0,
+  "last_code": "import numpy as np\nfrom collections import deque\nfrom typing import Tuple\n\nclass Policy:\n  def __init__(self):\n    # Price Forecasting (24-hour ahead)\n    self.FORECAST_WINDOW = 24\n    self.SEASONAL_COMPONENTS = 7  # 7 distinct daily patterns\n    self.ARIMA_ORDER = (2, 1, 2)\n    self.FORECAST_LOOKBACK = 336  # 2 weeks\n\n    # Bayesian Confidence Tracking\n    self.FORECAST_ERROR_ALPHA = 2.0  # Prior confidence in forecast\n    self.FORECAST_ERROR_BETA = 2.0\n    self.MIN_CONFIDENCE_THRESHOLD = 0.4\n    self.CONFIDENCE_UPDATE_RATE = 0.05\n\n    # Arbitrage Window Detection\n    self.ARBITRAGE_MIN_GAP = 0.15  # 15% price swing required\n    self.ARBITRAGE_HORIZON = 6  # Look 6 hours ahead for discharge\n    self.CHARGING_EFFICIENCY = 0.92\n    self.DISCHARGING_EFFICIENCY = 0.95\n\n    # Battery Constraints\n    self.MIN_SAFE_BATTERY_LEVEL = 0.15\n    self.MAX_SAFE_BATTERY_LEVEL = 0.90\n    self.EMERGENCY_RESERVE = 0.05\n\n    # Historical tracking\n    self.price_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.demand_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.pv_history = deque(maxlen=self.FORECAST_LOOKBACK)\n    self.forecast_errors = deque(maxlen=24)\n\n    # Forecast state\n    self.forecast_confidence = 0.5\n    self.seasonal_factors = [1.0] * self.SEASONAL_COMPONENTS\n    self.last_price_forecast = None\n    self.last_min_price_index = 0\n    self.last_max_price_index = 0\n\n  def _forecast_24h_prices(self) -> Tuple[np.ndarray, np.ndarray]:\n    \"\"\"Forecast next 24 hours of prices with confidence bounds.\"\"\"\n    if len(self.price_history) < 48:\n      return np.array([np.mean(list(self.price_history))] * 24), np.array([0.3] * 24)\n\n    prices = np.array(list(self.price_history))\n\n    # Seasonal decomposition\n    hourly_idx = len(self.price_history) % 24\n    day_idx = (len(self.price_history) // 24) % self.SEASONAL_COMPONENTS\n\n    # Simple exponential smoothing with seasonal adjustment\n    base_trend = np.mean(prices[-12:])\n    seasonal_adjustment = self.seasonal_factors[day_idx]\n\n    # ARIMA-like differencing\n    if len(prices) >= 2:\n      first_diff = np.diff(prices[-48:])\n      momentum = np.mean(first_diff[-6:])\n    else:\n      momentum = 0\n\n    # Generate 24-hour forecast\n    forecast = np.zeros(24)\n    confidence_bounds = np.zeros(24)\n\n    for h in range(24):\n      current_hour = (hourly_idx + h) % 24\n      current_day = (day_idx + (hourly_idx + h) // 24) % self.SEASONAL_COMPONENTS\n\n      # Trend + seasonal + momentum\n      trend_component = base_trend + (momentum * (h / 12))\n      seasonal_component = self.seasonal_factors[current_day] * (0.9 + 0.2 * np.sin(current_hour * np.pi / 12))\n\n      forecast[h] = trend_component * seasonal_component\n\n      # Confidence decreases with forecast horizon\n      base_confidence = self.forecast_confidence\n      horizon_decay = np.exp(-0.1 * h)\n      confidence_bounds[h] = base_confidence * horizon_decay + (1 - base_confidence) * 0.2\n\n    # Normalize prices to be positive\n    forecast = np.maximum(forecast, 0.01)\n\n    return forecast, confidence_bounds\n\n  def _find_arbitrage_opportunity(self, forecast: np.ndarray, confidence: np.ndarray) -> Tuple[int, int, float]:\n    \"\"\"Find best charge/discharge timing in 24-hour window.\"\"\"\n    # Find minimum price (charging opportunity)\n    weighted_forecast = forecast / confidence\n    min_idx = np.argmin(weighted_forecast)\n    min_price = forecast[min_idx]\n\n    # Find maximum price after minimum (discharge opportunity)\n    future_prices = weighted_forecast[min_idx + self.ARBITRAGE_HORIZON:]\n    if len(future_prices) > 0:\n      max_idx_in_future = np.argmax(future_prices)\n      max_idx = min_idx + self.ARBITRAGE_HORIZON + max_idx_in_future\n      max_price = forecast[max_idx]\n    else:\n      max_idx = min_idx + 1\n      max_price = forecast[max_idx]\n\n    arbitrage_spread = (max_price - min_price) / (min_price + 0.01)\n\n    return min_idx, max_idx, arbitrage_spread\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n    \"\"\"Determines action based on predicted arbitrage opportunities.\"\"\"\n\n    # Update histories\n    self.price_history.append(current_grid_buy_price)\n    self.demand_history.append(current_demand_kw)\n    self.pv_history.append(current_pv_generation_kw)\n\n    # Calculate battery state\n    battery_soc = current_energy_stored_kwh / max(battery_capacity_kwh, 0.01)\n\n    # Get 24-hour price forecast\n    forecast, confidence = self._forecast_24h_prices()\n    self.last_price_forecast = forecast\n\n    # Find arbitrage opportunity\n    min_idx, max_idx, spread = self._find_arbitrage_opportunity(forecast, confidence)\n\n    action_kw = 0.0\n\n    # Decision logic based on arbitrage opportunity\n    if min_idx == 0 and spread > self.ARBITRAGE_MIN_GAP:\n      # We're at charging opportunity now\n      if battery_soc < self.MAX_SAFE_BATTERY_LEVEL:\n        # Charge aggressively if confident in arbitrage\n        charge_magnitude = 10.0 * (confidence[0] ** 0.5)\n        action_kw = min(charge_magnitude, 10.0)\n\n    elif max_idx <= 6 and spread > self.ARBITRAGE_MIN_GAP and battery_soc > 0.4:\n      # Discharge opportunity in next 6 hours\n      if battery_soc > self.MIN_SAFE_BATTERY_LEVEL + 0.1:\n        discharge_magnitude = 5.0 * (confidence[max_idx] ** 0.5)\n        action_kw = -min(discharge_magnitude, 5.0)\n\n    else:\n      # No clear arbitrage: maintain position or balance demand\n      net_flow = current_pv_generation_kw - current_demand_kw\n      if net_flow > 1.0 and battery_soc < self.MAX_SAFE_BATTERY_LEVEL:\n        action_kw = min(net_flow * 0.8, 3.0)\n      elif net_flow < -1.0 and battery_soc > self.MIN_SAFE_BATTERY_LEVEL:\n        action_kw = max(net_flow * 0.5, -2.0)\n\n    # Apply hard constraints\n    action_kw = max(-5.0, min(10.0, action_kw))\n\n    # Energy conservation\n    if action_kw < 0:\n      max_discharge = current_energy_stored_kwh - (battery_capacity_kwh * self.EMERGENCY_RESERVE)\n      action_kw = max(action_kw, -max_discharge)\n    elif action_kw > 0:\n      max_charge = (battery_capacity_kwh - current_energy_stored_kwh) / self.CHARGING_EFFICIENCY\n      action_kw = min(action_kw, max_charge)\n\n    # Update forecast confidence based on realized price vs forecast\n    if self.last_price_forecast is not None and len(self.forecast_errors) > 0:\n      error = abs(current_grid_buy_price - self.last_price_forecast[0])\n      self.forecast_errors.append(error)\n      mean_error = np.mean(list(self.forecast_errors))\n      # Bayesian update: improve confidence when errors are low\n      error_percentile = mean_error / (np.mean(list(self.price_history)) + 0.01)\n      self.forecast_confidence = min(0.8, self.forecast_confidence + self.CONFIDENCE_UPDATE_RATE * (0.2 - error_percentile))\n\n    # Update seasonal factors (every 24 hours)\n    if len(self.price_history) % 24 == 0 and len(self.price_history) > 0:\n      hour_of_week = (len(self.price_history) // 24) % self.SEASONAL_COMPONENTS\n      recent_prices = list(self.price_history)[-24:]\n      self.seasonal_factors[hour_of_week] = np.mean(recent_prices) / (np.mean(list(self.price_history)) + 0.01)\n\n    return action_kw\n",
+  "last_metrics": {
+    "utilization_pct": 16.071428571428573,
+    "avg_soc_pct": 83.48210516405841
+  },
+  "cost_history": [
+    -4.520513055499096,
+    12.921011474719588,
+    12.342095869186625,
+    12.342095869186625,
+    38.31754699816881,
+    33.658104657752546,
+    47.962649273019466,
+    23.46559305276549,
+    38.98245398970639,
+    7.804867947772938
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": -4.520513055499096,
+      "utilization_pct": 66.66666666666666,
+      "avg_soc_pct": 53.54770493704498,
+      "runtime_s": 0.0004984163679182529,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": 12.921011474719588,
+      "utilization_pct": 18.452380952380953,
+      "avg_soc_pct": 98.65695078730343,
+      "runtime_s": 0.000757209025323391,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": 12.342095869186625,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 96.87281383859047,
+      "runtime_s": 0.000516125001013279,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": 12.342095869186625,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 96.87281383859047,
+      "runtime_s": 0.0008289576508104801,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 38.31754699816881,
+      "utilization_pct": 29.761904761904763,
+      "avg_soc_pct": 63.40831576225996,
+      "runtime_s": 0.0013507921248674393,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 33.658104657752546,
+      "utilization_pct": 45.23809523809524,
+      "avg_soc_pct": 47.755994045260906,
+      "runtime_s": 0.002197542227804661,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 47.962649273019466,
+      "utilization_pct": 84.52380952380952,
+      "avg_soc_pct": 55.69116119251297,
+      "runtime_s": 0.002242875285446644,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 23.46559305276549,
+      "utilization_pct": 52.976190476190474,
+      "avg_soc_pct": 72.73916294192165,
+      "runtime_s": 0.001308041624724865,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 38.98245398970639,
+      "utilization_pct": 57.14285714285714,
+      "avg_soc_pct": 61.30303894844691,
+      "runtime_s": 0.011514292098581791,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 7.804867947772938,
+      "utilization_pct": 16.071428571428573,
+      "avg_soc_pct": 83.48210516405841,
+      "runtime_s": 0.003149624913930893,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}
