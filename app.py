@@ -769,6 +769,45 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
 # ---------------------------------------------------------------- agents
 with t_agents:
 
+    st.markdown("### 🎬 Demo theater — a real search, replayed on loop")
+    if st.toggle("Run the theater (auto-advances every few seconds; loops forever)"):
+        th_runs = {**dollar_runs(), **euro_runs()}
+        th_name = st.selectbox("Recorded search", list(th_runs), key="th_run")
+        th_dir, th_unit, th_bench = th_runs[th_name]
+        eps = load_aps_run(th_dir)
+        # keep only rounds that set a new best (the improving arc), per episode;
+        # pick the episode with the longest arc
+        best_ep, arc = None, []
+        for ep, recs in eps.items():
+            b, steps = float("inf"), []
+            for r in recs:
+                if r["cost"] is not None and np.isfinite(r["cost"]) and r["cost"] < b:
+                    b = r["cost"]; steps.append(r)
+            if len(steps) > len(arc):
+                best_ep, arc = ep, steps
+        st.caption(f"🔴 RECORDED SEARCH · REPLAY — {best_ep}, {len(arc)} improving rounds, "
+                   "looping. Every round links to real timestamped transcripts "
+                   "(🔍 Under the hood).")
+
+        @st.fragment(run_every="4s")
+        def theater():
+            k = st.session_state.get("th_i", 0) % len(arc)
+            st.session_state["th_i"] = k + 1
+            r = arc[k]
+            a, b = st.columns([1, 2])
+            with a:
+                st.metric(f"Round {r['iteration'] + 1}", f"{r['cost']:,.2f} {th_unit}",
+                          (f"{r['cost'] - arc[k-1]['cost']:+,.2f} vs last best" if k else
+                           "first working strategy"))
+                for nm, v in th_bench.items():
+                    st.caption(f"{nm}: {v:,.2f} {th_unit}")
+                st.markdown(NARRATION.get(r["mode"], ""))
+            with b:
+                if r["code"]:
+                    st.code("\n".join(r["code"].splitlines()[:26]), language="python")
+            st.progress((k + 1) / len(arc), text=f"improving round {k + 1} of {len(arc)}")
+        theater()
+
     st.markdown("#### The three-level loop, on one picture")
     st.markdown("""
 <svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg" style="max-width:860px;width:100%">
