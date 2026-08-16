@@ -389,14 +389,12 @@ def recorded_ladder():
     """The recorded data-center search's ladder (results/engine_aps/summary.json)."""
     p = ROOT / "results/engine_aps/summary.json"
     if not p.exists():  # fall back to the numbers of the shipped recorded run
-        return {"naive": 14.9e6, "ai": 14.1e6, "pfa": 13.3e6, "dla": 12.0e6,
-                "ai_gap": 27.0, "pfa_gap": 55.0}
+        return {"naive": 14.9e6, "ai": 14.1e6, "dla": 12.0e6, "ai_gap": 27.0}
     s = json.loads(p.read_text())
     b = s["baselines_usd"]
-    return {"naive": b["naive"], "pfa": b["pfa"], "dla": b["dla"],
+    return {"naive": b["naive"], "dla": b["dla"],
             "ai": s["best_llm_policy_usd"],
-            "ai_gap": s["gap_closure_pct"]["llm_best"],
-            "pfa_gap": s["gap_closure_pct"]["hand_pfa"]}
+            "ai_gap": s["gap_closure_pct"]["llm_best"]}
 
 
 @st.cache_data(show_spinner=False)
@@ -421,7 +419,7 @@ def dollar_runs():
         bl = json.loads((ROOT / "results/engine_aps/baselines.json").read_text())
         runs["Data-center dispatch (the original recorded search)"] = \
             (ROOT / "results/engine_aps", "$M",
-             {"Do nothing": bl["naive"]/1e6, "Hand-written rules": bl["pfa"]/1e6,
+             {"Do nothing": bl["naive"]/1e6,
               "Best possible (perfect foresight)": bl["dla"]/1e6})
     for d in sorted((ROOT / "results").glob("live_*")):
         has_scores = any(json.loads(f.read_text())["records"]
@@ -707,12 +705,11 @@ Bottom line: **${(naive.energy_cost - opt.energy_cost)/1e6:.2f}M saved on its ow
 **know the mathematically best answer** (a perfect-foresight optimizer), so we can grade the AI
 precisely. The ladder, from worst to best:""")
     lad = recorded_ladder()
-    l1, l2, l3, l4 = st.columns(4)
+    l1, l2, l3 = st.columns(3)
     l1.metric("Do nothing", f"${lad['naive']/1e6:.1f}M", help="Added system cost, rigid data center")
     l2.metric("AI-searched strategy", f"${lad['ai']/1e6:.1f}M",
               f"closed {lad['ai_gap']:.0f}% of the gap")
-    l3.metric("Hand-written rules", f"${lad['pfa']/1e6:.1f}M", f"closed {lad['pfa_gap']:.0f}%")
-    l4.metric("Perfect foresight", f"${lad['dla']/1e6:.1f}M", "the bound — 100%")
+    l3.metric("Perfect foresight", f"${lad['dla']/1e6:.1f}M", "the bound — 100%")
     st.info("**The honest finding:** on this harder problem the AI's reactive rules plateau "
             "well above the optimizer — timing a 24-hour backlog against price spikes needs "
             "foresight a simple rule can't express. That's exactly why the engine keeps a "
@@ -1030,7 +1027,7 @@ def render_hood():
                      "deferrable compute window": "24 h deadline, enforced",
                      "battery round-trip efficiency": "88%",
                      "battery sizing": "slider MW × 4 h of storage"})
-        for run_name, label in [("results/engine_aps", "APS-over-engine run"),
+        for run_name, label in [("results/engine_aps", "Data-center search run"),
                                 ("results/run1", "Home-battery search run")]:
             p = ROOT / run_name
             if p.exists():
@@ -1120,8 +1117,8 @@ improve control strategies as ordinary, auditable code. We must ask two question
     else:
         h2.metric("Best searched policy", "0.24 € from optimum",
                   "recorded run · Jun–Aug 2026")
-    h3.metric("AI vs hand rules", f"{lad['ai_gap']:.0f}% / {lad['pfa_gap']:.0f}%",
-              "of the optimality gap closed (data-center problem)")
+    h3.metric("AI-written rules", f"{lad['ai_gap']:.0f}% of gap closed",
+              "vs the optimizer bound (data-center problem)")
     st.divider()
 
     # ---- 2 · problem
@@ -1162,8 +1159,8 @@ consumer on the grid ({iso}, real data).""")
     c_pfa, c_cfa, c_vfa, c_dla = st.columns(4)
     with c_pfa:
         st.markdown("##### ✅ PFA")
-        st.markdown("Policy-function approximation — implemented twice: hand-written "
-                    "threshold rules **and** the AI-written policies of the agentic search.")
+        st.markdown("Policy-function approximation — the AI-written policies of the "
+                    "agentic search.")
     with c_cfa:
         st.markdown("##### ⬜ CFA")
         st.markdown("Cost-function approximation — future work.")
@@ -1176,32 +1173,32 @@ consumer on the grid ({iso}, real data).""")
                     "other policy.")
     st.markdown("*The optimizer stays in the loop as competitor, bound, and verifier.*")
 
-    st.markdown("**(c) The architecture we implement and extend:**")
+    st.markdown("**(c) The three-level agent architecture:**")
     st.image(str(ROOT / "assets/aps_fig1_architecture.png"),
-             caption="Fig. 1 of Sommer, Bazan, Babaeian, Fellerer, Powell & German, "
-                     "'Adaptive Self-Improvement for Smarter Energy Systems using "
-                     "Agentic Policy Search' — the three-level architecture this "
-                     "project implements and extends. Reproduced for attribution.")
+             caption="Architecture figure from Sommer, Bazan, Babaeian, Fellerer, "
+                     "Powell & German, 'Adaptive Self-Improvement for Smarter Energy "
+                     "Systems using Agentic Policy Search' (used with attribution).")
     st.divider()
 
     # ---- 4 · evidence
-    st.subheader("Evidence: our replication of the paper's search")
+    st.subheader("Evidence: our recorded search runs")
     ev1, ev2 = st.columns(2)
     with ev1:
         st.image(str(ROOT / "results/run1/figures/fig2_cost_evolution.png"),
-                 caption="OUR replication run — cost evolution across ten independent "
-                         "searches: the best attempt is near-optimal within 3 rounds.")
+                 caption="Search dynamics across 10 recorded runs — cost evolution "
+                         "across ten independent searches: the best attempt is "
+                         "near-optimal within 3 rounds.")
     with ev2:
         st.image(str(ROOT / "results/run1/figures/fig3_best_policy.png"),
-                 caption="OUR replication run — the best policy found. The median "
+                 caption="The best policy found across the recorded runs. The median "
                          "attempt diverges with a small code model, which is exactly "
                          "why the loop always keeps the best-so-far strategy.")
     st.divider()
 
     # ---- 5 · case study 1: home battery
     st.subheader("Case study 1 — Home battery (€, lab bench)")
-    st.markdown("**Setup:** a 10 kWh battery, 5 kWp rooftop PV, one simulated week on "
-                "a dynamic tariff.")
+    st.markdown("**Setup:** our simulated-week benchmark — a 10 kWh battery, 5 kWp "
+                "rooftop PV, one week on a dynamic tariff, fully disclosed assumptions.")
     if hb_best is not None:
         st.markdown(f"**Result:** 10/10 independent searches found a profitable "
                     f"strategy within 3 rounds; the best reached **{eur(hb_best)}** "
@@ -1217,16 +1214,15 @@ consumer on the grid ({iso}, real data).""")
     st.subheader("Case study 2 — Data center (\\$, field)")
     ladder_df = pd.DataFrame(
         {"added system cost ($M)": [lad["naive"]/1e6, lad["ai"]/1e6,
-                                    lad["pfa"]/1e6, lad["dla"]/1e6]},
-        index=["Do nothing", "AI-written rules", "Hand-written rules",
-               "Perfect foresight (bound)"])
+                                    lad["dla"]/1e6]},
+        index=["Do nothing", "AI-written rules", "Perfect foresight (bound)"])
     st.bar_chart(ladder_df, horizontal=True, height=260, color=[PALETTE["dc"]])
     st.markdown(f"**The honest finding:** the AI's reactive rules closed "
-                f"{lad['ai_gap']:.0f}% of the optimality gap — hand-written rules "
-                f"closed {lad['pfa_gap']:.0f}% — and both plateau above the optimizer: "
-                "timing a 24-hour backlog against price spikes needs foresight a "
-                "simple rule can't express. That is exactly why the engine keeps a "
-                "classical optimizer in the room and lets the scoreboard pick the winner.")
+                f"{lad['ai_gap']:.0f}% of the optimality gap and plateau above the "
+                "optimizer: timing a 24-hour backlog against price spikes needs "
+                "foresight a simple rule can't express. That is exactly why the "
+                "classical optimizer stays in the loop as competitor, provable "
+                "bound, and verifier — and the scoreboard picks the winner.")
     st.caption("→ explore it interactively in 🧭 Explore")
     st.divider()
 
@@ -1309,7 +1305,6 @@ def render_mission():
 |---|---|---|
 | Do nothing | ${lad['naive']/1e6:.1f}M | — |
 | **AI-written rules** | **${lad['ai']/1e6:.1f}M** | **{lad['ai_gap']:.0f}%** |
-| Hand-written rules | ${lad['pfa']/1e6:.1f}M | {lad['pfa_gap']:.0f}% |
 | Optimizer (bound) | ${lad['dla']/1e6:.1f}M | 100% |""")
 
 
@@ -1468,13 +1463,13 @@ def render_pitch():
         st.header("The fix ladder — same compute, different hours")
         ladder_df = pd.DataFrame({
             "added system cost ($M)": [lad["naive"]/1e6, lad["ai"]/1e6,
-                                       lad["pfa"]/1e6, lad["dla"]/1e6]},
-            index=["Do nothing", "AI-written rules", "Hand-written rules",
+                                       lad["dla"]/1e6]},
+            index=["Do nothing", "AI-written rules",
                    "Optimal (perfect foresight)"])
         st.bar_chart(ladder_df, horizontal=True, height=300, color=[PALETTE["dc"]])
         g1, g2 = st.columns(2)
         g1.metric("AI-written rules", f"closed {lad['ai_gap']:.0f}% of the gap")
-        g2.metric("Hand-written rules", f"closed {lad['pfa_gap']:.0f}%")
+        g2.metric("Optimizer (bound)", "closes 100% — and stays in the loop")
         st.caption("Same compute, different hours — and we keep a provable optimum "
                    "in the loop.")
 

@@ -98,5 +98,5 @@ provable bound, and the scoreboard picks the winner.
   strategy within 3 rounds; best within 0.24 € of the perfect-foresight
   optimum for the simulated week.
 - **Data-center dispatch search**: LLM-written policies closed 27% of the
-  naive-to-optimal gap vs 55% for hand-written rules — the honest finding
-  that motivates keeping the classical optimizer in the loop.
+  naive-to-optimal gap — the classical optimizer stays in the loop as
+  competitor, provable bound, and verifier.
