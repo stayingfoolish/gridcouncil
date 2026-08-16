@@ -1,0 +1,389 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Dispatch Optimizer Redesign: Predictive Load-Price Matching
+
+## Analysis of Current Implementation
+
+**Strengths:**
+- Hour-of-day median pricing captures diurnal patterns
+- Urgency factor prevents deadline violations
+- SOC constraints maintain battery viability
+
+**Critical Limitations:**
+1. **Reactive pricing**: Only uses historical medians; no forward-looking signals
+2. **Decoupled decisions**: Flex serving and battery dispatch are independent
+3. **Threshold brittleness**: Binary cheap/expensive triggers miss nuanced optimization
+4. **Underutilized battery**: 12.5% utilization suggests conservative charging/discharging
+5. **Gap to optimum**: $2.6M gap (21% above LP optimum) indicates systematic underutilization of flexibility
+6. **Stagnation pattern**: Rising cost in iteration 2 suggests overfitting to recent history
+
+## Proposed Fundamental Redesign
+
+### Core Innovation: Joint Optimization with Temporal Lookahead
+
+Instead of independent flex-serving and battery decisions, treat the system as a **rolling optimization problem** where:
+- Backlog is a **flexible capacity reserve** with deadline constraints
+- Battery is a **dynamic price arbitrage instrument**
+- Dispatch jointly minimizes: `current_cost + expected_future_cost - flexibility_value`
+
+```python
+class PredictiveDispatchPolicy:
+    def __init__(self):
+        """
+        Redesigned policy using predictive patterns and joint optimization.
+        """
+        self.price_history = deque(maxlen=336)  # 14 days
+        self.hour_counter = 0
+        
+        # Learned price patterns
+        self.hour_mean_prices = {}  # hour -> mean price
+        self.hour_percentiles = {}  # hour -> (p10, p25, p50, p75, p90)
+        self.price_volatility = {}  # hour -> std dev
+        
+        # Decision memory for adaptive thresholds
+        self.recent_decisions = deque(maxlen=48)  # 2 days of decisions
+        self.cost_tracker = deque(maxlen=168)  # track marginal costs
+        
+        # Tuned parameters
+        self.battery_charge_threshold_percentile = 0.25  # charge at p25 prices
+        self.battery_discharge_threshold_percentile = 0.75  # discharge at p75 prices
+        self.min_battery_reserve = 0.15  # keep 15% SOC minimum
+        self.target_battery_level = 0.50  # aim for 50% SOC
+        self.flex_urgency_threshold_hours = 20  # serve at 20h old
+        
+    def _update_price_patterns(self, current_price: float, hour_of_day: int):
+        """Learn hour-specific price distributions."""
+        self.price_history.append((hour_of_day, current_price))
+        
+        # Recompute statistics for current hour
+        same_hour_prices = [p for h, p in self.price_history if h == hour_of_day]
+        
+        if len(same_hour_prices) >= 2:
+            self.hour_mean_prices[hour_of_day] = np.mean(same_hour_prices)
+            self.price_volatility[hour_of_day] = np.std(same_hour_prices)
+            self.hour_percentiles[hour_of_day] = (
+                np.percentile(same_hour_prices, 10),
+                np.percentile(same_hour_prices, 25),
+                np.percentile(same_hour_prices, 50),
+                np.percentile(same_hour_prices, 75),
+                np.percentile(same_hour_prices, 90),
+            )
+    
+    def _predict_next_24h_prices(self, current_hour: int, current_price: float) -> list:
+        """
+        Forecast next 24 hours using learned patterns.
+        Returns predicted prices for hours [current+1, current+2, ..., current+24]
+        """
+        forecast = []
+        for offset in range(1, 25):
+            future_hour = (current_hour + offset) % 24
+            
+            if future_hour in self.hour_percentiles:
+                # Use median of learned distribution
+                _, _, median, _, _ = self.hour_percentiles[future_hour]
+                forecast.append(median)
+            elif future_hour in self.hour_mean_prices:
+                forecast.append(self.hour_mean_prices[future_hour])
+            else:
+                # Fallback: assume mean of all prices
+                forecast.append(np.mean(list(self.price_history)) 
+                              if self.price_history else current_price)
+        
+        return forecast
+    
+    def _compute_flexibility_value(self,
+                                   backlog_mwh: float,
+                                   oldest_backlog_age_h: float,
+                                   current_price: float,
+                                   forecast_24h: list) -> float:
+        """
+        Compute the economic value of deferring vs. serving now.
+        
+        Returns: price_spread (positive = better to defer, negative = serve now)
+        """
+        if backlog_mwh == 0:
+            return 0.0
+        
+        # Cost to serve now
+        serve_now_cost = backlog_mwh * current_price
+        
+        # Expected cost if deferred 1-4 hours
+        hours_until_deadline = 24.0 - oldest_backlog_age_h
+        deferrable_hours = min(4, max(0, hours_until_deadline - 2.0))  # 2h buffer
+        
+        if deferrable_hours > 0:
+            future_prices = forecast_24h[:int(deferrable_hours)]
+            min_future_price = min(future_prices) if future_prices else current_price
+            defer_cost = backlog_mwh * min_future_price
+            
+            # Spread: positive = better to defer
+            spread = (serve_now_cost - defer_cost) / serve_now_cost if serve_now_cost > 0 else 0
+            return spread
+        
+        return 0.0
+    
+    def _compute_battery_charge_decision(self,
+                                        current_price: float,
+                                        current_hour: int,
+                                        battery_soc_mwh: float,
+                                        battery_capacity_mwh: float,
+                                        forecast_24h: list) -> float:
+        """
+        Determine if now is a good time to charge.
+        
+        Strategy: Charge if current price is in bottom 25% of expected prices for next 24h.
+        """
+        all_prices_24h = [current_price] + forecast_24h
+        charge_threshold = np.percentile(all_prices_24h, 25)
+        
+        charge_mw = 0.0
+        
+        # Aggressive charging at cheap hours
+        if current_price <= charge_threshold:
+            soc_ratio = battery_soc_mwh / battery_capacity_mwh
+            
+            if soc_ratio < self.target_battery_level:
+                # Charge at full power
+                charge_capacity = battery_capacity_mwh - battery_soc_mwh
+                charge_mw = min(100.0, charge_capacity / 1.0)  # 100 MW charge limit
+            elif soc_ratio < 0.90:
+                # Top up slowly toward 90%
+                charge_capacity = battery_capacity_mwh * 0.90 - battery_soc_mwh
+                charge_mw = min(40.0, charge_capacity / 1.0)
+        
+        return charge_mw
+    
+    def _compute_battery_discharge_decision(self,
+                                           current_price: float,
+                                           current_hour: int,
+                                           battery_soc_mwh: float,
+                                           battery_capacity_mwh: float,
+                                           firm_load_mw: float,
+                                           flex_to_serve_mw: float,
+                                           forecast_24h: list) -> float:
+        """
+        Determine if now is a good time to discharge.
+        
+        Strategy: Discharge if current price is in top 25% of expected prices,
+        AND we have adequate SOC buffer.
+        """
+        all_prices_24h = [current_price] + forecast_24h
+        discharge_threshold = np.percentile(all_prices_24h, 75)
+        
+        discharge_mw = 0.0
+        
+        # Discharge at expensive hours if SOC permits
+        if current_price >= discharge_threshold:
+            soc_ratio = battery_soc_mwh / battery_capacity_mwh
+            
+            if soc_ratio > self.target_battery_level:
+                # Discharge excess
+                discharge_available = battery_soc_mwh - (battery_capacity_mwh * self.min_battery_reserve)
+                discharge_mw = -min(100.0, discharge_available / 1.0)
+            elif soc_ratio > self.min_battery_reserve + 0.10:
+                # Tactical discharge to help during peak prices
+                discharge_mw = -min(50.0, (battery_soc_mwh - battery_capacity_mwh * self.min_battery_reserve) / 1.0)
+        
+        # Discharge to help with high load if SOC is healthy
+        if (firm_load_mw + flex_to_serve_mw) > 350.0:
+            soc_ratio = battery_soc_mwh / battery_capacity_mwh
+            if soc_ratio > 0.40:
+                available = battery_soc_mwh - (battery_capacity_mwh * self.min_battery_reserve)
+                load_assist = -min(80.0, available / 1.0)
+                discharge_mw = min(discharge_mw, load_assist)  # More negative = more discharge
+        
+        return discharge_mw
+    
+    def _compute_flex_serve_decision(self,
+                                    arriving_flex_mw: float,
+                                    backlog_mwh: float,
+                                    oldest_backlog_age_h: float,
+                                    current_price: float,
+                                    flexibility_value: float,
+                                    forecast_24h: list) -> float:
+        """
+        Compute optimal flex workload to serve now vs. defer.
+        
+        Core logic:
+        - Always serve arriving flex if it doesn't violate constraints
+        - Serve backlog opportunistically when prices are cheap or urgency is high
+        """
+        flex_serve_mw = arriving_flex_mw  # Always serve arriving work
+        
+        if backlog_mwh > 0:
+            # Deadline urgency (24h window)
+            time_until_deadline = 24.0 - oldest_backlog_age_h
+            
+            # Decision rule: serve backlog if urgent OR if price is favorable
+            serve_backlog = False
+            
+            if time_until_deadline <= 4.0:
+                # Must serve: deadline within 4 hours
+                serve_backlog = True
+            elif time_until_deadline <= 8.0 and flexibility_value < -0.10:
+                # Serve if moderately urgent and prices favor it
+                serve_backlog = True
+            elif flexibility_value < -0.20:
+                # Serve if significantly cheaper now than future
+                serve_backlog = True
+            elif oldest_backlog_age_h > self.flex_urgency_threshold_hours:
+                # Serve if backlog aging (> 20h old)
+                serve_backlog = True
+            
+            if serve_backlog:
+                # Serve as much backlog as capacity allows
+                backlog_to_serve = min(250.0 - arriving_flex_mw, backlog_mwh / 1.0)
+                flex_serve_mw += backlog_to_serve
+        
+        flex_serve_mw = max(0.0, min(250.0, flex_serve_mw))
+        return flex_serve_mw
+    
+    def take_action(self,
+                    hour_of_day: int,
+                    current_price: float,
+                    firm_load_mw: float,
+                    arriving_flex_mw: float,
+                    backlog_mwh: float,
+                    oldest_backlog_age_h: float,
+                    battery_soc_mwh: float,
+                    battery_capacity_mwh: float,
+                    battery_power_mw: float) -> tuple:
+        
+        # Update price statistics
+        self._update_price_patterns(current_price, hour_of_day)
+        self.hour_counter += 1
+        
+        # Generate 24-hour price forecast
+        forecast_24h = self._predict_next_24h_prices(hour_of_day, current_price)
+        
+        # Compute flexibility value (should we defer backlog?)
+        flexibility_value = self._compute_flexibility_value(
+            backlog_mwh, oldest_backlog_age_h, current_price, forecast_24h
+        )
+        
+        # Compute flex serving decision (joint with battery)
+        flex_serve_mw = self._compute_flex_serve_decision(
+            arriving_flex_mw, backlog_mwh, oldest_backlog_age_h,
+            current_price, flexibility_value, forecast_24h
+        )
+        
+        # Compute battery charge decision
+        battery_charge_mw = self._compute_battery_charge_decision(
+            current_price, hour_of_day, battery_soc_mwh, battery_capacity_mwh, forecast_24h
+        )
+        
+        # Compute battery discharge decision
+        battery_discharge_mw = self._compute_battery_discharge_decision(
+            current_price, hour_of_day, battery_soc_mwh, battery_capacity_mwh,
+            firm_load_mw, flex_serve_mw, forecast_24h
+        )
+        
+        # Combine charge/discharge (net battery action)
+        if battery_charge_mw > 0 and battery_discharge_mw < 0:
+            # Don't simultaneously charge and discharge; pick the stronger signal
+            battery_mw = battery_charge_mw if abs(battery_charge_mw) > abs(battery_discharge_mw) else battery_discharge_mw
+        else:
+            battery_mw = battery_charge_mw + battery_discharge_mw
+        
+        # Enforce SOC constraints
+        soc_after = battery_soc_mwh + battery_mw * 1.0
+        if soc_after < battery_capacity_mwh * self.min_battery_reserve:
+            battery_mw = battery_capacity_mwh * self.min_battery_reserve - battery_soc_mwh
+        elif soc_after > battery_capacity_mwh:
+            battery_mw = battery_capacity_mwh - battery_soc_mwh
+        
+        return flex_serve_mw, battery_mw
+```
+
+---
+
+## Key Parameter Values
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `battery_charge_threshold_percentile` | 0.25 (p25) | Charge during cheap 25% of hours; more aggressive than reactive baseline |
+| `battery_discharge_threshold_percentile` | 0.75 (p75) | Discharge during expensive 25% of hours |
+| `target_battery_level` | 50% | Optimal middle ground; reserve margin for opportunistic discharge, capacity for charging |
+| `min_battery_reserve` | 15% | Safety buffer; prevents zero-battery scenarios |
+| `flex_urgency_threshold_hours` | 20 hours | Serve backlog once >20h old (less than 4h until deadline) |
+| `charge_limit_mw` | 100 MW | Aggressive charging when prices warrant |
+| `discharge_limit_mw` | 100 MW | Symmetric discharge capability |
+
+---
+
+## Expected Improvements
+
+### Quantified Impact Projections
+
+1. **Battery Utilization**: 12.5% → **45-55%**
+   - Predictive charging/discharging at price extremes
+   - Increased cycling reduces system reliance on spot market
+
+2. **Added System Cost**: $14,613,893 → **$13,200,000–$13,500,000** (8–10% reduction)
+   - ~$1.1–1.4M savings from better price arbitrage
+   - Reduced peak-hour spot purchases
+
+3.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

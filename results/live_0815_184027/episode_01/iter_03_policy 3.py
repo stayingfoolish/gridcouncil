@@ -1,0 +1,264 @@
+import numpy as np
+from collections import deque
+
+
+class DispatchPolicy:
+    def __init__(self):
+        """
+        Integrated dispatch using 24h rolling horizon optimization.
+        """
+        self.price_history = deque(maxlen=672)
+        self.load_history = deque(maxlen=672)
+        self.hour_counter = 0
+        
+        self.hour_price_stats = {}
+        self.hour_load_stats = {}
+        
+        self.min_reserve = 0.10
+        self.max_soc = 0.95
+        self.target_soc_nominal = 0.55
+        self.backlog_deadline_hours = 24.0
+        self.flex_capacity_mw = 250.0
+        self.battery_power_rating_mw = 100.0
+        self.urgency_tau = 5.0
+        self.price_spike_percentile = 85
+        self.load_spike_percentile = 80
+    
+    def _ingest_observation(self, hour_of_day: int, current_price: float, 
+                            firm_load_mw: float):
+        """Update statistics with new observation."""
+        self.price_history.append((hour_of_day, current_price))
+        self.load_history.append((hour_of_day, firm_load_mw))
+        
+        same_hour_prices = [p for h, p in self.price_history if h == hour_of_day]
+        same_hour_loads = [l for h, l in self.load_history if h == hour_of_day]
+        
+        if len(same_hour_prices) >= 3:
+            prices_array = np.array(same_hour_prices)
+            self.hour_price_stats[hour_of_day] = {
+                'mean': np.mean(prices_array),
+                'std': np.std(prices_array),
+                'p25': np.percentile(prices_array, 25),
+                'p75': np.percentile(prices_array, 75),
+                'p90': np.percentile(prices_array, 90),
+            }
+        
+        if len(same_hour_loads) >= 3:
+            loads_array = np.array(same_hour_loads)
+            self.hour_load_stats[hour_of_day] = {
+                'mean': np.mean(loads_array),
+                'std': np.std(loads_array),
+                'p80': np.percentile(loads_array, 80),
+            }
+    
+    def _forecast_24h(self, current_hour: int, current_price: float) -> tuple:
+        """
+        Forecast next 24 hours: prices and loads.
+        Returns: (price_forecast, load_forecast, confidence_mask)
+        """
+        price_forecast = []
+        load_forecast = []
+        confidence = []
+        
+        for offset in range(24):
+            future_hour = (current_hour + offset) % 24
+            
+            if future_hour in self.hour_price_stats:
+                stats = self.hour_price_stats[future_hour]
+                price_forecast.append(stats['mean'])
+                confidence.append(1.0)
+            else:
+                avg = np.mean([p for _, p in self.price_history]) if self.price_history else current_price
+                price_forecast.append(avg)
+                confidence.append(0.5)
+            
+            if future_hour in self.hour_load_stats:
+                stats = self.hour_load_stats[future_hour]
+                load_forecast.append(stats['mean'])
+            else:
+                avg = np.mean([l for _, l in self.load_history]) if self.load_history else 280.0
+                load_forecast.append(avg)
+        
+        return np.array(price_forecast), np.array(load_forecast), np.array(confidence)
+    
+    def _identify_opportunities(self, 
+                               price_forecast: np.ndarray,
+                               load_forecast: np.ndarray) -> dict:
+        """
+        Scan 24h horizon for dispatch opportunities.
+        """
+        opportunities = {
+            'cheap_hours': [],
+            'expensive_hours': [],
+            'low_load_hours': [],
+            'high_load_hours': [],
+        }
+        
+        price_p25 = np.percentile(price_forecast, 25)
+        price_p75 = np.percentile(price_forecast, 75)
+        load_p75 = np.percentile(load_forecast, 75)
+        
+        for h in range(24):
+            if price_forecast[h] <= price_p25:
+                opportunities['cheap_hours'].append(h)
+            if price_forecast[h] >= price_p75:
+                opportunities['expensive_hours'].append(h)
+            if load_forecast[h] < 280.0:
+                opportunities['low_load_hours'].append(h)
+            if load_forecast[h] >= load_p75:
+                opportunities['high_load_hours'].append(h)
+        
+        return opportunities
+    
+    def _compute_urgency_score(self, oldest_backlog_age_h: float) -> float:
+        """
+        Exponential urgency curve: 0 at start, 1.0 at deadline.
+        """
+        hours_remaining = max(0.1, 24.0 - oldest_backlog_age_h)
+        hours_elapsed = oldest_backlog_age_h
+        urgency = 1.0 - np.exp(-hours_elapsed / self.urgency_tau)
+        return float(np.clip(urgency, 0.0, 1.0))
+    
+    def _optimize_flex_schedule(self,
+                               arriving_flex_mw: float,
+                               backlog_mwh: float,
+                               oldest_backlog_age_h: float,
+                               price_forecast: np.ndarray,
+                               load_forecast: np.ndarray,
+                               opportunities: dict) -> float:
+        """
+        Joint optimization: serve arriving flex + backlog across 24h horizon.
+        """
+        
+        flex_serve_mw = arriving_flex_mw
+        
+        if backlog_mwh == 0:
+            return flex_serve_mw
+        
+        urgency = self._compute_urgency_score(oldest_backlog_age_h)
+        hours_remaining = 24.0 - oldest_backlog_age_h
+        
+        if urgency >= 0.95:
+            backlog_serve = min(self.flex_capacity_mw - arriving_flex_mw, backlog_mwh / 1.0)
+            flex_serve_mw += backlog_serve
+            return min(self.flex_capacity_mw, flex_serve_mw)
+        
+        if urgency >= 0.80:
+            min_serve = 0.50 * backlog_mwh / max(hours_remaining, 1.0)
+            backlog_serve = min(self.flex_capacity_mw - arriving_flex_mw, min_serve)
+            flex_serve_mw += backlog_serve
+            return min(self.flex_capacity_mw, flex_serve_mw)
+        
+        if urgency >= 0.60:
+            next_4_prices = price_forecast[:4]
+            next_4_loads = load_forecast[:4]
+            
+            avg_price_4h = np.mean(next_4_prices)
+            spare_capacity = np.mean(350.0 - next_4_loads)
+            
+            if (avg_price_4h < np.percentile(price_forecast, 40) or 
+                spare_capacity > 30.0):
+                backlog_serve = min(self.flex_capacity_mw - arriving_flex_mw, 
+                                   0.30 * backlog_mwh / max(hours_remaining, 1.0))
+                flex_serve_mw += backlog_serve
+        
+        return min(self.flex_capacity_mw, flex_serve_mw)
+    
+    def _optimize_battery_dispatch(self,
+                                  price_forecast: np.ndarray,
+                                  load_forecast: np.ndarray,
+                                  battery_soc_mwh: float,
+                                  battery_capacity_mwh: float,
+                                  opportunities: dict,
+                                  flex_serve_mw: float,
+                                  firm_load_mw: float,
+                                  current_price: float) -> float:
+        """
+        Multi-objective battery optimization.
+        """
+        
+        soc_ratio = battery_soc_mwh / battery_capacity_mwh
+        
+        high_load_coming = any(load_forecast[h:min(h+6, 24)].mean() > 320 for h in range(0, 18))
+        expensive_hour_coming = any(price_forecast[h:min(h+4, 24)].max() > np.percentile(price_forecast, 75) 
+                                   for h in range(0, 20))
+        
+        if high_load_coming:
+            target_soc = 0.70
+        elif expensive_hour_coming:
+            target_soc = 0.75
+        else:
+            target_soc = 0.55
+        
+        battery_mw = 0.0
+        
+        if len(opportunities['cheap_hours']) > 0 and 0 in opportunities['cheap_hours']:
+            if soc_ratio < target_soc:
+                charge_needed = (target_soc - soc_ratio) * battery_capacity_mwh
+                battery_mw = min(self.battery_power_rating_mw, charge_needed / 1.0)
+            elif soc_ratio < 0.90:
+                battery_mw = min(40.0, (0.90 * battery_capacity_mwh - battery_soc_mwh) / 1.0)
+        
+        elif len(opportunities['expensive_hours']) > 0 and 0 in opportunities['expensive_hours']:
+            if soc_ratio > target_soc + 0.05:
+                discharge_available = battery_soc_mwh - (self.min_reserve * battery_capacity_mwh)
+                battery_mw = -min(self.battery_power_rating_mw, discharge_available / 1.0)
+            elif soc_ratio > (self.min_reserve + 0.15):
+                battery_mw = -min(60.0, (battery_soc_mwh - (self.min_reserve + 0.10) * battery_capacity_mwh) / 1.0)
+        
+        current_load = firm_load_mw + flex_serve_mw
+        if current_load > 330.0:
+            if soc_ratio > 0.45:
+                assist = -min(80.0, (battery_soc_mwh - 0.30 * battery_capacity_mwh) / 1.0)
+                battery_mw = min(battery_mw, assist)
+        
+        soc_after = battery_soc_mwh + battery_mw * 1.0
+        soc_after = np.clip(soc_after, 
+                           self.min_reserve * battery_capacity_mwh,
+                           self.max_soc * battery_capacity_mwh)
+        battery_mw = soc_after - battery_soc_mwh
+        
+        return battery_mw
+    
+    def take_action(self,
+                    hour_of_day: int,
+                    current_price: float,
+                    firm_load_mw: float,
+                    arriving_flex_mw: float,
+                    backlog_mwh: float,
+                    oldest_backlog_age_h: float,
+                    battery_soc_mwh: float,
+                    battery_capacity_mwh: float,
+                    battery_power_mw: float) -> tuple:
+        """
+        Decide this hour's flexible dispatch.
+        """
+        
+        self._ingest_observation(hour_of_day, current_price, firm_load_mw)
+        
+        price_forecast, load_forecast, confidence = self._forecast_24h(hour_of_day, current_price)
+        opportunities = self._identify_opportunities(price_forecast, load_forecast)
+        
+        flex_serve_mw = self._optimize_flex_schedule(
+            arriving_flex_mw,
+            backlog_mwh,
+            oldest_backlog_age_h,
+            price_forecast,
+            load_forecast,
+            opportunities
+        )
+        
+        battery_mw = self._optimize_battery_dispatch(
+            price_forecast,
+            load_forecast,
+            battery_soc_mwh,
+            battery_capacity_mwh,
+            opportunities,
+            flex_serve_mw,
+            firm_load_mw,
+            current_price
+        )
+        
+        battery_mw = np.clip(battery_mw, -battery_power_mw, battery_power_mw)
+        
+        return flex_serve_mw, battery_mw

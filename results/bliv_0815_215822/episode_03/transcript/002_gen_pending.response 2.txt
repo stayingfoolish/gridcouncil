@@ -1,0 +1,85 @@
+```python
+class Policy:
+    def __init__(self):
+        """Initializes the policy with configuration parameters."""
+        self.charge_threshold = 0.3
+        self.discharge_threshold = 0.7
+        self.price_margin = 0.05
+        self.min_reserve = 0.15
+        
+        self.base_buy_multiplier = 1.08
+        self.base_sell_multiplier = 0.92
+        self.volatility_sensitivity = 0.015
+        
+    def _get_adaptive_thresholds(self, price_volatility: float) -> tuple:
+        """Calculate thresholds based on market volatility."""
+        volatility_factor = 1 + (price_volatility / 100) * self.volatility_sensitivity
+        
+        buy_threshold = self.base_buy_multiplier * volatility_factor
+        sell_threshold = self.base_sell_multiplier * volatility_factor
+        
+        return buy_threshold, sell_threshold
+    
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+        price_volatility: float = 10.1,
+    ) -> tuple:
+        """Determines the target battery action to minimize energy costs."""
+        
+        soc = current_energy_stored_kwh / battery_capacity_kwh
+        net_power = current_pv_generation_kw - current_demand_kw
+        
+        buy_threshold, sell_threshold = self._get_adaptive_thresholds(price_volatility)
+        
+        if net_power > 0:
+            if soc < self.discharge_threshold and current_grid_buy_price > current_grid_sell_price * buy_threshold:
+                action_kw = min(net_power, 10.0)
+                reason = f"Charge battery: PV surplus {net_power:.2f}kW, SOC {soc:.1%}, buy {current_grid_buy_price:.3f}€/kWh vs sell {current_grid_sell_price:.3f}€/kWh (threshold: {buy_threshold:.3f}x)"
+                return action_kw, reason
+            elif soc >= battery_capacity_kwh * 0.95:
+                action_kw = 0.0
+                reason = f"Battery near full at {soc:.1%}, stop charging despite PV surplus"
+                return action_kw, reason
+            else:
+                action_kw = min(net_power, 10.0)
+                reason = f"Charge from PV surplus: {net_power:.2f}kW available, SOC {soc:.1%}"
+                return action_kw, reason
+        
+        deficit = current_demand_kw - current_pv_generation_kw
+        
+        if deficit > 0:
+            if soc > (self.charge_threshold + self.min_reserve) and current_grid_buy_price > current_grid_sell_price * buy_threshold:
+                discharge_power = min(deficit, 5.0, soc * battery_capacity_kwh)
+                action_kw = -discharge_power
+                reason = f"Discharge to avoid expensive grid: demand {current_demand_kw:.2f}kW, buy {current_grid_buy_price:.3f}€/kWh (threshold: {buy_threshold:.3f}x)"
+                return action_kw, reason
+            else:
+                action_kw = 0.0
+                reason = f"Buy from grid: demand {deficit:.2f}kW, SOC {soc:.1%}"
+                return action_kw, reason
+        
+        if soc > self.discharge_threshold and current_grid_sell_price > current_grid_buy_price * sell_threshold:
+            excess_capacity = (soc - self.discharge_threshold) * battery_capacity_kwh
+            if excess_capacity > 0.5:
+                discharge_power = min(excess_capacity / 4, 5.0)
+                action_kw = -discharge_power
+                reason = f"Discharge to grid: sell {current_grid_sell_price:.3f}€/kWh profitable at {sell_threshold:.3f}x, SOC {soc:.1%}"
+                return action_kw, reason
+        
+        if soc < self.charge_threshold and current_grid_buy_price < current_grid_sell_price * (1 / sell_threshold):
+            available_capacity = (self.discharge_threshold - soc) * battery_capacity_kwh
+            if available_capacity > 0.5:
+                charge_power = min(available_capacity / 4, 10.0)
+                action_kw = charge_power
+                reason = f"Charge at low price: buy {current_grid_buy_price:.3f}€/kWh cheap, SOC {soc:.1%}"
+                return action_kw, reason
+        
+        action_kw = 0.0
+        reason = f"Idle: SOC {soc:.1%}"
+        return action_kw, reason
+```

@@ -1,0 +1,17 @@
+{
+  "lp_bound": 12019506,
+  "naive_cost": 14878858,
+  "n_iterations": 12,
+  "phase": "gen_pending",
+  "iteration": 0,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "Implement a rule-based dispatch policy that decides, from the current price and local state, when to run deferrable compute, when to defer it, and when to charge or discharge the battery, minimizing the added system dispatch cost of the data center.",
+  "mode": "initial",
+  "best_cost": Infinity,
+  "best_iteration": -1,
+  "last_code": "",
+  "last_metrics": {},
+  "cost_history": [],
+  "records": []
+}

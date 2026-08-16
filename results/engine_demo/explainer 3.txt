@@ -1,0 +1,25 @@
+ENGINE EXPLAINER — NYISO, 2.1 held-out weeks
+
+A 500 MW data center connecting as inflexible load would have raised the
+market's peak clearing price by $196/MWh and added
+$76.3M to existing consumers' bills over the period.
+
+The engine dispatched the flexibility the load already has — 50% deferrable
+compute (24h window) and a 400 MWh battery — comparing threshold rules (PFA)
+against a lookahead LP (DLA) on the calibrated twin. DLA lookahead (MPC) won the
+arbitration. The lever: hold deferrable jobs and discharge storage through
+stack-climbing hours, recover overnight when the marginal unit is cheap.
+
+Result: the data center's own energy bill falls $3.42M
+(22%), added system dispatch cost falls
+$2.86M (19%), and the
+consumer bill impact drops $24.98M
+(33%). Peak price impact:
++$196 -> +$196/MWh.
+
+The residual peak impact comes from the 250 MW firm floor: at the scarcity
+hour the battery (100 MW) cannot cover it. The engine's sizing answer: with
+250 MW / 1000 MWh of storage the peak impact falls to
++$56/MWh and the consumer bill impact to
+$29.7M — that is the interconnection
+package to bring to the operator.

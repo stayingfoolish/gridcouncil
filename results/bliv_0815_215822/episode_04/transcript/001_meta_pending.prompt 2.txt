@@ -1,0 +1,107 @@
+You are an expert developing an intelligent battery management system.
+Current Total Cost: -4.33
+Best Cost Achieved: -4.33
+Iteration: 1
+Battery Utilization: 64.3%
+Average State of Charge: 53.7
+Price Volatility: 10.1
+Performance History (last 5 costs): [-4.33]
+
+Current Implementation:
+```python
+class Policy:
+    def __init__(self):
+        """Initializes the policy with price and energy thresholds."""
+        self.price_ratio_threshold = 1.3
+        self.charge_efficiency = 0.95
+        self.discharge_efficiency = 0.95
+
+    def take_action(self,
+                    current_energy_stored_kwh: float,
+                    current_pv_generation_kw: float,
+                    current_demand_kw: float,
+                    current_grid_buy_price: float,
+                    current_grid_sell_price: float,
+                    battery_capacity_kwh: float) -> tuple:
+        """Determines optimal battery action to minimize energy costs.
+
+        Decision logic:
+        1. If buying is much cheaper than discharging: buy from grid
+        2. If selling price is attractive: discharge and sell
+        3. If PV generation exceeds demand: charge battery
+        4. Otherwise: balance based on price signals
+        """
+        action_kw = 0.0
+        reason = ""
+
+        pv_excess = max(0, current_pv_generation_kw - current_demand_kw)
+        pv_deficit = max(0, current_demand_kw - current_pv_generation_kw)
+
+        energy_stored_ratio = current_energy_stored_kwh / battery_capacity_kwh
+
+        if current_grid_buy_price == 0 or current_grid_sell_price == 0:
+            reason = "no action: invalid price data"
+            return action_kw, reason
+
+        price_ratio = current_grid_buy_price / current_grid_sell_price if current_grid_sell_price > 0 else float('inf')
+
+        if pv_excess > 0:
+            battery_space_ratio = 1 - energy_stored_ratio
+            if battery_space_ratio > 0.15:
+                max_charge = min(pv_excess, 10.0)
+                charge_cost_per_kwh = current_grid_buy_price / self.charge_efficiency
+                sell_revenue_per_kwh = current_grid_sell_price * self.discharge_efficiency
+                
+                if sell_revenue_per_kwh > charge_cost_per_kwh * 1.1:
+                    action_kw = max_charge
+                    reason = f"charge: PV excess {pv_excess:.2f}kW and sell revenue {sell_revenue_per_kwh:.3f}€/kWh beats charge cost {charge_cost_per_kwh:.3f}€/kWh"
+                    return action_kw, reason
+
+        if pv_deficit > 0:
+            if price_ratio > self.price_ratio_threshold and current_energy_stored_kwh > battery_capacity_kwh * 0.2:
+                max_discharge = min(pv_deficit, 5.0, current_energy_stored_kwh)
+                action_kw = -max_discharge
+                reason = f"discharge: buy price {current_grid_buy_price:.3f}€/kWh is {price_ratio:.2f}x sell price, stored {current_energy_stored_kwh:.2f}kWh"
+                return action_kw, reason
+
+            if current_grid_sell_price > current_grid_buy_price * 1.5 and current_energy_stored_kwh > battery_capacity_kwh * 0.3:
+                max_discharge = min(pv_deficit, 5.0, current_energy_stored_kwh)
+                action_kw = -max_discharge
+                reason = f"discharge: sell price {current_grid_sell_price:.3f}€/kWh highly favorable vs buy {current_grid_buy_price:.3f}€/kWh"
+                return action_kw, reason
+
+        if pv_excess > 0 and energy_stored_ratio < 0.85:
+            max_charge = min(pv_excess, 10.0)
+            action_kw = max_charge
+            reason = f"charge: excess PV generation {pv_excess:.2f}kW with {energy_stored_ratio*100:.1f}% battery fill"
+            return action_kw, reason
+
+        if current_energy_stored_kwh > battery_capacity_kwh * 0.9 and current_grid_sell_price > current_grid_buy_price:
+            available_to_discharge = min(5.0, current_energy_stored_kwh - battery_capacity_kwh * 0.85)
+            if available_to_discharge > 0.5:
+                action_kw = -available_to_discharge
+                reason = f"discharge: battery near full {energy_stored_ratio*100:.1f}% and sell price {current_grid_sell_price:.3f}€/kWh favorable"
+                return action_kw, reason
+
+        if current_energy_stored_kwh < battery_capacity_kwh * 0.2 and current_grid_buy_price < current_grid_sell_price * 0.7:
+            space_available = battery_capacity_kwh * 0.6 - current_energy_stored_kwh
+            max_charge = min(space_available / self.charge_efficiency, 10.0, pv_excess)
+            if max_charge > 0.5:
+                action_kw = max_charge
+                reason = f"charge: buy price {current_grid_buy_price:.3f}€/kWh very low vs sell {current_grid_sell_price:.3f}€/kWh, battery low at {energy_stored_ratio*100:.1f}%"
+                return action_kw, reason
+
+        reason = f"no action: no profitable arbitrage, prices buy={current_grid_buy_price:.3f}€/kWh sell={current_grid_sell_price:.3f}€/kWh, demand={current_demand_kw:.2f}kW, storage={energy_stored_ratio*100:.1f}%"
+        return action_kw, reason
+
+```
+
+Suggest ONE specific improvement to the existing approach
+
+Your task:
+1. Analyze the current implementation's strengths and limitations
+2. The current approach shows potential. Focus on targeted improvements while maintaining core strategy.
+3. Provide specific parameter values and implementation details
+4. Explain expected impact on cost and system behavior
+
+Focus on CONCRETE improvements that can be implemented immediately.

@@ -1,0 +1,94 @@
+```python
+class Policy:
+    def __init__(self):
+        """Initializes the policy with dynamic price-aware thresholds."""
+        self.base_charge_threshold = 0.25
+        self.base_discharge_threshold = 0.75
+        self.price_sensitivity = 0.15
+        self.recent_prices = []
+        self.max_charge_power = 10.0
+        self.max_discharge_power = 5.0
+        
+    def _calculate_adaptive_thresholds(self, current_grid_buy_price, current_grid_sell_price):
+        """Adjust thresholds based on current price levels relative to recent history."""
+        if not self.recent_prices or len(self.recent_prices) < 2:
+            return self.base_discharge_threshold, self.base_charge_threshold
+        
+        recent_buys = [p[0] for p in self.recent_prices[-5:]]
+        recent_sells = [p[1] for p in self.recent_prices[-5:]]
+        
+        avg_buy = sum(recent_buys) / len(recent_buys)
+        avg_sell = sum(recent_sells) / len(recent_sells)
+        
+        buy_ratio = current_grid_buy_price / avg_buy if avg_buy > 0 else 1.0
+        discharge_threshold = self.base_discharge_threshold + (1.0 - buy_ratio) * self.price_sensitivity
+        
+        sell_ratio = current_grid_sell_price / avg_sell if avg_sell > 0 else 1.0
+        charge_threshold = self.base_charge_threshold - (sell_ratio - 1.0) * self.price_sensitivity
+        
+        discharge_threshold = min(0.95, max(0.55, discharge_threshold))
+        charge_threshold = max(0.05, min(0.40, charge_threshold))
+        
+        return discharge_threshold, charge_threshold
+    
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> tuple:
+        """Determines the target action with price-adaptive thresholds."""
+        
+        self.recent_prices.append((current_grid_buy_price, current_grid_sell_price))
+        if len(self.recent_prices) > 5:
+            self.recent_prices.pop(0)
+        
+        discharge_threshold, charge_threshold = self._calculate_adaptive_thresholds(
+            current_grid_buy_price, current_grid_sell_price
+        )
+        
+        energy_stored_ratio = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+        net_generation = current_pv_generation_kw - current_demand_kw
+        energy_deficit = current_demand_kw - current_pv_generation_kw
+        
+        action_kw = 0.0
+        reason = ""
+        
+        if net_generation > 0.1:
+            if energy_stored_ratio < discharge_threshold:
+                max_charge = min(self.max_charge_power, net_generation, 
+                               battery_capacity_kwh - current_energy_stored_kwh)
+                if max_charge > 0.05:
+                    action_kw = max_charge
+                    reason = f"Charge {action_kw:.2f}kW (SoC {energy_stored_ratio*100:.1f}% < threshold {discharge_threshold*100:.0f}%)"
+                else:
+                    action_kw = 0.0
+                    reason = "Battery full, surplus feeds to grid"
+            else:
+                action_kw = 0.0
+                reason = f"SoC {energy_stored_ratio*100:.1f}% >= threshold {discharge_threshold*100:.0f}%, sell excess"
+        
+        elif energy_deficit > 0.1:
+            if energy_stored_ratio > charge_threshold:
+                max_discharge = min(self.max_discharge_power, energy_deficit, 
+                                   current_energy_stored_kwh)
+                if max_discharge > 0.05:
+                    action_kw = -max_discharge
+                    reason = f"Discharge {-action_kw:.2f}kW (SoC {energy_stored_ratio*100:.1f}% > threshold {charge_threshold*100:.0f}%)"
+                else:
+                    action_kw = 0.0
+                    reason = "Battery depleted, buy from grid"
+            else:
+                action_kw = 0.0
+                reason = f"SoC {energy_stored_ratio*100:.1f}% <= threshold {charge_threshold*100:.0f}%, buy cheap"
+        
+        else:
+            action_kw = 0.0
+            reason = "Supply balanced with demand"
+        
+        action_kw = max(-self.max_discharge_power, min(self.max_charge_power, action_kw))
+        
+        return action_kw, reason
+```

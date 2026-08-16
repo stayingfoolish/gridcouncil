@@ -1,0 +1,217 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+ANALYSIS OF CURRENT IMPLEMENTATION
+
+Strengths:
+- Regime classification effectively segments price behavior into 4 tiers
+- Mean-reversion modeling provides temporal foresight for forward decisions
+- Battery allocation to peak regimes (2-3) directly mitigates spike exposure
+- Deadline urgency escalation prevents compute starvation
+- 336-hour price history captures weekly seasonality patterns
+
+Critical Limitations Driving Stagnation:
+1. Battery Underutilization (17.5%): Battery is treated reactively (charge in regime-0, discharge in regime 2-3), missing opportunities for deliberate pre-positioning before predicted peaks
+2. Sequential Decision Making: Backlog serving and battery dispatch are independent; no joint optimization of when to serve compute + use battery simultaneously
+3. Regime Myopia: 4-regime model is too coarse; identical behavior for all prices within a regime threshold
+4. Peak Price Impact (196.2 $/MWh): Backlog serving ratios (85% in regime-0, 30% in regime-1) may trigger demand shocks that spike prices further
+5. Forecast Horizon Mismatch: 24-hour forward simulation predicts regimes, but we need cost-minimizing schedules for 48+ hours
+6. Oscillating Performance: History [14296269, 14712314, 14835724, 14693608, 14842315] shows instability; policy alternates between aggressive and conservative, suggesting hypersensitivity to price regime boundaries
+
+PROPOSED APPROACH: Dual-Horizon Predictive Batching with Pre-Emptive Battery Cycling
+
+Core Philosophy: Shift from reactive regime-following to proactive cost minimization by:
+- Building long-term ("costmap") understanding of recurring low-price windows
+- Pre-positioning battery 18-36 hours before predicted peak windows
+- Batching compute in two tiers: emergency (hard deadlines <6h away) and scheduled (flexible deadlines 6-30h away)
+- Smoothing load to flatten price response curve
+
+Key Implementation Changes:
+
+1. COSTMAP LEARNING (New module)
+   - Compute rolling 7-day price percentiles by hour-of-week (168 hourly buckets)
+   - Identify "golden hours" where p25 price falls below mean - 0.5*stdev
+   - Track recurrence pattern (how often these windows repeat weekly)
+   - Use this as prior for next week's schedule prediction
+
+   Expected impact: Reduces peak price sensitivity by enabling pre-planned compute scheduling rather than reactive serving
+
+2. BATTERY PRE-POSITIONING STRATEGY (Replace current reactive model)
+   Current: Charge when regime==0 (opportunistic), discharge when regime>=2 (reactive)
+   Proposed:
+   - If next 24-48h contains predicted high-cost windows (p75+), begin charging now if SOC < 70%
+   - Build toward 80% SOC by 4 hours before predicted peak, then hold
+   - During peak window, discharge only to soften load spikes (discharge at 60% power, not 90%)
+   - This creates "battery buffer" for unexpected peaks rather than energy arbitrage
+
+   New threshold logic:
+   ```
+   peak_window_hours = next 24-48h hours with price > p75
+   if peak_window_hours and soc < 70 and current_regime <= 1:
+      charge_aggressively = True
+      target_soc = 80
+   elif peak_window_hours and soc > 40:
+      discharge_gently = True (at 0.6x max power, not aggressive)
+   else:
+      hold_current_soc = True
+   ```
+   Expected impact: Increases battery utilization from 17.5% → 45-55% by deliberate cycling; reduces peak demand surges
+
+3. COMPUTE BATCHING REFINEMENT (Replace uniform backlog serving)
+   Current: Serve all arriving flex + fraction of backlog based on regime + urgency
+   Proposed: Stratify backlog into priority tiers
+
+   Tier 1 - EMERGENCY: oldest_backlog_age > 24h (deadline imminent)
+   → Serve immediately at baseline rates (cannot defer further)
+   → Budget: cap at arriving_flex_mw + backlog_mwh * 0.40
+
+   Tier 2 - SCHEDULED: oldest_backlog_age 6-24h (flexible window)
+   → Serve only during golden hours (lowest p25 windows in rolling costmap)
+   → If in golden hour: serve at backlog_mwh * 0.95
+   → If not in golden hour: serve only arriving_flex_mw
+   → Budget: hold for next golden window within deadline
+
+   Tier 3 - FLEXIBLE: arriving_flex_mw with <6h deadline
+   → Serve immediately at full rate (hard SLA)
+
+   Fallback: If no golden hour appears before deadline, linearly interpolate serving over final 6 hours
+
+   Expected impact: Reduces demand-side price shocks by smoothing compute arrivals; targets lowest-cost windows; should reduce peak impact from 196.2 to ~120-140 $/MWh
+
+4. REGIME THRESHOLD ADAPTATION (Reduce binary logic brittleness)
+   Current: Hard thresholds at p25, p50, p75 classify all prices into 4 buckets
+   Proposed: Soft regime scores using sigmoid transitions
+
+   ```
+   regime_score = sigmoid((current_price - p50) / (p75 - p25))
+   # regime_score in [0, 1]: 0=low, 1=peak
+   # Use for smooth interpolation between decisions, not hard classification
+
+   def sigmoid(x):
+       return 1 / (1 + exp(-x))
+   ```
+
+   Apply to battery aggressiveness:
+   - regime_score 0.0-0.2: charge if below 80% SOC
+   - regime_score 0.2-0.6: hold current SOC
+   - regime_score 0.6-1.0: discharge proportionally (discharge_power = max_power * (regime_score - 0.6) / 0.4)
+
+   Expected impact: Eliminates oscillation at regime boundaries (e.g., price at p75±1 no longer flips policy); smoother, more stable decisions
+
+5. SHORTENED BATCH_WINDOW for Tighter Forecasting
+   Current: batch_window = 24 hours (too long for volatile markets)
+   Proposed: batch_window = 4 hours (align with typical intra-day seasonality)
+
+   Also increase lookback_hours from 72 to 168 (full week) for better weekly pattern capture
+
+   Expected impact: Faster adaptation to intra-day price patterns; reduces stagnation by responding to finer-grained opportunities
+
+PARAMETER RECOMMENDATIONS:
+
+```python
+# Costmap module
+weekly_price_history_hours = 7 * 24  # 168 hours
+golden_hour_threshold = mean_price - 0.7 * std_price  # Prices significantly below mean
+
+# Battery strategy
+battery_charge_target_soc = 0.80
+battery_charge_lead_time_hours = 18  # Start charging 18h before peak window
+battery_discharge_gentle_power_factor = 0.60  # Don't drain at full power during peaks
+soc_threshold_charge = 0.70
+soc_threshold_discharge = 0.40
+
+# Backlog serving
+emergency_backlog_age_threshold = 24.0  # hours
+emergency_serve_fraction = 0.40
+scheduled_backlog_age_threshold = 6.0
+scheduled_serve_fraction_golden = 0.95
+scheduled_serve_fraction_normal = 0.0
+
+# Thresholds
+lookback_hours = 168  # 7 days
+batch_window = 4  # hours
+regime_sigmoid_scale = (p75 - p25)  # Normalize sigmoid steepness
+```
+
+EXPECTED OUTCOMES:
+
+Cost Improvement Pathway:
+- Current Added System Cost: $14,842,315
+- Expected with dual-horizon batching: $13,800,000 - $14,100,000 (6-8% reduction)
+- Target (with full costmap + battery pre-positioning): $12,700,000 - $13,200,000 (12-15% reduction)
+- Theoretical ceiling: $12,019,506 (LP optimum)
+
+Behavioral Changes:
+1. Battery utilization: 17.5% → 50-60% (more deliberate cycling)
+2. Peak price impact: 196.2 $/MWh → 120-150 $/MWh (smoother load profile)
+3. Performance stability: Eliminate oscillation in [14296269, 14712314, ...] by soft regime transitions
+4. Deadline violations: 0 MWh maintained (emergency tier ensures coverage)
+
+Failure Modes Mitigated:
+- Price forecasts fail: Fallback to emergency tier for all backlog within 6h
+- Battery SOC hits limits: Switch to load-shedding proportional to available SOC
+- No golden hours exist: Linear serve-down over final 6 hours of deadline window
+
+This approach treats the dispatch problem as a joint optimization (compute + battery schedule) rather than sequential (regime → battery → backlog). The costmap encodes market structure learned over weeks, replacing reactive regime classification. Pre-positioned battery acts as "demand flexibility storage" to absorb load smoothing rather than energy arbitrage.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

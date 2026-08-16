@@ -1,0 +1,71 @@
+# Analysis & Targeted Improvement
+
+## Current Strengths
+- Price percentile tracking provides robust price context
+- Urgency-based backlog handling prevents deadline violations
+- Battery deficit/excess framing enables proactive charging/discharging
+- Price trend detection captures momentum
+
+## Critical Limitation Identified
+
+**The battery target SOC (50%) is static and disconnected from price forecasting.** 
+
+The policy charges/discharges around a fixed 50% target regardless of whether prices are trending upward (should charge more aggressively) or downward (can stay leaner). This creates two problems:
+
+1. **During rising price trends**: Battery sits at 50% when it should be at 70-80%, then discharge capacity is insufficient during expensive hours
+2. **During falling price trends**: Battery gets over-charged at moderate prices, wasting capacity that could have been filled later cheaper, and battery utilization stays low (currently 27.2%)
+
+The gap between theoretical optimum ($12.02M) and current ($14.53M) suggests ~17.4% cost headroom—much of which stems from suboptimal battery positioning timing.
+
+---
+
+## Specific Improvement: Dynamic Battery Target SOC Based on Price Trend
+
+### Implementation
+
+```python
+def take_action(self, ...):
+    # ... existing code ...
+    
+    # REPLACE the static line:
+    # target_battery_soc = battery_capacity_mwh * self.battery_target_soc_fraction
+    
+    # WITH dynamic target:
+    if self.price_trend > 0.10:  # Strong upward trend
+        dynamic_target_fraction = 0.70
+    elif self.price_trend > 0.03:  # Moderate upward trend
+        dynamic_target_fraction = 0.60
+    elif self.price_trend < -0.10:  # Strong downward trend
+        dynamic_target_fraction = 0.30
+    elif self.price_trend < -0.03:  # Moderate downward trend
+        dynamic_target_fraction = 0.40
+    else:  # Flat/neutral
+        dynamic_target_fraction = 0.50
+    
+    target_battery_soc = battery_capacity_mwh * dynamic_target_fraction
+    battery_deficit = target_battery_soc - battery_soc_mwh
+    battery_excess = battery_soc_mwh - target_battery_soc
+    
+    # ... rest of existing logic continues unchanged ...
+```
+
+### Why This Works
+
+| Scenario | Trend | New Target | Behavior | Impact |
+|----------|-------|-----------|----------|--------|
+| Prices rising | +10% | 70% | Aggressively charge now, discharge expensive peak | Capture spread efficiently |
+| Prices stable | 0% | 50% | Current behavior maintained | No disruption |
+| Prices falling | -10% | 30% | Stay lean, fill battery cheaper later | Avoid stranded cost |
+
+### Expected Impact
+
+- **Cost reduction**: +2-3% savings (~$290K-$435K) by optimally timing charge/discharge cycles relative to price direction
+- **Battery utilization**: Increase from 27.2% → 35-40% through more intentional cycling
+- **Backlog resilience**: Maintains current performance (no negative impact on deadline violations)
+
+### Rationale for Parameters
+- **±10% trend threshold**: Captures sustained momentum vs. noise (1-2 hour swings)
+- **70%/30% bounds**: Maintains safety margin (won't hit 100%/0% constraints)
+- **Neutral at ±0.03 to ±0.10**: Avoids oscillation in flat markets
+
+This is a **minimal, surgical change** (7 lines) that exploits the price trend signal already being calculated but underutilized.
