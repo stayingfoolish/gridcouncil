@@ -1,89 +1,90 @@
-# gridcouncil — APS Replication
+# gridcouncil — Grid Optimization Engine
 
-Replication of **"Adaptive Self-Improvement for Smarter Energy Systems using
-Agentic Policy Search"** (Sommer, Bazan, Babaeian, Fellerer, Powell, German;
-FAU Erlangen-Nürnberg / Princeton).
+A multi-agent optimization engine for the power grid: a **digital twin**
+calibrated on real market data, an **optimizer** that dispatches the
+flexibility new loads already have, and an **agentic policy search** loop in
+which AI agents write, test, and iteratively improve control strategies as
+ordinary, auditable code.
 
-The paper proposes **Agentic Policy Search (APS)**: a three-level hierarchy in
-which an LLM writes executable battery-control policies for a residential
-energy system (Level 2), a meta-level LLM iteratively refines or replaces the
-task instructions based on simulation feedback (Level 3), and the policies are
-evaluated in a simulated 7-day residential energy system (Level 1).
+Electricity prices are climbing as data centers and EV adoption pile new
+demand onto the grid. Because wholesale markets clear at the marginal price,
+a single new demand peak can raise bills for everyone. The engine answers the
+question every city, utility, and operator is asking: **how much new load can
+the grid welcome before prices spike — and what do we do about it?**
+
+## Demo app
+
+```bash
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python numpy scipy matplotlib pandas scikit-learn pyarrow gridstatus streamlit anthropic
+.venv/bin/python -m streamlit run app.py
+```
+
+Seven tabs: the problem on real market data (including a zonal price map),
+two precomputed stories (a home battery in €, a 500 MW data center in $),
+how the agents talk to each other, two Live Labs that run the agentic search
+in real time, and a full-transparency tab (prompts, data, logs, verbatim
+transcripts).
 
 ## Layout
 
 ```
+engine/
+  data.py           day-ahead LMP + load + fuel mix via gridstatus (NYISO open
+                    feeds; PJM adapter slot pending an API key)
+  twin.py           merit-order digital twin: isotonic supply stack + hourly
+                    adjustment, out-of-sample calibration report
+  scenario.py       load injection -> counterfactual prices & bill impact
+  optimizer.py      flexibility dispatch: threshold rules (PFA) vs lookahead LP
+                    (DLA) over the convex stack cost, arbitrated by realized cost
+  aps_dispatch.py   environment + prompts for LLM-written dispatch policies
+  aps_episode.py    episode state machine for the data-center policy search
 aps/
-  simulation.py     Level 1: exogenous processes + battery simulation (Sec. 7.1, Table 1)
-  benchmark.py      Perfect-foresight LP optimum (Appendix D), finite-horizon & steady-state
-  prompts.py        Verbatim prompt templates (Sec. 7.2/7.3, Appendix C)
-  policy_runtime.py Post-processing Phi + sandboxed subprocess evaluation (Sec. 7.1.7)
-  episode.py        Algorithm 1 state machine: generation, 5-attempt repair loop,
+  simulation.py     simulated home: PV, battery, dynamic tariff (one week)
+  benchmark.py      perfect-foresight LP optimum (finite-horizon & steady-state)
+  prompts.py        prompt templates for the home-battery policy search
+  episode.py        episode state machine: generation, 5-attempt repair loop,
                     greedy refine/explore meta-policy with stagnation switching
+  policy_runtime.py post-processing + sandboxed subprocess evaluation
 experiments/
-  driver.py         Filesystem-based experiment driver (init / step / status)
-  analyze.py        Aggregation + replication of Figures 2, 3, 4, 5
-results/run1/       Experiment data: per-episode states, generated policies, figures
+  driver.py         filesystem-based search driver, home battery
+  driver2.py        filesystem-based search driver, data-center dispatch
+  worker.py         LLM worker loop (Anthropic API or claude CLI)
+  analyze.py        aggregation + summary figures
+  run_engine_demo.py end-to-end scenario demo + figures + explainer
+results/            recorded runs: per-round strategies, scores, event logs,
+                    verbatim transcripts
 ```
 
-## Reproduction
+## How the agentic search works
 
-```bash
-uv venv --python 3.11 .venv && uv pip install numpy scipy matplotlib
-.venv/bin/python experiments/driver.py init --run results/run1 --episodes 10 --iterations 10
-# Loop: serve each episode_*/pending_prompt.txt with an LLM, write response.txt, then
-.venv/bin/python experiments/driver.py step --run results/run1
-# When DONE: aggregate + figures
-.venv/bin/python experiments/analyze.py results/run1
-```
+Three specialists in a loop, communicating through files on disk (every
+message is archived, so every run is replayable):
 
-The driver is LLM-agnostic: any worker that reads `pending_prompt.txt` and
-writes `response.txt` can serve completions. In this replication each
-completion was served by a fresh, stateless **Claude Haiku 4.5** call (the
-paper used Gemini 2.5 Flash Preview via OpenRouter; both are the
-"cheap fast model" tier).
+1. A **coach** (meta-level LLM) sees only aggregate scores — never raw market
+   data — and issues one instruction per round: refine the current strategy,
+   or rethink it entirely (automatic switch on stagnation).
+2. A **strategy writer** (code-generating LLM) turns the instruction into a
+   complete policy class — plain Python, auditable line by line.
+3. A **grid twin / simulator** (not an AI) scores the policy against the data.
+   Crashes summon a **bug fixer** that repairs the code from the error message
+   (up to 5 attempts, then the round restarts).
 
-## Benchmark calibration (deterministic part)
+The loop always keeps the best strategy found. Classical optimizers (the
+lookahead LP) stay in the arbitration as both a competitor and a
+provable bound, and the scoreboard picks the winner.
 
-The paper's exogenous noise processes are not fully specified, so the free
-shape parameters (peak widths, PV irradiance factor, price noise) were
-calibrated against the paper's three reference values with seed 42:
+## Headline results (all reproducible from this repo)
 
-| Quantity            | Paper   | This repo |
-|---------------------|---------|-----------|
-| No-battery cost     | 10.70 € | 10.64 €   |
-| Finite-horizon opt. | −6.67 € | −6.32 €   |
-| Steady-state opt.   | −5.20 € | −5.55 €   |
-| Price volatility    | 10 %    | 10.1 %    |
-
-## Deviations from the paper
-
-- 10 episodes instead of 20 (compute budget); 10 iterations each, as in the paper.
-- LLM: Claude Haiku 4.5 (stateless subagent calls) instead of Gemini 2.5 Flash.
-- Iteration restarts capped at 2 (after 5 failed repairs each) before a NaN
-  iteration is recorded; the paper restarts unboundedly.
-- Exogenous noise processes reconstructed by calibration (see above).
-
-See `results/run1/figures/` and the replication report for findings.
-
-## Grid Optimization Engine (cost mode v1)
-
-`engine/` implements the cost-mode v1 of the Grid Optimization Engine on real
-ISO data (NYISO open feeds; PJM adapter stub pending an API key):
-
-```
-engine/data.py       day-ahead LMP + load + fuel mix via gridstatus (cached)
-engine/twin.py       merit-order twin: isotonic supply stack + hourly adjustment,
-                     out-of-sample calibration report (the credibility anchor)
-engine/scenario.py   load injection -> counterfactual prices & bill impact
-engine/optimizer.py  flexibility dispatch: PFA threshold rules vs DLA lookahead LP
-                     (convex stack cost), arbitrated by realized system cost
-experiments/run_engine_demo.py  end-to-end demo + figures + plain-English explainer
-```
-
-Demo result (NYISO, 2.1 held-out weeks, twin corr 0.88): a 500 MW inflexible
-data center raises the peak clearing price +196 $/MWh and consumer bills
-+76.3 M$; dispatching its own flexibility (50 % deferrable compute, storage)
-cuts the consumer impact 33 % and its energy bill 22 %; the engine's sizing
-answer (250 MW / 1 GWh storage) brings the peak impact down to +56 $/MWh.
-Outputs in `results/engine_demo/`.
+- **Digital twin**: out-of-sample correlation 0.88, MAE $20.7/MWh on 75 days
+  of NYISO day-ahead prices; held-out weeks used for every number shown.
+- **Scenario**: a rigid 500 MW data center raises the peak clearing price by
+  +$196/MWh (+$76M on consumer bills over 2 weeks); dispatching its own
+  flexibility cuts the consumer impact 33% and its bill 22%; the computed
+  storage-sizing answer (250 MW / 1 GWh) brings the peak impact to +$56/MWh.
+- **Home battery search**: 10/10 independent searches found a profitable
+  strategy within 3 rounds; best within 0.24 € of the perfect-foresight
+  optimum for the simulated week.
+- **Data-center dispatch search**: LLM-written policies closed 27% of the
+  naive-to-optimal gap vs 55% for hand-written rules — the honest finding
+  that motivates keeping the classical optimizer in the loop.

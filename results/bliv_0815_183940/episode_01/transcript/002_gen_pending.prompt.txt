@@ -1,0 +1,168 @@
+You are an expert Python developer.
+
+Develop an intelligent battery management policy to optimize energy costs while satisfying the demand_sequence.
+The policy must make strategic decisions about:
+1. When to charge the battery (buy & store energy)
+2. When to discharge the battery (sell & discharge energy)
+3. When to directly purchase from the market
+
+Key Constraints:
+1. Battery Capacity:
+   - 0 <= energy_stored <= max_energy_stored
+   - Battery charge must stay within physical limits
+   - power_discharge >= -5
+   - power_charge <= 10
+
+2. Energy Conservation:
+   - energy_discharged <= energy_stored
+   - Cannot discharge more energy than stored
+
+3. Demand Coverage:
+   - power_bought + power_discharged >= power_own_demand
+   - Must meet energy demand_sequence in each timestep
+
+Structure example:
+class Policy:
+  def __init__(self):
+    """Initializes the policy.
+    Parameters or internal states can be defined here
+    """
+    pass
+
+  def take_action(self,
+    # energy stored in the battery [kWh]
+    current_energy_stored_kwh: float,
+    # PV power generation [kW]
+    current_pv_generation_kw: float,
+    # household power demand [kW]
+    current_demand_kw: float,
+    # grid purchase price [euro/kWh]
+    current_grid_buy_price: float,
+    # grid feed-in tariff (sell price) [euro/kWh]
+    current_grid_sell_price: float,
+    # Maximum battery capacity [kWh]
+    battery_capacity_kwh: float,
+  ) -> float:
+    """Determines the target action for the battery based on the current state.
+
+    Returns:
+      float: The target power for the battery [kW]
+        positive: charging; negative: discharging;
+        zero: no action
+    """
+    # --- Implement your logic here ---
+    # Example: Always return 0 (no action)
+    action_kw = 0.0
+
+    # Return the calculated action
+    return action_kw
+
+Implementation instructions:
+# Analysis & Specific Improvement
+
+## Current Implementation Assessment
+
+**Strengths:**
+- Clear price-based logic with threshold mechanisms
+- Considers battery constraints (min/max thresholds)
+- Handles three distinct scenarios (excess PV, deficit, balanced)
+
+**Critical Limitation:**
+The policy uses **static price thresholds** (0.15/0.25 €/kWh) that don't adapt to market conditions. With **10.1% price volatility**, fixed thresholds are suboptimal—they may trigger unnecessary actions during high volatility or miss opportunities during stable periods.
+
+---
+
+## ONE Specific Improvement: Dynamic Price Thresholds
+
+### Implementation
+
+```python
+class Policy:
+  def __init__(self):
+    self.max_charge_power = 10
+    self.max_discharge_power = 5
+    self.battery_min_threshold = 0.2
+    self.battery_max_threshold = 0.9
+    
+    # NEW: Dynamic threshold tracking
+    self.price_history = []
+    self.history_window = 20  # Track last 20 price observations
+    self.min_price_observed = float('inf')
+    self.max_price_observed = float('-inf')
+
+  def take_action(self, ...):
+    # Update price history
+    self.price_history.append(current_grid_buy_price)
+    if len(self.price_history) > self.history_window:
+      self.price_history.pop(0)
+    
+    # Calculate dynamic thresholds based on observed range
+    if len(self.price_history) >= 5:
+      avg_price = sum(self.price_history) / len(self.price_history)
+      price_std = (sum((p - avg_price)**2 for p in self.price_history) / len(self.price_history))**0.5
+      
+      # Adaptive thresholds: mean ± 0.5*std
+      price_threshold_charge = max(0.10, avg_price - 0.5 * price_std)
+      price_threshold_discharge = min(0.40, avg_price + 0.5 * price_std)
+    else:
+      # Fallback for initial iterations
+      price_threshold_charge = 0.15
+      price_threshold_discharge = 0.25
+    
+    # Rest of logic remains identical, but uses dynamic thresholds
+    battery_level = current_energy_stored_kwh / battery_capacity_kwh
+    excess_pv = max(0, current_pv_generation_kw - current_demand_kw)
+    deficit = max(0, current_demand_kw - current_pv_generation_kw)
+    
+    energy_to_full = battery_capacity_kwh - current_energy_stored_kwh
+    max_charge_available = min(self.max_charge_power, energy_to_full)
+    max_discharge_available = min(self.max_discharge_power, current_energy_stored_kwh)
+    
+    action_kw = 0.0
+    
+    # Use price_threshold_charge and price_threshold_discharge throughout
+    if excess_pv > 0:
+      if battery_level < self.battery_max_threshold:
+        charge_amount = min(excess_pv, max_charge_available)
+        action_kw = charge_amount
+        return action_kw
+    
+    if deficit > 0:
+      if current_grid_buy_price > price_threshold_discharge and battery_level > self.battery_min_threshold:
+        discharge_amount = min(deficit, max_discharge_available)
+        action_kw = -discharge_amount
+        return action_kw
+    
+    if excess_pv == 0 and deficit == 0:
+      if current_grid_buy_price < price_threshold_charge and battery_level < self.battery_max_threshold:
+        charge_amount = min(self.max_charge_power, max_charge_available)
+        action_kw = charge_amount
+        return action_kw
+      elif current_grid_buy_price > price_threshold_discharge and battery_level > self.battery_min_threshold * 1.5:
+        discharge_amount = min(self.max_discharge_power * 0.5, max_discharge_available)
+        action_kw = -discharge_amount
+        return action_kw
+    
+    return action_kw
+```
+
+---
+
+## Expected Impact
+
+| Metric | Current | Expected |
+|--------|---------|----------|
+| **Total Cost** | -4.48 | **-5.2 to -5.8** |
+| **Battery Utilization** | 66.1% | **70-75%** |
+| **Volatility Adaptation** | Static (fails in high volatility) | **Dynamic, market-aware** |
+
+### Why This Works
+
+1. **Better charge timing**: When volatility spikes, thresholds compress—avoiding charging at peaks
+2. **Opportunistic discharge**: When prices dip, thresholds expand—allowing profitable discharge windows
+3. **Self-calibrating**: Adapts automatically as market conditions evolve without manual tuning
+4. **Minimal overhead**: Single pass calculation, O(1) complexity per step
+
+This directly addresses the 10.1% volatility issue by making the policy responsive to actual price distributions rather than assuming static conditions.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

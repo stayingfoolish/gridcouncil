@@ -1,0 +1,132 @@
+from collections import deque
+
+class DispatchPolicy:
+    def __init__(self):
+        self.price_history = deque(maxlen=168)
+        self.price_percentiles = {}
+        self.hour_count = 0
+        self.price_threshold_multiplier = 1.15
+        self.battery_target_soc_fraction = 0.5
+        self.urgency_threshold = 12.0
+        self.recent_prices = deque(maxlen=6)
+        self.price_trend = 0.0
+
+    def take_action(self,
+        hour_of_day: int,
+        current_price: float,
+        firm_load_mw: float,
+        arriving_flex_mw: float,
+        backlog_mwh: float,
+        oldest_backlog_age_h: float,
+        battery_soc_mwh: float,
+        battery_capacity_mwh: float,
+        battery_power_mw: float,
+    ) -> tuple:
+
+        self.price_history.append(current_price)
+        self.recent_prices.append(current_price)
+        self.hour_count += 1
+
+        if self.hour_count >= 24:
+            prices_sorted = sorted(self.price_history)
+            n = len(prices_sorted)
+            self.price_percentiles = {
+                'p25': prices_sorted[n // 4],
+                'p50': prices_sorted[n // 2],
+                'p75': prices_sorted[3 * n // 4],
+                'p90': prices_sorted[int(0.9 * n)],
+            }
+        else:
+            self.price_percentiles = {
+                'p25': current_price,
+                'p50': current_price,
+                'p75': current_price,
+                'p90': current_price,
+            }
+
+        if len(self.recent_prices) >= 3:
+            recent_avg = sum(list(self.recent_prices)[-3:]) / 3
+            if len(self.recent_prices) == 6:
+                older_avg = sum(list(self.recent_prices)[:3]) / 3
+            else:
+                older_avg = recent_avg
+            self.price_trend = (recent_avg - older_avg) / (older_avg + 1e-6)
+
+        target_battery_soc = battery_capacity_mwh * self.battery_target_soc_fraction
+        battery_deficit = target_battery_soc - battery_soc_mwh
+        battery_excess = battery_soc_mwh - target_battery_soc
+
+        if backlog_mwh > 0:
+            backlog_hours_remaining = max(0, 24 - oldest_backlog_age_h)
+        else:
+            backlog_hours_remaining = 24
+
+        is_backlog_urgent = backlog_mwh > 0 and oldest_backlog_age_h > self.urgency_threshold
+        is_backlog_approaching = backlog_mwh > 0 and backlog_hours_remaining < 18
+
+        typical_price = self.price_percentiles['p50']
+        expensive_threshold = typical_price * self.price_threshold_multiplier
+
+        is_cheap = current_price < self.price_percentiles['p25']
+        is_expensive = current_price > expensive_threshold
+        is_very_expensive = current_price > self.price_percentiles['p90']
+        is_price_rising = self.price_trend > 0.05
+
+        flex_serve_mw = 0.0
+        battery_mw = 0.0
+
+        if is_cheap:
+            if battery_deficit > 0:
+                charge_amount = min(battery_power_mw, battery_deficit / 0.5)
+                battery_mw = charge_amount
+            else:
+                flex_serve_mw = arriving_flex_mw
+
+        elif is_very_expensive:
+            flex_serve_mw = 0.0
+            if battery_soc_mwh > target_battery_soc * 0.2:
+                if battery_excess > 0:
+                    discharge_amount = min(battery_power_mw, battery_excess / 0.8)
+                else:
+                    discharge_amount = battery_power_mw * 0.7
+                battery_mw = -min(discharge_amount, battery_power_mw)
+
+        elif is_expensive:
+            flex_serve_mw = 0.0
+            if is_price_rising and battery_soc_mwh > target_battery_soc * 0.35:
+                if battery_excess > 0:
+                    discharge_amount = min(battery_power_mw * 0.6, battery_excess / 0.9)
+                else:
+                    discharge_amount = battery_power_mw * 0.4
+                battery_mw = -discharge_amount
+            elif battery_soc_mwh > target_battery_soc * 0.4 and battery_excess > 0:
+                discharge_amount = min(battery_power_mw, battery_excess / 1.0)
+                battery_mw = -discharge_amount
+
+        else:
+            typical_load_contribution = min(arriving_flex_mw, 200.0)
+            flex_serve_mw = typical_load_contribution
+
+            if battery_deficit > 0 and not is_price_rising:
+                charge_amount = min(battery_power_mw * 0.6, battery_deficit / 2.0)
+                battery_mw = charge_amount
+
+        if is_backlog_urgent and backlog_hours_remaining < 6:
+            max_serve = arriving_flex_mw + min(battery_power_mw, backlog_mwh)
+            flex_serve_mw = max(flex_serve_mw, backlog_mwh / max(backlog_hours_remaining, 1))
+            flex_serve_mw = min(flex_serve_mw, max_serve)
+            battery_mw = 0.0
+
+        elif is_backlog_approaching:
+            urgency_factor = 1.0 - (backlog_hours_remaining / 18.0)
+            additional_flex = arriving_flex_mw * urgency_factor * 0.7
+            flex_serve_mw = max(flex_serve_mw, additional_flex)
+
+        battery_mw = max(-battery_power_mw, min(battery_mw, battery_power_mw))
+        max_discharge = min(battery_power_mw, battery_soc_mwh / 1.0)
+        battery_mw = max(-max_discharge, battery_mw)
+        max_charge = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+        battery_mw = min(max_charge, battery_mw)
+        flex_serve_mw = max(0.0, flex_serve_mw)
+
+        return flex_serve_mw, battery_mw

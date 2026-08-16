@@ -1,0 +1,128 @@
+```python
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy with price history tracking and adaptive thresholds."""
+    self.price_history = []
+    self.price_percentile_75 = 50.0
+    self.price_percentile_90 = 70.0
+    self.hour_count = 0
+
+  def take_action(self,
+    hour_of_day: int,
+    current_price: float,
+    firm_load_mw: float,
+    arriving_flex_mw: float,
+    backlog_mwh: float,
+    oldest_backlog_age_h: float,
+    battery_soc_mwh: float,
+    battery_capacity_mwh: float,
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch using price-responsive scheduling."""
+    
+    self.price_history.append(current_price)
+    self.hour_count += 1
+    
+    if len(self.price_history) > 168:
+      self.price_history.pop(0)
+    
+    if len(self.price_history) >= 24:
+      sorted_prices = sorted(self.price_history)
+      idx_75 = int(len(sorted_prices) * 0.75)
+      idx_90 = int(len(sorted_prices) * 0.90)
+      self.price_percentile_75 = sorted_prices[idx_75]
+      self.price_percentile_90 = sorted_prices[idx_90]
+    
+    battery_soc_ratio = battery_soc_mwh / battery_capacity_mwh if battery_capacity_mwh > 0 else 0.0
+    
+    flex_serve_mw = 0.0
+    battery_mw = 0.0
+    
+    total_load = firm_load_mw + arriving_flex_mw
+    
+    urgency_factor = min(1.0, oldest_backlog_age_h / 18.0) if oldest_backlog_age_h > 0 else 0.0
+    urgent_serve = backlog_mwh * urgency_factor / 1.0 if oldest_backlog_age_h > 0 else 0.0
+    
+    if oldest_backlog_age_h >= 22.0:
+      flex_serve_mw = arriving_flex_mw + min(backlog_mwh, battery_soc_mwh / 1.0)
+      discharge_for_deadline = min(battery_power_mw, battery_soc_mwh / 1.0)
+      battery_mw = -discharge_for_deadline
+      return (flex_serve_mw, battery_mw)
+    
+    if backlog_mwh > 300.0 and battery_soc_ratio < 0.50:
+      flex_serve_mw = arriving_flex_mw
+      charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+      max_charge = max(0, 350.0 - total_load)
+      charge_amount = min(charge_capacity, max_charge)
+      battery_mw = charge_amount
+      return (flex_serve_mw, battery_mw)
+    
+    opportunistic_discharge_triggered = False
+    
+    price_ratio = current_price / self.price_percentile_75 if self.price_percentile_75 > 0 else 1.0
+    
+    if (price_ratio > 1.15 and
+        battery_soc_ratio > 0.35 and
+        oldest_backlog_age_h < 18.0):
+      
+      flex_scale = min(1.0, 0.5 + (price_ratio - 1.15) * 2.5)
+      flex_serve_mw = arriving_flex_mw * flex_scale
+      
+      discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+      required_discharge = max(0, flex_serve_mw - arriving_flex_mw)
+      opportunistic_discharge = min(discharge_capacity, max(required_discharge, 20.0))
+      battery_mw = -opportunistic_discharge
+      opportunistic_discharge_triggered = True
+    
+    if not opportunistic_discharge_triggered:
+      if current_price < self.price_percentile_75 * 0.75 and battery_soc_ratio < 0.90:
+        flex_serve_mw = arriving_flex_mw * 0.6
+        charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+        max_charge = max(0, 350.0 - total_load)
+        charge_amount = min(charge_capacity, max_charge, 80.0)
+        battery_mw = charge_amount
+      elif current_price < self.price_percentile_75 * 0.85 and battery_soc_ratio < 0.70:
+        flex_serve_mw = arriving_flex_mw * 0.7
+        charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+        max_charge = max(0, 350.0 - total_load)
+        charge_amount = min(charge_capacity, max_charge, 60.0)
+        battery_mw = charge_amount
+      elif current_price > self.price_percentile_90 * 0.95 and battery_soc_ratio > 0.25:
+        flex_serve_mw = arriving_flex_mw * 0.5
+        discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+        battery_mw = -min(discharge_capacity, 40.0)
+      else:
+        flex_serve_mw = arriving_flex_mw * 0.5
+        if backlog_mwh > 0 and battery_soc_ratio > 0.40:
+          backlog_serve = min(backlog_mwh, battery_soc_mwh / 1.0 * 0.5)
+          flex_serve_mw = arriving_flex_mw + backlog_serve / 1.0
+          discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+          battery_mw = -min(discharge_capacity, 30.0)
+        elif battery_soc_ratio < 0.50 and current_price < self.price_percentile_75:
+          charge_capacity = min(battery_power_mw, (battery_capacity_mwh - battery_soc_mwh) / 0.88)
+          max_charge = max(0, 350.0 - total_load)
+          charge_amount = min(charge_capacity, max_charge, 50.0)
+          battery_mw = charge_amount
+    
+    if urgent_serve > 0:
+      flex_serve_mw = min(flex_serve_mw + urgent_serve, arriving_flex_mw + backlog_mwh)
+      if flex_serve_mw > arriving_flex_mw:
+        backlog_draw = flex_serve_mw - arriving_flex_mw
+        discharge_needed = backlog_draw
+        discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+        battery_mw = -min(discharge_capacity, discharge_needed + 10.0)
+    
+    flex_serve_mw = max(0.0, flex_serve_mw)
+    flex_serve_mw = min(flex_serve_mw, arriving_flex_mw + backlog_mwh)
+    
+    battery_mw = max(-battery_power_mw, min(battery_power_mw, battery_mw))
+    
+    if battery_mw > 0:
+      max_charge_energy = (battery_capacity_mwh - battery_soc_mwh) / 0.88
+      battery_mw = min(battery_mw, max_charge_energy / 1.0)
+    elif battery_mw < 0:
+      max_discharge_energy = battery_soc_mwh
+      battery_mw = max(battery_mw, -max_discharge_energy / 1.0)
+    
+    return (flex_serve_mw, battery_mw)
+```

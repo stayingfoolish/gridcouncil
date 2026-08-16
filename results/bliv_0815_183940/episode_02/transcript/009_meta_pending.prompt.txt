@@ -1,0 +1,144 @@
+You are an expert developing an intelligent battery management system.
+Current Total Cost: -4.57
+Best Cost Achieved: -4.57
+Iteration: 5
+Battery Utilization: 67.3%
+Average State of Charge: 54.7
+Price Volatility: 10.1
+Performance History (last 5 costs): [3.25, 10.64, 10.32, -1.32, -4.57]
+
+Current Implementation:
+```python
+import numpy as np
+
+class Policy:
+    def __init__(self):
+        """Initializes the policy with parameters for intelligent battery management."""
+        self.volatility_sigmoid_center = 0.12
+        self.volatility_sigmoid_steepness = 25
+        self.price_history = []
+        self.max_price_history = 100
+        self.min_soc_target = 0.20
+        self.max_soc_target = 0.85
+        
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> float:
+        """Determines the target action for the battery based on current state."""
+        
+        self.price_history.append((current_grid_buy_price, current_grid_sell_price))
+        if len(self.price_history) > self.max_price_history:
+            self.price_history.pop(0)
+        
+        current_soc = current_energy_stored_kwh / battery_capacity_kwh
+        net_generation = current_pv_generation_kw - current_demand_kw
+        price_spread = current_grid_buy_price - current_grid_sell_price
+        volatility = self._calculate_price_volatility()
+        
+        max_charge_power = 10.0
+        max_discharge_power = 5.0
+        
+        if net_generation > 0:
+            excess_generation = net_generation
+            available_charge_capacity = battery_capacity_kwh - current_energy_stored_kwh
+            
+            if available_charge_capacity > 0.1:
+                charge_power = min(excess_generation, max_charge_power)
+                charge_power = min(charge_power, available_charge_capacity / 0.25)
+                return charge_power
+            else:
+                return 0.0
+        
+        deficit = current_demand_kw - current_pv_generation_kw
+        if deficit > 0:
+            if current_soc > self.min_soc_target:
+                adjusted_discharge_power = self._calculate_volatility_adjusted_power(
+                    volatility, max_discharge_power
+                )
+                discharge_power = min(deficit, adjusted_discharge_power)
+                available_discharge = current_energy_stored_kwh / 0.25
+                discharge_power = min(discharge_power, available_discharge)
+                return -discharge_power
+            else:
+                return 0.0
+        
+        if abs(net_generation) < 0.2:
+            if price_spread > 0.01 and current_soc > self.min_soc_target:
+                adjusted_discharge_power = self._calculate_volatility_adjusted_power(
+                    volatility, max_discharge_power
+                )
+                available_discharge = current_energy_stored_kwh / 0.25
+                discharge_power = min(adjusted_discharge_power * 0.5, available_discharge)
+                return -discharge_power
+            elif price_spread < -0.01 and current_soc < self.max_soc_target:
+                available_charge_capacity = battery_capacity_kwh - current_energy_stored_kwh
+                if available_charge_capacity > 0.1:
+                    charge_power = min(max_charge_power * 0.3, available_charge_capacity / 0.25)
+                    return charge_power
+        
+        return 0.0
+    
+    def _calculate_price_volatility(self) -> float:
+        """Calculates price volatility as a percentage."""
+        if len(self.price_history) < 5:
+            return 5.0
+        
+        recent_prices = []
+        for buy_price, sell_price in self.price_history[-20:]:
+            recent_prices.append(buy_price)
+            recent_prices.append(sell_price)
+        
+        if len(recent_prices) < 2:
+            return 5.0
+        
+        mean_price = np.mean(recent_prices)
+        if mean_price < 0.01:
+            return 5.0
+        
+        std_price = np.std(recent_prices)
+        volatility_pct = (std_price / mean_price) * 100
+        
+        return volatility_pct
+    
+    def _calculate_volatility_adjusted_power(self, volatility: float, base_power: float) -> float:
+        """
+        Sigmoid-based confidence adjustment for power deployment.
+        Distinguishes between safe and risky volatility regimes.
+        
+        Low volatility (<8%): Deploy ~95% of power (high confidence)
+        Medium volatility (8-12%): Deploy ~85% of power (moderate confidence)
+        High volatility (>15%): Deploy ~70% of power (low confidence)
+        """
+        volatility_decimal = volatility / 100.0
+        
+        sigmoid_input = -self.volatility_sigmoid_steepness * (
+            volatility_decimal - self.volatility_sigmoid_center
+        )
+        
+        try:
+            confidence = 1.0 / (1.0 + np.exp(sigmoid_input))
+        except OverflowError:
+            confidence = 0.0 if sigmoid_input > 0 else 1.0
+        
+        adjustment = 0.68 + confidence * 0.28
+        
+        adjusted_power = base_power * adjustment
+        
+        return adjusted_power
+
+```
+
+Suggest ONE specific improvement to the existing approach
+
+Your task:
+1. Analyze the current implementation's strengths and limitations
+2. The current approach shows potential. Focus on targeted improvements while maintaining core strategy.
+3. Provide specific parameter values and implementation details
+4. Explain expected impact on cost and system behavior
+
+Focus on CONCRETE improvements that can be implemented immediately.

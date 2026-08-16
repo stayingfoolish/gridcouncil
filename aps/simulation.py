@@ -1,4 +1,4 @@
-"""Level 1: residential energy system simulation (paper Section 7.1, Table 1).
+"""Level 1: residential energy system simulation.
 
 State  S_t = (R_t, P_t^pv, L_t, p_t^buy, p_t^sell)
 Action x_t in [-D_max, C_max]  (positive = charge, negative = discharge, kW)
@@ -15,7 +15,7 @@ import numpy as np
 
 @dataclass
 class SystemParams:
-    """Technical and economic parameters (paper Table 1)."""
+    """Technical and economic parameters of the simulated home."""
 
     battery_capacity_kwh: float = 10.0
     round_trip_efficiency: float = 0.90
@@ -60,7 +60,7 @@ class SystemParams:
 
 @dataclass
 class ExogenousSeries:
-    """Fixed-seed realization of W_t (paper Section 7.1.3)."""
+    """Fixed-seed realization of the exogenous processes."""
 
     pv_kw: np.ndarray
     load_kw: np.ndarray
@@ -134,7 +134,7 @@ class SimulationResult:
 
 def clip_action(x: float, soc: float, params: SystemParams) -> float:
     """Enforce admissible power limits and SoC bounds (simulation clips
-    infeasible policy outputs, paper Section 7.1.2)."""
+    infeasible policy outputs)."""
     x = float(np.clip(x, -params.max_discharge_kw, params.max_charge_kw))
     eta = params.eta_leg
     if x > 0:  # cannot charge above capacity

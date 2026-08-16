@@ -1,4 +1,4 @@
-"""Filesystem-based experiment driver for the APS replication.
+"""Filesystem-based experiment driver for the home-battery policy search.
 
 Usage:
   python experiments/driver.py init  --run results/run1 --episodes 10 --iterations 10

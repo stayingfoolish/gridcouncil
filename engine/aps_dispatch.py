@@ -1,12 +1,11 @@
 """APS-over-engine: LLM-generated dispatch policies for data-center
-flexibility, searched with the replication's meta-policy machinery and
+flexibility, searched with the agentic policy-search machinery and
 benchmarked against the DLA LP bound (optimal for the convex stack).
 
 The generated policy controls, hour by hour, how much deferrable compute to
 serve and how to move the battery, given the current price and local state.
 The environment enforces physical limits and the 24 h compute deadline by
-clipping/forcing, exactly as the APS paper's simulation clips infeasible
-actions.
+clipping/forcing.
 """
 
 import json

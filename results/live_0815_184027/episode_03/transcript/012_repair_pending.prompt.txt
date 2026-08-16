@@ -1,0 +1,334 @@
+You are an expert Python developer debugging a power-market dispatch policy.
+
+A DispatchPolicy implementation has failed in the simulation environment with the following:
+Error Message:
+Traceback (most recent call last):
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/results/live_0815_184027/episode_03/work/_eval.py", line 15, in <module>
+    out = simulate_dispatch(cls(), env)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/prajwalsreenivas/Documents/GitHub/gridcouncil/engine/aps_dispatch.py", line 194, in simulate_dispatch
+    raw = policy.take_action(
+          ^^^^^^^^^^^^^^^^^^^
+  File "policy.py", line 248, in take_action
+  File "policy.py", line 190, in optimize_dispatch_schedule
+  File "policy.py", line 142, in constraint_backlog_deadlines
+TypeError: slice indices must be integers or None or have an __index__ method
+
+
+Failed Code:
+```python
+import numpy as np
+from collections import deque
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+class DispatchPolicy:
+    def __init__(self):
+        self.price_history = deque(maxlen=168)
+        self.cost_history = deque(maxlen=5)
+        self.forecast_window = 24
+        self.optimization_horizon = 24
+        self.price_spike_threshold = 1.5
+        
+    def build_price_forecast_robust(self, current_price):
+        if len(self.price_history) < 24:
+            return [current_price] * self.forecast_window
+        
+        hist = np.array(list(self.price_history))
+        
+        daily_pattern = np.zeros(24)
+        for h in range(24):
+            hour_prices = hist[h::24]
+            daily_pattern[h] = np.median(hour_prices) if len(hour_prices) > 0 else current_price
+        
+        rolling_median = np.median(hist[-48:]) if len(hist) >= 48 else np.median(hist)
+        spike_mask = hist > rolling_median * self.price_spike_threshold
+        spike_fraction = np.mean(spike_mask[-24:]) if len(hist) >= 24 else 0.0
+        
+        detrended = hist - daily_pattern[np.arange(len(hist)) % 24]
+        if len(detrended) >= 2:
+            residuals = detrended[:-1]
+            next_residuals = detrended[1:]
+            if np.std(residuals) > 0.1:
+                ar_coeff = np.corrcoef(residuals, next_residuals)[0, 1]
+                ar_coeff = np.clip(ar_coeff, -0.8, 0.8)
+            else:
+                ar_coeff = 0.3
+        else:
+            ar_coeff = 0.3
+        
+        forecast = []
+        last_residual = detrended[-1] if len(detrended) > 0 else 0.0
+        
+        for i in range(self.forecast_window):
+            base = daily_pattern[i % 24]
+            projected_residual = last_residual * (ar_coeff ** (i + 1))
+            if spike_fraction > 0.15 and i > 2 and i < 20:
+                spike_premium = rolling_median * 0.2 * spike_fraction
+            else:
+                spike_premium = 0.0
+            
+            forecast_price = base + projected_residual + spike_premium
+            forecast.append(max(10.0, forecast_price))
+            last_residual = projected_residual
+        
+        return forecast
+    
+    def identify_backlog_cohorts(self, backlog_mwh, oldest_backlog_age_h):
+        if backlog_mwh < 1.0:
+            return []
+        
+        cohorts = []
+        cohort_size = backlog_mwh / 5
+        for cohort_idx in range(5):
+            arrival_age = oldest_backlog_age_h - cohort_idx * 4
+            deadline_hours_left = max(1, 24 - arrival_age)
+            cohorts.append({
+                'mwh': cohort_size,
+                'age_h': arrival_age,
+                'deadline_hours': deadline_hours_left,
+                'idx': cohort_idx
+            })
+        
+        return [c for c in cohorts if c['deadline_hours'] > 0]
+    
+    def optimize_dispatch_schedule(self,
+                                    forecast,
+                                    arriving_flex_mw,
+                                    backlog_cohorts,
+                                    firm_load_profile,
+                                    battery_soc_mwh,
+                                    battery_capacity_mwh,
+                                    battery_power_mw):
+        
+        H = self.optimization_horizon
+        n_cohorts = len(backlog_cohorts)
+        
+        n_flex = H
+        n_backlog = n_cohorts * H if n_cohorts > 0 else H
+        n_discharge = H
+        n_charge = H
+        n_soc = H + 1
+        
+        total_vars = n_flex + n_backlog + n_discharge + n_charge + n_soc
+        
+        def objective(x):
+            flex_serve = x[:n_flex]
+            batt_discharge = x[n_flex + n_backlog:n_flex + n_backlog + n_discharge]
+            batt_charge = x[n_flex + n_backlog + n_discharge:n_flex + n_backlog + n_discharge + n_charge]
+            
+            cost = 0.0
+            for t in range(H):
+                total_demand = firm_load_profile[t] + flex_serve[t] - batt_discharge[t] + batt_charge[t]
+                cost += forecast[t] * max(0, total_demand)
+            
+            if n_cohorts > 0:
+                backlog_serve = x[n_flex:n_flex + n_backlog].reshape(n_cohorts, H)
+                for c, cohort in enumerate(backlog_cohorts):
+                    deadline_idx = min(cohort['deadline_hours'], H - 1)
+                    total_served = np.sum(backlog_serve[c, :deadline_idx+1])
+                    shortfall = max(0, cohort['mwh'] - total_served)
+                    cost += shortfall * 1000.0
+            
+            return cost
+        
+        def constraint_battery_soc(x):
+            batt_soc = x[n_flex + n_backlog + n_discharge + n_charge:]
+            batt_discharge = x[n_flex + n_backlog:n_flex + n_backlog + n_discharge]
+            batt_charge = x[n_flex + n_backlog + n_discharge:n_flex + n_backlog + n_discharge + n_charge]
+            
+            constraints = []
+            soc = battery_soc_mwh
+            constraints.append(soc - batt_soc[0])
+            
+            for t in range(H):
+                soc_next = soc + batt_charge[t] * 0.88 - batt_discharge[t] / 0.88
+                constraints.append(soc_next - batt_soc[t + 1])
+                soc = soc_next
+            
+            return np.array(constraints)
+        
+        def constraint_backlog_deadlines(x):
+            if n_cohorts == 0:
+                return np.array([])
+            
+            backlog_serve = x[n_flex:n_flex + n_backlog].reshape(n_cohorts, H)
+            constraints = []
+            
+            for c, cohort in enumerate(backlog_cohorts):
+                deadline_idx = min(cohort['deadline_hours'], H - 1)
+                served = np.sum(backlog_serve[c, :deadline_idx+1])
+                constraints.append(served - cohort['mwh'])
+            
+            return np.array(constraints)
+        
+        def constraint_battery_power(x):
+            batt_discharge = x[n_flex + n_backlog:n_flex + n_backlog + n_discharge]
+            batt_charge = x[n_flex + n_backlog + n_discharge:n_flex + n_backlog + n_discharge + n_charge]
+            
+            constraints = []
+            for t in range(H):
+                constraints.append(battery_power_mw - batt_discharge[t])
+                constraints.append(battery_power_mw - batt_charge[t])
+                if t > 0:
+                    prev_net = batt_charge[t-1] - batt_discharge[t-1]
+                    curr_net = batt_charge[t] - batt_discharge[t]
+                    constraints.append(50.0 - abs(curr_net - prev_net))
+            
+            return np.array(constraints)
+        
+        lb_flex = np.zeros(n_flex)
+        ub_flex = np.full(n_flex, arriving_flex_mw)
+        
+        if n_cohorts > 0:
+            max_backlog_chunk = max([c['mwh'] for c in backlog_cohorts]) if n_cohorts > 0 else 100.0
+        else:
+            max_backlog_chunk = 100.0
+        
+        lb_backlog = np.zeros(n_backlog)
+        ub_backlog = np.full(n_backlog, max_backlog_chunk)
+        
+        bounds = (
+            np.concatenate([lb_flex, lb_backlog, np.zeros(n_discharge), np.zeros(n_charge), np.zeros(n_soc)]),
+            np.concatenate([ub_flex, ub_backlog, np.full(n_discharge, battery_power_mw), 
+                           np.full(n_charge, battery_power_mw), np.full(n_soc, battery_capacity_mwh)])
+        )
+        
+        x0 = np.zeros(total_vars)
+        x0[:n_flex] = arriving_flex_mw * 0.5
+        x0[n_flex + n_backlog + n_discharge:n_flex + n_backlog + n_discharge + n_charge] = 30.0
+        x0[n_flex + n_backlog + n_discharge + n_charge:] = np.linspace(battery_soc_mwh, 
+                                                                        max(battery_soc_mwh * 0.8, 50.0), n_soc)
+        
+        constraints_list = []
+        
+        if any(x > 0 for x in constraint_battery_soc(x0)):
+            constraints_list.append({'type': 'eq', 'fun': constraint_battery_soc})
+        
+        deadlines = constraint_backlog_deadlines(x0)
+        if len(deadlines) > 0:
+            constraints_list.append({'type': 'ineq', 'fun': constraint_backlog_deadlines})
+        
+        constraints_list.append({'type': 'ineq', 'fun': constraint_battery_power})
+        
+        try:
+            from scipy.optimize import Bounds
+            bounds_obj = Bounds(bounds[0], bounds[1])
+            result = minimize(
+                objective,
+                x0,
+                method='SLSQP',
+                bounds=bounds_obj,
+                constraints=constraints_list,
+                options={'ftol': 1e-3, 'maxiter': 100}
+            )
+            optimal_x = result.x
+        except Exception:
+            optimal_x = x0
+        
+        flex_serve_now = np.clip(optimal_x[0], 0, arriving_flex_mw)
+        batt_discharge_now = np.clip(optimal_x[n_flex + n_backlog], 0, battery_power_mw)
+        batt_charge_now = np.clip(optimal_x[n_flex + n_backlog + n_discharge], 0, battery_power_mw)
+        
+        battery_mw = batt_charge_now - batt_discharge_now
+        
+        return float(flex_serve_now), float(battery_mw)
+    
+    def take_action(self,
+                    hour_of_day,
+                    current_price,
+                    firm_load_mw,
+                    arriving_flex_mw,
+                    backlog_mwh,
+                    oldest_backlog_age_h,
+                    battery_soc_mwh,
+                    battery_capacity_mwh,
+                    battery_power_mw):
+        
+        self.price_history.append(current_price)
+        
+        forecast = self.build_price_forecast_robust(current_price)
+        
+        firm_load_profile = np.array([
+            firm_load_mw * (0.7 + 0.3 * np.sin(2 * np.pi * (h - 14) / 24))
+            for h in range(self.optimization_horizon)
+        ])
+        firm_load_profile = np.clip(firm_load_profile, firm_load_mw * 0.5, firm_load_mw * 1.5)
+        
+        backlog_cohorts = self.identify_backlog_cohorts(backlog_mwh, oldest_backlog_age_h)
+        
+        if oldest_backlog_age_h >= 23:
+            flex_serve_now = backlog_mwh / 1.0 + arriving_flex_mw
+            battery_mw = 0.0
+            return flex_serve_now, battery_mw
+        
+        if len(self.price_history) >= 12:
+            flex_serve_now, battery_mw = self.optimize_dispatch_schedule(
+                forecast,
+                arriving_flex_mw,
+                backlog_cohorts,
+                firm_load_profile,
+                battery_soc_mwh,
+                battery_capacity_mwh,
+                battery_power_mw
+            )
+        else:
+            flex_serve_now = arriving_flex_mw * 0.5
+            battery_mw = 0.0
+        
+        flex_serve_now = np.clip(flex_serve_now, 0, arriving_flex_mw + backlog_mwh)
+        battery_mw = np.clip(battery_mw, -battery_power_mw, battery_power_mw)
+        
+        if battery_soc_mwh <= 10.0:
+            battery_mw = max(battery_mw, 0)
+        
+        if battery_soc_mwh >= battery_capacity_mwh - 10.0:
+            battery_mw = min(battery_mw, 0)
+        
+        return float(flex_serve_now), float(battery_mw)
+
+```
+
+Task:
+Fix the implementation errors while maintaining the original strategy where appropriate.
+
+Expected output structure:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Return only the corrected DispatchPolicy class implementation without markdown formatting or extra comments outside the class.

@@ -2,15 +2,15 @@
   "benchmarks": {
     "no_battery": {
       "ours": 10.64,
-      "paper": 10.7
+      "reference": 10.7
     },
     "finite_horizon_opt": {
       "ours": -6.32,
-      "paper": -6.67
+      "reference": -6.67
     },
     "steady_state_opt": {
       "ours": -5.55,
-      "paper": -5.2
+      "reference": -5.2
     },
     "price_volatility_pct": 10.1
   },

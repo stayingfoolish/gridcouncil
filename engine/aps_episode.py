@@ -1,6 +1,6 @@
 """Episode state machine for APS-over-engine (adapted from aps/episode.py).
 
-Same phases and filesystem protocol as the paper replication, so the same
+Same phases and filesystem protocol as the home-battery search, so the same
 LLM-worker wave pattern drives it: pending_prompt.txt -> response.txt ->
 driver step. The objective is the added system dispatch cost in $ (lower is
 better; the DLA LP bound is included in the meta prompt as calibration)."""

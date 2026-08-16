@@ -1,0 +1,164 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Analysis & Targeted Improvement
+
+## Current Implementation Assessment
+
+**Strengths:**
+- Price percentile-based decision framework is sound
+- Urgency factor correctly captures deadline pressure
+- Battery charge/discharge logic separates expensive vs. cheap periods
+- Load shedding constraint (750 MW) prevents grid violations
+
+**Critical Limitation:**
+The gap to theoretical optimum ($14.5M vs. $12.0M, **$2.5M shortfall = 17.1%**) suggests the policy **fails to anticipate price movements**. It reacts to percentiles in a 24-hour window but doesn't model forward-looking price expectations.
+
+**Secondary Issue:**
+Battery utilization at 49.7% is wastable. The policy charges opportunistically but doesn't strategically pre-position inventory ahead of predicted expensive periods.
+
+---
+
+## Recommended Single Improvement: Dynamic Price Threshold Adjustment
+
+### Problem
+The fixed percentile thresholds (25th/75th) treat all hours equally. A 2 AM cheap period and a peak-hour cheap period receive identical treatment, but their *value* is vastly different.
+
+### Solution: Hourly Price Volatility Weighting
+
+Replace static percentile thresholds with **hour-of-day adjusted thresholds** that recognize predictable intra-day price patterns:
+
+```python
+def take_action(self, ...):
+    self.price_history.append(current_price)
+    if len(self.price_history) > 168:  # Expand to 7-day window
+        self.price_history.pop(0)
+    self.hour_counter += 1
+    
+    # NEW: Compute hour-of-day specific statistics
+    current_hour_prices = [
+        self.price_history[i] 
+        for i in range(len(self.price_history))
+        if (self.hour_counter - len(self.price_history) + i) % 24 == hour_of_day
+    ]
+    
+    if len(current_hour_prices) >= 3:
+        price_median_this_hour = sorted(current_hour_prices)[len(current_hour_prices) // 2]
+        price_std_this_hour = (max(current_hour_prices) - min(current_hour_prices)) / 2.0
+    else:
+        # Fallback to global
+        price_median_this_hour = sorted(self.price_history)[len(self.price_history) // 2]
+        price_std_this_hour = (max(self.price_history) - min(self.price_history)) / 4.0
+    
+    # Thresholds now adapt to hour-of-day volatility
+    cheap_threshold = price_median_this_hour - 1.2 * price_std_this_hour
+    expensive_threshold = price_median_this_hour + 1.2 * price_std_this_hour
+    
+    is_cheap = current_price < cheap_threshold
+    is_expensive = current_price > expensive_threshold
+    
+    # ... rest of logic unchanged
+```
+
+### Implementation Details
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| History window | 168 hours (7 days) | Captures weekly patterns; reduces initialization bias |
+| Volatility multiplier | 1.2× std dev | Tighter than ±25th/75th percentiles; captures extremes more precisely |
+| Minimum hour samples | 3 | Prevents pathological cases in early iterations |
+
+### Expected Impact
+
+1. **Cost Reduction: ~$280K–$420K** (1.9–2.9% improvement)
+   - Avoids charging during "cheap by hour's standard" periods that occur near peak hours
+   - Defer more compute to true overnight lows (2–6 AM) with higher dispatch efficiency
+   - Reduces energy arbitrage losses from mistimed cycle charges
+
+2. **Battery Utilization: 49.7% → 62–68%**
+   - Pre-charges more aggressively before predictable afternoon peaks
+   - Discharges more strategically during peak-hour extremes
+   - Higher turnover with tighter thresholds
+
+3. **Peak Price Impact: 209.8 $/MWh → 190–200 $/MWh**
+   - Reduces accidental peak-hour charging
+   - Smoother load profile during expensive windows
+
+4. **Backlog Risk: Unchanged**
+   - Urgency factor logic remains intact
+   - Deadline violations unlikely to increase
+
+### Why This Works
+
+- **Captures time-of-use structure** (most DA markets show strong 24h seasonality)
+- **Minimal code complexity** (10 new lines, no algorithm change)
+- **Backwards compatible** (fallback to global stats if insufficient history)
+- **Addresses the 17% gap** by exploiting hourly predictability the current policy ignores
+
+---
+
+## Implementation Priority
+
+**Do this first.** It's the highest-ROI single change that requires no retraining and directly targets the theoretical optimum gap.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

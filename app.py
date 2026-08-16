@@ -4,7 +4,7 @@
 
 Information architecture (story-first, live separated):
   1. The problem            — shared opening: the marginal-price auction, real data
-  2. Story: Home battery    — precomputed narrative (paper replication, EUR)
+  2. Story: Home battery    — precomputed narrative (simulated week, EUR)
   3. Story: Data center     — precomputed narrative + interactive scenario (real NYISO, USD)
   4. How the agents talk    — the coach / strategy-writer / twin message loop
   5. Live Lab: Home         — kick off APS on the home battery, watch it deliberate
@@ -438,8 +438,7 @@ with t_home:
 electricity tariff (~0.35 €/kWh to buy, a fixed 0.08 € to sell back). Every hour someone —
 or something — must decide: *charge the battery, discharge it, or trade with the grid?*
 Get it wrong and solar power is sold cheap at noon and expensive power is bought at dinner.
-This is a faithful replication of a published academic benchmark (Sommer et al.,
-FAU Erlangen-Nürnberg / Princeton), simulated over one week.""")
+The system is simulated over one week with fully disclosed assumptions.""")
 
     b1, b2, b3 = st.columns(3)
     b1.metric("Doing nothing (no battery)", "10.64 €", help="Cost of the week without any battery")
@@ -682,7 +681,7 @@ with t_hood:
             st.code(_P.META_PROMPT, language="text")
             st.markdown("**Required code structure** (the contract every strategy must fit)")
             st.code(_P.POLICY_SIGNATURE, language="python")
-        with st.expander("Home-battery replication prompts (aps/prompts.py)"):
+        with st.expander("Home-battery prompts (aps/prompts.py)"):
             from aps import prompts as _BP
             st.code(_BP.GENERATION_PROMPT, language="text")
             st.code(_BP.META_PROMPT, language="text")
@@ -711,7 +710,7 @@ with t_hood:
                      "battery round-trip efficiency": "88%",
                      "battery sizing": "slider MW × 4 h of storage"})
         for run_name, label in [("results/engine_aps", "APS-over-engine run"),
-                                ("results/run1", "Battery replication run")]:
+                                ("results/run1", "Home-battery search run")]:
             p = ROOT / run_name
             if p.exists():
                 with st.expander(f"{label}: initial configuration & benchmarks"):

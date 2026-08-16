@@ -1,7 +1,5 @@
-"""Prompt templates for the generation level (7.2) and meta level (7.3).
-
-Templates follow the paper (Section 7.2.2 and 7.3.2 listings) verbatim, with
-the placeholder variables filled per iteration.
+"""Prompt templates for the strategy-generation level and the meta (coach)
+level, with placeholder variables filled per iteration.
 """
 
 POLICY_SIGNATURE = '''class Policy:

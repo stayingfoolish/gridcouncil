@@ -1,0 +1,97 @@
+```python
+class DispatchPolicy:
+    def __init__(self):
+        """Initializes the policy with price history tracking and adaptive thresholds."""
+        self.price_history = []
+        self.max_history = 168  # 1 week of hourly prices
+        self.price_percentile_10 = 40.0
+        self.price_percentile_50 = 60.0
+        self.price_percentile_90 = 80.0
+        self.backlog_safety_mwh = 50.0
+
+    def take_action(self,
+                    hour_of_day: int,
+                    current_price: float,
+                    firm_load_mw: float,
+                    arriving_flex_mw: float,
+                    backlog_mwh: float,
+                    oldest_backlog_age_h: float,
+                    battery_soc_mwh: float,
+                    battery_capacity_mwh: float,
+                    battery_power_mw: float) -> tuple:
+        """
+        Intelligent dispatch policy minimizing system cost via load shifting and battery arbitrage.
+        
+        Strategy:
+        1. Serve deferrable compute in cheap hours; defer to backlog in expensive hours
+        2. Use battery to arbitrage price peaks: charge cheap, discharge expensive
+        3. Enforce 24-hour backlog deadline via urgency mechanism
+        """
+        
+        self.price_history.append(current_price)
+        if len(self.price_history) > self.max_history:
+            self.price_history.pop(0)
+        
+        if len(self.price_history) >= 24:
+            sorted_prices = sorted(self.price_history)
+            self.price_percentile_10 = sorted_prices[len(sorted_prices) // 10]
+            self.price_percentile_50 = sorted_prices[len(sorted_prices) // 2]
+            self.price_percentile_90 = sorted_prices[(9 * len(sorted_prices)) // 10]
+        
+        price_trend = 0
+        if len(self.price_history) >= 3:
+            price_trend = self.price_history[-1] - self.price_history[-3]
+        
+        is_cheap_hour = current_price < self.price_percentile_50 * 0.85
+        is_expensive_hour = current_price > self.price_percentile_50 * 1.2
+        
+        total_backlog_mwh = backlog_mwh + arriving_flex_mw
+        hours_until_deadline = 24 - oldest_backlog_age_h if oldest_backlog_age_h > 0 else 24
+        
+        if total_backlog_mwh > 1e-6:
+            required_flex_rate = total_backlog_mwh / max(hours_until_deadline, 1.0)
+        else:
+            required_flex_rate = 0.0
+        
+        urgency_factor = min(1.0, required_flex_rate / 250.0 + (24 - hours_until_deadline) / 24.0 * 0.3)
+        
+        if is_cheap_hour:
+            flex_serve_mw = arriving_flex_mw + min(backlog_mwh, arriving_flex_mw)
+        elif is_expensive_hour:
+            if oldest_backlog_age_h > 20:
+                flex_serve_mw = required_flex_rate
+            elif urgency_factor > 0.7:
+                flex_serve_mw = arriving_flex_mw * 0.6 + required_flex_rate * 0.4
+            else:
+                flex_serve_mw = arriving_flex_mw * 0.2
+        else:
+            if urgency_factor > 0.8:
+                flex_serve_mw = arriving_flex_mw + required_flex_rate * 0.5
+            else:
+                flex_serve_mw = arriving_flex_mw * 0.7 + required_flex_rate * 0.2
+        
+        flex_serve_mw = max(0.0, min(flex_serve_mw, arriving_flex_mw + backlog_mwh))
+        
+        battery_deficit = (battery_capacity_mwh * 0.70) - battery_soc_mwh
+        
+        if is_cheap_hour and battery_deficit > 1e-6:
+            available_charge_power = min(battery_power_mw, battery_deficit / 1.0,
+                                       (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+            battery_mw = available_charge_power
+        elif is_expensive_hour and battery_soc_mwh > battery_capacity_mwh * 0.15:
+            available_discharge_power = min(battery_power_mw,
+                                          (battery_soc_mwh - battery_capacity_mwh * 0.15) / 1.0)
+            battery_mw = -available_discharge_power
+        elif current_price > self.price_percentile_90 * 1.15 and battery_soc_mwh > battery_capacity_mwh * 0.20:
+            available_discharge_power = min(battery_power_mw * 0.8,
+                                          (battery_soc_mwh - battery_capacity_mwh * 0.20) / 1.0)
+            battery_mw = -available_discharge_power
+        elif battery_deficit > 20.0 and not is_expensive_hour:
+            available_charge_power = min(battery_power_mw * 0.5, battery_deficit / 1.0,
+                                       (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+            battery_mw = available_charge_power
+        else:
+            battery_mw = 0.0
+        
+        return flex_serve_mw, battery_mw
+```

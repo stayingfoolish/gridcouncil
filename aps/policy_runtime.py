@@ -1,5 +1,5 @@
-"""Post-processing (Phi) of LLM output into executable code and sandboxed
-policy evaluation in a subprocess (paper Sections 5.3.1 and 7.1.7)."""
+"""Post-processing of LLM output into executable code and sandboxed
+policy evaluation in an isolated subprocess."""
 
 import json
 import re

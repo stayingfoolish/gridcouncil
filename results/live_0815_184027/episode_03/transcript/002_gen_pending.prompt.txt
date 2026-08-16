@@ -1,0 +1,140 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Analysis & Recommended Improvement
+
+## Current Implementation Assessment
+
+**Strengths:**
+- Adaptive price percentile tracking (captures market regime changes)
+- Multi-factor decision logic (price, urgency, battery state)
+- Physical constraint enforcement (charge/discharge limits)
+
+**Critical Limitations:**
+1. **Battery underutilization (0.0%)**: Despite 168 MWh capacity, battery is never discharged to serve backlog
+2. **$2.56M gap to theoretical optimum**: Suggests missing arbitrage opportunities
+3. **High peak price impact ($196.2/MWh)**: Indicates inflexible load shifting during expensive periods
+4. **Weak backlog discharge logic**: Only discharges when `urgency_factor > 0.5` (backlog age > 18h), missing earlier economic opportunities
+
+---
+
+## Recommended Improvement: Opportunistic Battery Discharge for Price Arbitrage
+
+### The Problem
+The policy only discharges battery defensively (when backlog is urgent). It misses **proactive arbitrage**: discharge battery during high-price periods to offset firm load, even without immediate backlog deadline pressure.
+
+### Implementation
+
+**Add battery arbitrage logic before backlog discharge decisions:**
+
+```python
+def take_action(self, ...):
+    # ... existing price history and urgency calculations ...
+    
+    # NEW: Opportunistic battery arbitrage (insert after urgency_factor calculation)
+    # Discharge battery to reduce expensive load when conditions align
+    if (current_price > self.price_percentile_75 * 1.15 and  # High price regime
+        battery_soc_ratio > 0.35 and                          # Sufficient charge
+        oldest_backlog_age_h < 18.0):                         # No extreme urgency yet
+        
+        # Calculate expected price recovery window (next 6 hours)
+        # Discharge aggressively if price is >25% above 75th percentile
+        discharge_capacity = min(battery_power_mw, battery_soc_mwh / 1.0)
+        arbitrage_discharge = min(discharge_capacity, 60.0)  # Up from 30-80 scattered logic
+        battery_mw = -arbitrage_discharge
+        flex_serve_mw = arriving_flex_mw * 0.3  # Reduce flex serving to prioritize firm load offset
+        
+        return (flex_serve_mw, battery_mw)
+    
+    # ... rest of existing logic ...
+```
+
+### Specific Parameter Changes
+
+| Parameter | Old Value | New Value | Rationale |
+|-----------|-----------|-----------|-----------|
+| Battery discharge trigger | `urgency_factor > 0.5` (18h+) | `price_percentile_75 * 1.15` (high price) | Capture price spikes earlier |
+| Min SOC for discharge | Implicit (0.5) | **0.35** | Allow deeper cycling while maintaining emergency margin |
+| Arbitrage discharge rate | 30-80 MW (scattered) | **60 MW** (consistent) | Maximize peak-hour firm load offset |
+| Price threshold premium | None | **+15%** above 75th percentile | Avoid discharging on marginal price increases |
+| Backlog age cutoff | None | **< 18 hours** | Preserve charge for deadline-critical periods |
+
+### Expected Impact
+
+| Metric | Current | Projected | Impact |
+|--------|---------|-----------|--------|
+| Battery Utilization | 0.0% | 15-25% | Multiple discharge cycles/week during peak periods |
+| Peak Price Impact | $196.2/MWh | ~$165/MWh | Reduced firm load exposure during high-price hours |
+| Added System Cost | $14,577,438 | **~$14,150,000** | ~$427K savings (2.9% improvement) from arbitrage |
+| Gap to LP Optimum | $2,557,932 | ~$2,130,000 | Closer to theoretical bound through proactive discharge |
+
+### Why This Works
+
+1. **Targets the 0% battery utilization problem** directly—creates explicit conditions to discharge
+2. **Reduces peak price exposure** by serving firm load with battery during expensive periods instead of buying grid power
+3. **Maintains backlog safety** with age-based cutoff (won't drain battery when deadlines near)
+4. **Low implementation risk**—uses existing price percentile tracking and constraint logic
+
+This is the highest-leverage single change: the battery is an expensive asset that's currently unused while you're paying peak prices. This improvement unlocks its economic value.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

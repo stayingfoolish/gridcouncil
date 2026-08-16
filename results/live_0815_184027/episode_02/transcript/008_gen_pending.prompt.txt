@@ -1,0 +1,159 @@
+You are an expert Python developer working on power-market optimization.
+
+Develop an intelligent dispatch policy for a 500 MW data center connected to
+a wholesale electricity market. Half of its load (250 MW arriving each hour)
+is deferrable compute that may wait up to 24 hours; the other 250 MW is firm.
+It also has a battery (400 MWh, 100 MW, ~88% round-trip efficiency).
+Electricity prices follow a daily cycle (roughly $30-100/MWh normally) with
+occasional scarcity spikes into the hundreds of dollars. The grid price rises
+when total load rises, so concentrating load into already-expensive hours is
+doubly costly.
+
+The policy must decide each hour:
+1. How much deferrable compute to serve now vs defer (backlog served later)
+2. When to charge and discharge the battery
+
+Objective: minimize the total added system dispatch cost (equivalently: avoid
+drawing power in expensive hours, shift work and storage to cheap hours).
+
+Key constraints (enforced by the environment, but respect them):
+1. Deferred compute must be served within 24 hours (the environment
+   force-serves overdue backlog at any price - avoid letting this happen)
+2. 0 <= battery state of charge <= capacity; |battery power| <= limit
+3. flex_serve_mw >= 0; serving beyond arrivals draws down the backlog
+
+Structure example:
+class DispatchPolicy:
+  def __init__(self):
+    """Initializes the policy. Internal state (price history, thresholds,
+    counters) can be kept here across time steps."""
+    pass
+
+  def take_action(self,
+    # hour of day 0-23
+    hour_of_day: int,
+    # baseline day-ahead price this hour [$/MWh]
+    current_price: float,
+    # inflexible data-center load this hour [MW]
+    firm_load_mw: float,
+    # newly arriving deferrable compute this hour [MW]
+    arriving_flex_mw: float,
+    # deferred compute waiting to be served [MWh]
+    backlog_mwh: float,
+    # age of the oldest deferred compute [hours] (deadline: 24)
+    oldest_backlog_age_h: float,
+    # battery state of charge [MWh]
+    battery_soc_mwh: float,
+    # battery capacity [MWh]
+    battery_capacity_mwh: float,
+    # battery power limit [MW]
+    battery_power_mw: float,
+  ) -> tuple:
+    """Decide this hour's flexible dispatch.
+
+    Returns:
+      (flex_serve_mw, battery_mw)
+      flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
+        serving more than arriving_flex_mw works down the backlog)
+      battery_mw: positive = charge, negative = discharge [MW]
+    """
+    # --- Implement your logic here ---
+    return arriving_flex_mw, 0.0
+
+Implementation instructions:
+# Analysis & Recommendation
+
+## Current Strengths
+- Solid foundation with $14.04M cost (94.4% of theoretical optimum)
+- Effective price-aware dispatch logic with percentile-based thresholds
+- Battery arbitrage mechanism operational
+- Deadline enforcement via urgency factor
+- Converging trajectory (4 iterations of improvement)
+
+## Critical Limitation Identified
+
+**The battery charge target is too conservative and misses peak-shaving opportunities.**
+
+Current logic:
+- Targets 70% SOC during cheap hours (fixed at `battery_capacity_mwh * 0.70`)
+- Discharge threshold only triggers at 120% of P50 or extreme prices (>P90 * 1.15)
+- Battery sits idle 43.3% of the time despite `Peak Price Impact: 196.2 $/MWh` indicating massive price volatility
+
+**The gap to theoretical optimum ($12.02M) suggests systematic under-utilization of battery for peak shaving.**
+
+---
+
+## Specific Improvement: Dynamic Battery Targets Based on Price Volatility
+
+### Implementation
+
+Replace the static 0.70 target with a **dynamic charging target that scales with price dispersion**:
+
+```python
+def take_action(self, ...):
+    # ... existing price history logic ...
+    
+    # NEW: Calculate price volatility coefficient
+    if len(self.price_history) >= 24:
+        sorted_prices = sorted(self.price_history)
+        p10 = sorted_prices[len(sorted_prices) // 10]
+        p90 = sorted_prices[(9 * len(sorted_prices)) // 10]
+        price_spread = p90 - p10
+        
+        # Normalize spread to volatility factor (0.5 to 1.5)
+        base_spread = 20.0  # Expected typical spread
+        volatility_factor = 0.5 + min(1.0, price_spread / base_spread) * 1.0
+    else:
+        volatility_factor = 0.75
+    
+    # Dynamic charge target: low volatility → 60%, high volatility → 85%
+    target_soc_ratio = 0.60 + (volatility_factor - 0.5) * 0.5  # Range: [0.60, 0.85]
+    battery_target_mwh = battery_capacity_mwh * target_soc_ratio
+    battery_deficit = battery_target_mwh - battery_soc_mwh
+    
+    # NEW: Aggressive discharge at elevated prices (P50 threshold, not P90)
+    is_elevated_price = current_price > self.price_percentile_50 * 1.1
+    
+    # ... existing cheap_hour charging logic, using battery_deficit ...
+    
+    if is_cheap_hour and battery_deficit > 1e-6:
+        available_charge_power = min(battery_power_mw, battery_deficit / 1.0,
+                                   (battery_capacity_mwh - battery_soc_mwh) / 1.0)
+        battery_mw = available_charge_power
+    elif is_elevated_price and battery_soc_mwh > battery_capacity_mwh * 0.10:  # Lower threshold
+        available_discharge_power = min(battery_power_mw,
+                                      (battery_soc_mwh - battery_capacity_mwh * 0.10) / 1.0)
+        battery_mw = -available_discharge_power
+    # ... rest of battery logic ...
+```
+
+### Key Changes
+
+| Parameter | Old | New | Rationale |
+|-----------|-----|-----|-----------|
+| Charge target | Static 0.70 | Dynamic 0.60–0.85 | High volatility (P90-P10=$196) demands fuller battery |
+| Discharge trigger | P50 × 1.2 OR P90 × 1.15 | P50 × 1.1 | More frequent discharge at mildly elevated prices |
+| Min discharge SOC | 0.15 (firm load buffer) | 0.10 | Tighter minimum allows more discharge capacity |
+
+---
+
+## Expected Impact
+
+**Cost Reduction:** $14.04M → ~$13.7–13.8M
+- Peak price impact of 196.2 $/MWh × increased discharge frequency ≈ $250–350K savings
+- Volatility-aware targeting prevents undercharging in low-spread periods, avoiding emergency grid purchases
+
+**Dispatch Behavior:**
+- Battery utilization: 43.3% → ~55–60% (fuller cycling in volatile markets)
+- Backlog deadline violations: remain at 0 (urgency mechanism unchanged)
+- Flex serve profile: slightly reduced during P50 × 1.1–1.2 band as battery carries more peak load
+
+**Convergence:** Closes ~$350K of the $2.02M gap to theoretical optimum through better peak-shaving capture.
+
+---
+
+## Why This Works
+
+The current policy conflates "expensive hour" (P50 × 1.2 = ~$72) with "discharge hour." Your observed $196.2 peak suggests occasional extreme spikes that the current thresholds miss. Dynamic targets adapt to market regime without retuning; aggressive discharge at milder elevations (P50 × 1.1 = ~$66) captures more arbitrage while volatility scaling prevents over-discharge in stable periods.
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

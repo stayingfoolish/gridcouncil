@@ -1,0 +1,392 @@
+You are an expert Python developer.
+
+Develop an intelligent battery management policy to optimize energy costs while satisfying the demand_sequence.
+The policy must make strategic decisions about:
+1. When to charge the battery (buy & store energy)
+2. When to discharge the battery (sell & discharge energy)
+3. When to directly purchase from the market
+
+Key Constraints:
+1. Battery Capacity:
+   - 0 <= energy_stored <= max_energy_stored
+   - Battery charge must stay within physical limits
+   - power_discharge >= -5
+   - power_charge <= 10
+
+2. Energy Conservation:
+   - energy_discharged <= energy_stored
+   - Cannot discharge more energy than stored
+
+3. Demand Coverage:
+   - power_bought + power_discharged >= power_own_demand
+   - Must meet energy demand_sequence in each timestep
+
+Structure example:
+class Policy:
+  def __init__(self):
+    """Initializes the policy.
+    Parameters or internal states can be defined here
+    """
+    pass
+
+  def take_action(self,
+    # energy stored in the battery [kWh]
+    current_energy_stored_kwh: float,
+    # PV power generation [kW]
+    current_pv_generation_kw: float,
+    # household power demand [kW]
+    current_demand_kw: float,
+    # grid purchase price [euro/kWh]
+    current_grid_buy_price: float,
+    # grid feed-in tariff (sell price) [euro/kWh]
+    current_grid_sell_price: float,
+    # Maximum battery capacity [kWh]
+    battery_capacity_kwh: float,
+  ) -> float:
+    """Determines the target action for the battery based on the current state.
+
+    Returns:
+      float: The target power for the battery [kW]
+        positive: charging; negative: discharging;
+        zero: no action
+    """
+    # --- Implement your logic here ---
+    # Example: Always return 0 (no action)
+    action_kw = 0.0
+
+    # Return the calculated action
+    return action_kw
+
+Implementation instructions:
+# Novel Battery Management System: Predictive Arbitrage with Dynamic Risk Management
+
+## Current Implementation Analysis
+
+### Strengths
+- ✅ Price percentile tracking (good baseline)
+- ✅ Volatility detection mechanism
+- ✅ Hard SOC limits prevent dangerous states
+- ✅ Momentum calculation attempts trend prediction
+
+### Critical Limitations
+1. **Reactive Decision Making**: Only looks backward at price history; doesn't anticipate future price movements
+2. **Static Thresholds**: Fixed percentile values (25/75) don't adapt to market conditions
+3. **Poor Performance Under Volatility**: With 10.1% price volatility, current system overshoots
+4. **Suboptimal SOC Management**: Battery at 45.2% utilization indicates conservative, underoptimized charging
+5. **No Demand Forecasting**: Ignores future energy requirements
+6. **Linear Momentum**: Decaying momentum doesn't capture price cycle patterns
+7. **Stagnation Pattern**: Cost oscillates [3.25, 10.64, 10.32] - suggests unpredictable decision-making
+
+---
+
+## Proposed Approach: Multi-Horizon Arbitrage with State-Machine Control
+
+### Core Philosophy
+Replace reactive percentile-based decisions with **predictive price-cycle detection** and **opportunity cost optimization**.
+
+```python
+import numpy as np
+from collections import deque
+from enum import Enum
+from dataclasses import dataclass
+from typing import Tuple
+
+class BatteryState(Enum):
+    """Explicit operational states for clear decision context."""
+    ARBITRAGE_READY = 1      # Positioned to capture spread
+    ACCUMULATE = 2           # Building reserves for high-price period
+    HOLD = 3                 # Waiting for clear opportunity
+    EMERGENCY_DISCHARGE = 4  # Demand surge/price spike
+    OPPORTUNISTIC = 5        # Secondary optimization
+
+@dataclass
+class PriceMetrics:
+    """Structured price analysis."""
+    buy_z_score: float
+    sell_z_score: float
+    spread_pct: float
+    cycle_phase: float  # 0-1, where in estimated price cycle
+    volatility: float
+    trend_strength: float
+
+class Policy:
+    def __init__(self):
+        """Initialize with forward-looking, state-aware control."""
+        
+        # Expanded history for better pattern recognition
+        self.price_window = 48  # 2-hour window for cycle detection
+        self.buy_price_history = deque(maxlen=self.price_window)
+        self.sell_price_history = deque(maxlen=self.price_window)
+        self.soc_history = deque(maxlen=self.price_window)
+        self.demand_history = deque(maxlen=self.price_window)
+        
+        # State machine
+        self.current_state = BatteryState.HOLD
+        self.state_duration = 0
+        self.last_action = 0.0
+        
+        # Dynamic thresholds (adapt based on market conditions)
+        self.base_charge_threshold = 35  # percentile
+        self.base_discharge_threshold = 65
+        self.charge_threshold = self.base_charge_threshold
+        self.discharge_threshold = self.base_discharge_threshold
+        
+        # Hard limits
+        self.min_soc_hard = 0.08
+        self.max_soc_hard = 0.97
+        self.min_soc_operational = 0.15
+        self.max_soc_operational = 0.90
+        
+        # Power parameters
+        self.max_charge_power = 8.0
+        self.max_discharge_power = 8.0
+        
+        # Arbitrage thresholds
+        self.min_spread_to_arbitrage = 0.08  # 8% spread required
+        self.cycle_detection_sensitivity = 0.15  # Detect price oscillation
+        
+        # Safety margins
+        self.volatility_safety_margin = 0.7  # Reduce power in volatile markets
+        self.demand_forecast_horizon = 12  # Timesteps ahead
+        
+        # Performance tracking
+        self.successful_arbitrage_count = 0
+        self.missed_opportunity_count = 0
+        self.last_buy_price = None
+        self.last_sell_price = None
+        self.recent_pnl = deque(maxlen=20)
+
+    # ========== PRICE ANALYSIS ==========
+    
+    def _calculate_z_score(self, current_price: float, price_history: deque) -> float:
+        """Normalized price distance from mean (in standard deviations)."""
+        if len(price_history) < 3:
+            return 0.0
+        
+        prices = np.array(list(price_history))
+        mean_price = np.mean(prices)
+        std_price = np.std(prices)
+        
+        if std_price < 0.001:
+            return 0.0
+        
+        z_score = (current_price - mean_price) / std_price
+        return np.clip(z_score, -3, 3)
+    
+    def _detect_price_cycle_phase(self, price_history: deque) -> Tuple[float, float]:
+        """
+        Detect cyclical pattern in prices (0-1 phase, 0-1 strength).
+        Returns (phase, cycle_strength)
+        """
+        if len(price_history) < 12:
+            return 0.5, 0.0
+        
+        prices = np.array(list(price_history))
+        
+        # Detrend with moving average
+        ma_long = np.convolve(prices, np.ones(6)/6, mode='same')
+        detrended = prices - ma_long
+        
+        # Simple autocorrelation analysis for cyclicity
+        half_window = len(prices) // 2
+        if half_window < 3:
+            return 0.5, 0.0
+        
+        # Check for 12-step cycle (common in hourly price data)
+        correlation_12 = np.corrcoef(detrended[:-12], detrended[12:])[0, 1]
+        cycle_strength = max(0, correlation_12)
+        
+        # Estimate phase (position in cycle)
+        recent_3 = detrended[-3:]
+        phase = 0.5 + (0.25 * np.mean(np.sign(recent_3)))
+        
+        return np.clip(phase, 0, 1), cycle_strength
+    
+    def _analyze_spread_opportunity(self, current_buy: float, current_sell: float,
+                                   buy_history: deque, sell_history: deque) -> Tuple[float, float, float]:
+        """
+        Analyze arbitrage opportunity: (spread_pct, buy_attractiveness, sell_attractiveness)
+        """
+        if current_buy <= 0 or current_sell <= 0:
+            return 0.0, 0.0, 0.0
+        
+        spread_pct = (current_buy - current_sell) / current_sell if current_sell > 0 else 0
+        
+        # Z-scores indicate if prices are at extremes
+        buy_z = self._calculate_z_score(current_buy, buy_history)
+        sell_z = self._calculate_z_score(current_sell, sell_history)
+        
+        # Attractiveness: extreme prices = better opportunities
+        buy_attractiveness = -buy_z  # Negative z = low buy price = good time to charge
+        sell_attractiveness = sell_z  # Positive z = high sell price = good time to discharge
+        
+        return spread_pct, buy_attractiveness, sell_attractiveness
+    
+    def _forecast_demand(self, demand_history: deque, horizon: int = 12) -> float:
+        """Forecast average demand over next horizon periods."""
+        if len(demand_history) < 3:
+            return 0.0
+        
+        demands = np.array(list(demand_history))
+        
+        # Simple trend + seasonal component
+        recent_trend = (demands[-1] - demands[0]) / max(len(demands), 1)
+        avg_demand = np.mean(demands[-6:])  # Last hour average
+        
+        # Forecast assumes continuation of trend
+        forecasted = avg_demand + recent_trend * (horizon / 12)
+        return max(0, forecasted)
+    
+    def _calculate_volatility_adjusted_power(self, volatility: float, base_power: float) -> float:
+        """Reduce power scaling in high-volatility markets."""
+        volatility_pct = volatility / 100.0
+        
+        # Safety curve: at 15% volatility, reduce to 70% power
+        if volatility_pct > 0.15:
+            adjustment = self.volatility_safety_margin
+        else:
+            adjustment = 0.85 + 0.15 * (0.15 - volatility_pct) / 0.15
+        
+        return base_power * adjustment
+    
+    # ========== STATE MACHINE LOGIC ==========
+    
+    def _update_thresholds(self, volatility: float):
+        """Dynamically adjust decision thresholds based on market volatility."""
+        # Higher volatility → more conservative thresholds (wait for clearer signals)
+        volatility_factor = min(volatility / 20.0, 1.0)  # Normalize to [0,1]
+        
+        self.charge_threshold = self.base_charge_threshold * (0.8 + 0.4 * volatility_factor)
+        self.discharge_threshold = self.base_discharge_threshold * (0.6 + 0.4 * volatility_factor)
+    
+    def _determine_state(self, soc: float, spread_pct: float, buy_attract: float,
+                        sell_attract: float, volatility: float, 
+                        net_generation: float, demand_forecast: float) -> BatteryState:
+        """Determine optimal operational state."""
+        
+        # Emergency condition
+        if net_generation < -3.0 and soc > self.min_soc_hard:
+            return BatteryState.EMERGENCY_DISCHARGE
+        
+        # High spread + positioned inventory = arbitrage ready
+        if (spread_pct > self.min_spread_to_arbitrage and 
+            soc > self.min_soc_operational and
+            sell_attract > 0.5):
+            return BatteryState.ARBITRAGE_READY
+        
+        # Building for forecasted demand
+        if (soc < self.min_soc_operational * 1.5 and 
+            buy_attract > 0.3 and
+            demand_forecast > 0.5):
+            return BatteryState.ACCUMULATE
+        
+        # Opportunistic secondary trading
+        if (soc > self.max_soc_operational * 0.85 and 
+            sell_attract > 0.2 and
+            spread_pct > 0.02):
+            return BatteryState.OPPORTUNISTIC
+        
+        # Default: wait for better signals
+        return BatteryState.HOLD
+    
+    # ========== MAIN ACTION LOGIC ==========
+    
+    def take_action(self,
+                    current_energy_stored_kwh: float,
+                    current_pv_generation_kw: float,
+                    current_demand_kw: float,
+                    current_grid_buy_price: float,
+                    current_grid_sell_price: float,
+                    battery_capacity_kwh: float) -> float:
+        """Core decision engine with state-machine control."""
+        
+        # Update histories
+        self.buy_price_history.append(current_grid_buy_price)
+        self.sell_price_history.append(current_grid_sell_price)
+        self.demand_history.append(current_demand_kw)
+        
+        soc = current_energy_stored_kwh / battery_capacity_kwh if battery_capacity_kwh > 0 else 0
+        self.soc_history.append(soc)
+        
+        net_generation = current_pv_generation_kw - current_demand_kw
+        
+        # ===== ANALYSIS PHASE =====
+        
+        # Price metrics
+        buy_z = self._calculate_z_score(current_grid_buy_price, self.buy_price_history)
+        sell_z = self._calculate_z_score(current_grid_sell_price, self.sell_price_history)
+        spread_pct, buy_attract, sell_attract = self._analyze_spread_opportunity(
+            current_grid_buy_price, current_grid_sell_price,
+            self.buy_price_history, self.sell_price_history
+        )
+        
+        cycle_phase, cycle_strength = self._detect_price_cycle_phase(self.buy_price_history)
+        volatility = self._calculate_volatility(self.buy_price_history)
+        
+        # Forecast
+        demand_forecast = self._forecast_demand(self.demand_history, self.demand_forecast_horizon)
+        
+        # Update dynamic thresholds
+        self._update_thresholds(volatility)
+        
+        # ===== STATE DETERMINATION =====
+        
+        new_state = self._determine_state(
+            soc, spread_pct, buy_attract, sell_attract,
+            volatility, net_generation, demand_forecast
+        )
+        
+        # Track state duration for hysteresis (avoid flip-flopping)
+        if new_state == self.current_state:
+            self.state_duration += 1
+        else:
+            self.state_duration = 1
+            self.current_state = new_state
+        
+        # ===== DECISION PHASE =====
+        
+        action_kw = 0.0
+        
+        if self.current_state == BatteryState.EMERGENCY_DISCHARGE:
+            # Meet demand at any cost
+            deficit = abs(min(net_generation, 0))
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_hard) / (1/60)
+            action_kw = -min(deficit * 1.1, self.max_discharge_power, max_available)
+        
+        elif self.current_state == BatteryState.ARBITRAGE_READY:
+            # High-priority discharge: sell at peak prices
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_operational) / (1/60)
+            base_discharge = self.max_discharge_power * 0.85
+            adjusted_discharge = self._calculate_volatility_adjusted_power(volatility, base_discharge)
+            action_kw = -min(adjusted_discharge, max_available)
+            
+            self.successful_arbitrage_count += 1
+        
+        elif self.current_state == BatteryState.ACCUMULATE:
+            # Aggressive charging: build reserves for upcoming demand
+            if buy_attract > 0.3:
+                max_available = (battery_capacity_kwh * self.max_soc_operational - current_energy_stored_kwh) / (1/60)
+                base_charge = self.max_charge_power * 0.8
+                adjusted_charge = self._calculate_volatility_adjusted_power(volatility, base_charge)
+                action_kw = min(adjusted_charge, max_available)
+            
+            # Also harvest free PV
+            if net_generation > 0:
+                max_available = (battery_capacity_kwh * self.max_soc_hard - current_energy_stored_kwh) / (1/60)
+                pv_charge = min(net_generation, self.max_charge_power, max_available)
+                action_kw = max(action_kw, pv_charge)
+        
+        elif self.current_state == BatteryState.OPPORTUNISTIC:
+            # Secondary discharge: small amounts at favorable prices
+            max_available = (current_energy_stored_kwh - battery_capacity_kwh * self.min_soc_operational) / (1/60)
+            opportunistic_power = self.max_discharge_power * 0.4
+            adjusted_power = self._calculate_volatility_adjusted_power(volatility, opportunistic_power)
+            action_kw = -min(adjusted_power, max_available)
+        
+        elif self.current_state == BatteryState.HOLD:
+            # Hold or micro-optimize based on free resources
+            if net_generation > 0.5 and soc < self.max_soc_hard:
+                # Free PV: always charge if room
+                max_available = (battery_capacity_
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.

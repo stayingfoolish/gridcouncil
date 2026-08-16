@@ -1,4 +1,4 @@
-"""Globally optimal benchmarks with perfect foresight (paper Appendix D).
+"""Globally optimal benchmarks with perfect foresight.
 
 Deterministic LP over the full horizon with variables c_t, d_t (charge /
 discharge power) and i_t, e_t (grid import / export power):

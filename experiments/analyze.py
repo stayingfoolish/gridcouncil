@@ -1,4 +1,4 @@
-"""Aggregate APS run results and replicate the paper's figures.
+"""Aggregate policy-search run results and generate summary figures.
 
 Outputs (into <run>/figures/):
   fig2_cost_evolution.png   - median/IQR/min-max cost per iteration + benchmarks
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aps.benchmark import solve_optimal
 from aps.simulation import NoBatteryPolicy, SystemParams, generate_exogenous, simulate
 
-PAPER = {"fh_opt": -6.67, "ss_opt": -5.20, "no_battery": 10.70}
+REFERENCE = {"fh_opt": -6.67, "ss_opt": -5.20, "no_battery": 10.70}  # calibration targets
 
 
 def load_run(run_dir: Path):
@@ -51,7 +51,7 @@ def main(run_dir: Path, drop_outliers: bool = True):
         for rec in ep["state"]["records"]:
             cost[i, rec["iteration"]] = rec["total_cost"]
 
-    # Paper footnote 3: single-iteration outliers removed in post-processing.
+    # Optional filter for single-iteration outliers.
     outliers = []
     cost_f = cost.copy()
     if drop_outliers:
@@ -80,7 +80,7 @@ def main(run_dir: Path, drop_outliers: bool = True):
     ax.axhline(nb, color="red", ls="--", label=f"No Battery ({nb:.2f})")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Cost [EUR]")
-    ax.set_title("Evolution of cumulative cost over iterations (Fig. 2 replication)")
+    ax.set_title("Evolution of cumulative cost over iterations")
     ax.legend(loc="upper left", fontsize=8, ncol=2)
     ax.set_xticks(it)
     fig.tight_layout()
@@ -104,7 +104,7 @@ def main(run_dir: Path, drop_outliers: bool = True):
         ax1.set_ylabel("State of charge [kWh]")
         ax1.set_title(
             f"Best policy ({ep_name}, iter {trace['iteration']}, "
-            f"cost {trace['total_cost']:.2f} EUR) - Fig. 3 replication"
+            f"cost {trace['total_cost']:.2f} EUR)"
         )
         ax2.step(t, act, where="post", color="k", lw=0.8)
         ax2.fill_between(t, act, 0, where=act > 0, step="post", color="lightcoral", label="Buy")
@@ -133,9 +133,9 @@ def main(run_dir: Path, drop_outliers: bool = True):
 
     summary = {
         "benchmarks": {
-            "no_battery": {"ours": round(nb, 2), "paper": PAPER["no_battery"]},
-            "finite_horizon_opt": {"ours": round(fh, 2), "paper": PAPER["fh_opt"]},
-            "steady_state_opt": {"ours": round(ss, 2), "paper": PAPER["ss_opt"]},
+            "no_battery": {"ours": round(nb, 2), "reference": REFERENCE["no_battery"]},
+            "finite_horizon_opt": {"ours": round(fh, 2), "reference": REFERENCE["fh_opt"]},
+            "steady_state_opt": {"ours": round(ss, 2), "reference": REFERENCE["ss_opt"]},
             "price_volatility_pct": round(series.price_volatility_pct, 1),
         },
         "episodes": len(episodes),

@@ -1,4 +1,4 @@
-"""Episode state machine implementing Algorithm 1 (paper Appendix A).
+"""Episode state machine for the agentic policy search loop.
 
 Each episode runs I meta-iterations. Every iteration: the meta-policy emits a
 task_description (greedy refine/explore with stagnation switching, Section
@@ -19,7 +19,7 @@ from . import prompts
 from .policy_runtime import evaluate_policy_code, postprocess
 from .simulation import SystemParams
 
-MAX_REPAIR_ATTEMPTS = 5     # paper: restart iteration after 5 failed repairs
+MAX_REPAIR_ATTEMPTS = 5     # restart the iteration after 5 failed repairs
 MAX_RESTARTS = 2            # bound on iteration restarts (practical cap)
 STAGNATION_WINDOW = 3       # iterations without improvement -> explore
 IMPROVEMENT_EPS = 0.05      # minimum cost improvement counted as progress [eur]
@@ -203,8 +203,7 @@ class EpisodeState:
 
     def _record_failed_iteration(self, code: str) -> str:
         """All repairs and restarts exhausted: record a no-op iteration so the
-        episode can continue (documented deviation from the paper, which
-        restarts indefinitely)."""
+        episode can continue."""
         rec = IterationRecord(
             iteration=self.iteration,
             total_cost=float("nan"),

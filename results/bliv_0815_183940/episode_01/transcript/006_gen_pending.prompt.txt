@@ -1,0 +1,382 @@
+You are an expert Python developer.
+
+Develop an intelligent battery management policy to optimize energy costs while satisfying the demand_sequence.
+The policy must make strategic decisions about:
+1. When to charge the battery (buy & store energy)
+2. When to discharge the battery (sell & discharge energy)
+3. When to directly purchase from the market
+
+Key Constraints:
+1. Battery Capacity:
+   - 0 <= energy_stored <= max_energy_stored
+   - Battery charge must stay within physical limits
+   - power_discharge >= -5
+   - power_charge <= 10
+
+2. Energy Conservation:
+   - energy_discharged <= energy_stored
+   - Cannot discharge more energy than stored
+
+3. Demand Coverage:
+   - power_bought + power_discharged >= power_own_demand
+   - Must meet energy demand_sequence in each timestep
+
+Structure example:
+class Policy:
+  def __init__(self):
+    """Initializes the policy.
+    Parameters or internal states can be defined here
+    """
+    pass
+
+  def take_action(self,
+    # energy stored in the battery [kWh]
+    current_energy_stored_kwh: float,
+    # PV power generation [kW]
+    current_pv_generation_kw: float,
+    # household power demand [kW]
+    current_demand_kw: float,
+    # grid purchase price [euro/kWh]
+    current_grid_buy_price: float,
+    # grid feed-in tariff (sell price) [euro/kWh]
+    current_grid_sell_price: float,
+    # Maximum battery capacity [kWh]
+    battery_capacity_kwh: float,
+  ) -> float:
+    """Determines the target action for the battery based on the current state.
+
+    Returns:
+      float: The target power for the battery [kW]
+        positive: charging; negative: discharging;
+        zero: no action
+    """
+    # --- Implement your logic here ---
+    # Example: Always return 0 (no action)
+    action_kw = 0.0
+
+    # Return the calculated action
+    return action_kw
+
+Implementation instructions:
+# Fundamental Rethink: Predictive State Machine with Margin-Based Decision Framework
+
+## Analysis of Current Implementation
+
+### Strengths
+- Good volatility regime detection
+- Comprehensive price metrics (trend, momentum, percentile)
+- Handles PV excess and deficit scenarios
+
+### Critical Limitations Causing Stagnation
+1. **Reactive Decision-Making**: Decides based on current price vs. thresholds, not future expected value
+2. **Conflicting Signals**: Multiple overlapping conditions create decision paralysis and suboptimal arbitrage
+3. **Poor Cost Attribution**: No distinction between cost from poor timing vs. operational necessity
+4. **Threshold Rigidity**: Fixed multipliers (0.85, 1.15, etc.) don't adapt to margin opportunities
+5. **Missing Negative Feedback**: System doesn't learn from poor decisions; cost degradation from -4.48 → 4.53 suggests decision logic is breaking down
+6. **Volatility Paradox**: High volatility should mean MORE aggressive arbitrage, but current system becomes more conservative
+
+## Novel Approach: Margin-Aware Predictive State Machine
+
+### Core Insight
+Instead of asking "Should I charge/discharge NOW?", ask:
+- **"What margin do I need to justify this action?"**
+- **"What's the probability I'll regret this action in the next N periods?"**
+
+```python
+from collections import deque
+import math
+
+class ImprovedPolicy:
+    def __init__(self):
+        # Physical constraints
+        self.max_charge_power = 10
+        self.max_discharge_power = 5
+        self.battery_capacity = 50  # Will be set dynamically
+        
+        # Price prediction: Simple but effective
+        self.price_history = deque(maxlen=60)
+        self.action_history = deque(maxlen=20)  # Track what we did
+        self.outcome_history = deque(maxlen=20)  # Track if it was good/bad
+        
+        # State machine
+        self.current_state = "IDLE"
+        self.state_entry_price = 0
+        self.state_entry_battery = 0
+        self.steps_in_state = 0
+        self.forced_exit_steps = 0
+        
+        # Margin requirements by regime
+        self.min_margin_arbitrage = 0.08  # 8% margin for pure arbitrage
+        self.min_margin_storage = 0.12    # 12% for storage speculation
+        self.margin_emergency = 0.02      # 2% when emergency action needed
+        
+    def _predict_next_prices(self, price_history: deque, steps_ahead: int = 3) -> dict:
+        """
+        Predict next N prices using simple momentum + mean reversion
+        Returns: dict with predicted prices and confidence
+        """
+        if len(price_history) < 3:
+            current = price_history[-1] if price_history else 0
+            return {
+                'predictions': [current] * steps_ahead,
+                'confidence': 0.3,
+                'trend_direction': 0
+            }
+        
+        recent = list(price_history)[-5:]
+        older = list(price_history)[-15:-5] if len(price_history) >= 15 else []
+        
+        # Calculate trend
+        recent_avg = sum(recent) / len(recent)
+        older_avg = sum(older) / len(older) if older else recent_avg
+        trend = (recent_avg - older_avg) / (older_avg + 1e-6)
+        
+        # Calculate mean reversion strength
+        long_term_mean = sum(price_history) / len(price_history)
+        current_deviation = (recent_avg - long_term_mean) / (long_term_mean + 1e-6)
+        
+        # Simple AR(1) with mean reversion
+        predictions = []
+        current_price = recent_avg
+        for i in range(steps_ahead):
+            # 70% momentum, 30% mean reversion
+            next_price = current_price * (1 + trend * 0.7) + long_term_mean * 0.3 * (1 - current_deviation)
+            # Add dampening
+            next_price = max(0.1, next_price)
+            predictions.append(next_price)
+            current_price = next_price
+            trend *= 0.9  # Decay momentum
+        
+        confidence = min(0.8, 0.3 + len(price_history) * 0.01)
+        
+        return {
+            'predictions': predictions,
+            'confidence': confidence,
+            'trend_direction': 1 if trend > 0 else (-1 if trend < 0 else 0),
+            'mean': long_term_mean,
+            'current_deviation': current_deviation
+        }
+    
+    def _calculate_action_margin(self,
+        action_type: str,  # "charge", "discharge"
+        current_price: float,
+        predictions: dict,
+        battery_level: float,
+        target_battery_level: float,
+    ) -> dict:
+        """
+        Calculate the expected margin for a proposed action
+        Margin = (expected_sell_price - entry_price) / entry_price
+        """
+        next_prices = predictions['predictions']
+        
+        if action_type == "charge":
+            # We buy now at current_price
+            # Best case: sell at max(next_prices)
+            # Worst case: sell at min(next_prices)
+            best_sell = max(next_prices)
+            worst_sell = min(next_prices)
+            mean_sell = sum(next_prices) / len(next_prices)
+            
+            best_margin = (best_sell - current_price) / (current_price + 1e-6)
+            worst_margin = (worst_sell - current_price) / (current_price + 1e-6)
+            expected_margin = (mean_sell - current_price) / (current_price + 1e-6)
+            
+            # Penalty: battery can't go below min
+            battery_constraint_penalty = 0
+            if target_battery_level < 0.1:
+                battery_constraint_penalty = 0.05
+            
+            expected_margin -= battery_constraint_penalty
+            
+        else:  # discharge
+            # We sell now at current_price
+            # Best case: buy back at min(next_prices)
+            # Worst case: buy back at max(next_prices)
+            best_buy = min(next_prices)
+            worst_buy = max(next_prices)
+            mean_buy = sum(next_prices) / len(next_prices)
+            
+            best_margin = (current_price - worst_buy) / (current_price + 1e-6)
+            worst_margin = (current_price - best_buy) / (current_price + 1e-6)
+            expected_margin = (current_price - mean_buy) / (current_price + 1e-6)
+            
+            # Penalty: we might need this energy
+            battery_constraint_penalty = 0.03 if battery_level < 0.4 else 0
+            expected_margin -= battery_constraint_penalty
+        
+        return {
+            'expected_margin': expected_margin,
+            'best_margin': best_margin,
+            'worst_margin': worst_margin,
+            'margin_confidence': predictions['confidence'],
+            'upside_potential': best_margin - expected_margin,
+            'downside_risk': expected_margin - worst_margin,
+        }
+    
+    def _evaluate_state_exit(self, current_price: float) -> bool:
+        """
+        Determine if we should exit current state
+        Exit if: margin has been realized, or risk of reversal is too high
+        """
+        if self.current_state == "IDLE":
+            return False
+        
+        if self.current_state == "CHARGING":
+            # Exit if price has risen too much (opportunity cost)
+            margin_realized = (current_price - self.state_entry_price) / (self.state_entry_price + 1e-6)
+            if margin_realized > 0.15:
+                return True  # Price rose, stop charging
+            
+            # Force exit after 8 steps to avoid over-commitment
+            if self.steps_in_state > 8:
+                return True
+        
+        elif self.current_state == "DISCHARGING":
+            # Exit if price has fallen too much (opportunity cost)
+            margin_realized = (self.state_entry_price - current_price) / (self.state_entry_price + 1e-6)
+            if margin_realized > 0.15:
+                return True  # Price fell, stop discharging
+            
+            # Force exit after 6 steps
+            if self.steps_in_state > 6:
+                return True
+        
+        return False
+    
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> float:
+        
+        self.battery_capacity = battery_capacity_kwh
+        self.price_history.append(current_grid_buy_price)
+        
+        battery_level = current_energy_stored_kwh / battery_capacity_kwh
+        excess_pv = max(0, current_pv_generation_kw - current_demand_kw)
+        deficit = max(0, current_demand_kw - current_pv_generation_kw)
+        
+        energy_to_full = battery_capacity_kwh - current_energy_stored_kwh
+        max_charge_available = min(self.max_charge_power, energy_to_full)
+        max_discharge_available = min(self.max_discharge_power, current_energy_stored_kwh)
+        
+        # Get price predictions
+        predictions = self._predict_next_prices(self.price_history, steps_ahead=3)
+        
+        # **PHASE 1: Handle mandatory operational needs**
+        
+        # Must absorb excess PV
+        if excess_pv > 0 and battery_level < 0.95:
+            charge_amount = min(excess_pv * 0.9, max_charge_available)
+            self._enter_state("CHARGING", current_grid_buy_price, battery_level)
+            return charge_amount
+        
+        # Must meet deficit from battery
+        if deficit > 0 and battery_level > 0.15:
+            discharge_amount = min(deficit * 0.9, max_discharge_available)
+            self._enter_state("DISCHARGING", current_grid_buy_price, battery_level)
+            return -discharge_amount
+        
+        # **PHASE 2: Check if we should exit current speculative state**
+        if self._evaluate_state_exit(current_grid_buy_price):
+            self.current_state = "IDLE"
+            self.forced_exit_steps = 0
+        
+        # **PHASE 3: Opportunistic arbitrage if in IDLE state**
+        if self.current_state == "IDLE":
+            
+            # Charging opportunity: buy low
+            if battery_level < 0.80:
+                charge_margin = self._calculate_action_margin(
+                    "charge",
+                    current_grid_buy_price,
+                    predictions,
+                    battery_level,
+                    battery_level + self.max_charge_power / battery_capacity_kwh
+                )
+                
+                required_margin = self.min_margin_arbitrage
+                if predictions['current_deviation'] < -0.15:  # Price is low
+                    required_margin *= 0.8
+                
+                if charge_margin['expected_margin'] > required_margin and \
+                   predictions['trend_direction'] >= 0:  # Neutral or uptrend
+                    
+                    charge_amount = min(self.max_charge_power * 0.8, max_charge_available)
+                    self._enter_state("CHARGING", current_grid_buy_price, battery_level)
+                    return charge_amount
+            
+            # Discharging opportunity: sell high
+            if battery_level > 0.30:
+                discharge_margin = self._calculate_action_margin(
+                    "discharge",
+                    current_grid_buy_price,
+                    predictions,
+                    battery_level,
+                    battery_level - self.max_discharge_power / battery_capacity_kwh
+                )
+                
+                required_margin = self.min_margin_arbitrage
+                if predictions['current_deviation'] > 0.15:  # Price is high
+                    required_margin *= 0.8
+                
+                if discharge_margin['expected_margin'] > required_margin and \
+                   predictions['trend_direction'] <= 0:  # Neutral or downtrend
+                    
+                    discharge_amount = min(self.max_discharge_power * 0.7, max_discharge_available)
+                    self._enter_state("DISCHARGING", current_grid_buy_price, battery_level)
+                    return -discharge_amount
+        
+        # **PHASE 4: Increment state counter**
+        self.steps_in_state += 1
+        
+        return 0.0
+    
+    def _enter_state(self, new_state: str, entry_price: float, battery_level: float):
+        """Transition to new state"""
+        if self.current_state != new_state:
+            self.current_state = new_state
+            self.state_entry_price = entry_price
+            self.state_entry_battery = battery_level
+            self.steps_in_state = 0
+
+```
+
+## Expected Improvements
+
+### 1. **Decision Clarity** (-2.5 to -3.5 cost range)
+- **Current problem**: Multiple overlapping conditions → indecision
+- **Fix**: Margin-based framework forces YES/NO decisions
+- **Expected gain**: 15-25% cost reduction
+
+### 2. **Volatility Exploitation** (-3.5 to -4.2 cost range)
+- **Current problem**: High volatility triggers CONSERVATISM (wrong!)
+- **Fix**: High volatility = wider predictions = larger margins required but MORE opportunities
+- **Expected gain**: Additional 10-15% when volatility > 12%
+
+### 3. **State Discipline** (-4.2 to -4.8 cost range)
+- **Current problem**: Perpetual state transitions, never fully committed
+- **Fix**: State machine prevents flip-flopping
+- **Expected gain**: 20% reduction in transaction regret
+
+### 4. **Prediction-Driven Actions** (-4.8 to -5.5 cost range)
+- **Current problem**: Reacts to NOW, ignores FUTURE
+- **Fix**: All decisions based on next 3 periods
+- **Expected gain**: 30% improvement in arbitrage timing
+
+## Implementation Priority
+
+| Step | Action | Expected Gain |
+|------|--------|--------------|
+| 1 | Replace reactive thresholds with margin calculations | Cost: 4.53 → 2.0 |
+| 2 | Add state machine discipline | Cost: 2.0 → -1.5 |
+| 3 | Implement 3-period prediction loop | Cost: -1.5 → -4.0 |
+| 4 | Tune margin requirements by regime | Cost: -4.0 → -5.2 |
+
+This approach is fundamentally different: **it stops asking "what's the price?" and starts asking "what's the profitable margin?"**
+
+Provide the final implementation without Markdown formatting or additional comments outside the class.
