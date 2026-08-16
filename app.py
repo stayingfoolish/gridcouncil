@@ -32,6 +32,10 @@ st.set_page_config(page_title="Grid Optimization Engine", page_icon="⚡",
 
 EUR_BENCH = {"No battery": 10.64, "Best possible (perfect foresight)": -6.32}
 
+# One color per actor, used on every chart so the story reads consistently.
+PALETTE = {"grid": "#64748b", "dc": "#8b5cf6", "homes": "#14b8a6",
+           "ai": "#f87171", "price": "#f59e0b", "carbon": "#22c55e"}
+
 
 @st.cache_resource(show_spinner="Loading a year of market data and calibrating the twin…")
 def load_twin():
@@ -151,11 +155,12 @@ def replay_ui(runs: dict, keyp: str):
     with lc:
         plot_df = pd.DataFrame({
             "round": [h["iteration"] + 1 for h in hist],
-            "this attempt": [h["cost"]/scale for h in hist],
-            "best so far": [min(x["cost"] for x in hist[:i+1])/scale for i, h in enumerate(hist)],
+            f"this attempt ({unit})": [h["cost"]/scale for h in hist],
+            f"best so far ({unit})": [min(x["cost"] for x in hist[:i+1])/scale
+                                      for i, h in enumerate(hist)],
         }).set_index("round")
         for label, val in bench.items():
-            plot_df[label] = val
+            plot_df[f"{label} ({unit})"] = val
         st.line_chart(plot_df, height=300)
     with rc:
         mode = cur["mode"] if shown > 1 else "initial"
@@ -356,9 +361,10 @@ def live_lab(flavor: dict, keyp: str):
             live_df = pd.DataFrame({
                 "round": range(1, len(vals) + 1),
                 f"attempt ({flavor['unit']})": [v / sc for v in vals]}).set_index("round")
-            live_df[flavor["naive_label"]] = bl["naive"] / sc
-            live_df[flavor["best_label"]] = bl["dla"] / sc
-            st.line_chart(live_df, height=240)
+            live_df[f"{flavor['naive_label']} ({flavor['unit']})"] = bl["naive"] / sc
+            live_df[f"{flavor['best_label']} ({flavor['unit']})"] = bl["dla"] / sc
+            st.line_chart(live_df, height=240,
+                          color=[PALETTE["ai"], PALETTE["grid"], PALETTE["carbon"]])
         st.markdown("**Deliberation feed** (newest first):")
         icons = {"score": "🎯", "crash": "💥", "spike": "⚡"}
         for e in reversed(events[-12:]):
@@ -369,6 +375,36 @@ def live_lab(flavor: dict, keyp: str):
             st.markdown(f"{icon} **{e['episode']} · round {e['iteration'] + 1} · {who}** — "
                         f"{e['detail'][:220]}{'…' if len(e['detail']) > 220 else ''}")
     live_feed()
+
+
+@st.cache_data(show_spinner=False)
+def recorded_ladder():
+    """The recorded data-center search's ladder (results/engine_aps/summary.json)."""
+    p = ROOT / "results/engine_aps/summary.json"
+    if not p.exists():  # fall back to the numbers of the shipped recorded run
+        return {"naive": 14.9e6, "ai": 14.1e6, "pfa": 13.3e6, "dla": 12.0e6,
+                "ai_gap": 27.0, "pfa_gap": 55.0}
+    s = json.loads(p.read_text())
+    b = s["baselines_usd"]
+    return {"naive": b["naive"], "pfa": b["pfa"], "dla": b["dla"],
+            "ai": s["best_llm_policy_usd"],
+            "ai_gap": s["gap_closure_pct"]["llm_best"],
+            "pfa_gap": s["gap_closure_pct"]["hand_pfa"]}
+
+
+@st.cache_data(show_spinner=False)
+def recorded_home_best():
+    """Best strategy cost across the recorded home-battery search (results/run1)."""
+    costs = [r["total_cost"]
+             for f in (ROOT / "results/run1").glob("episode_*/state.json")
+             for r in json.loads(f.read_text())["records"]
+             if r.get("total_cost") is not None]
+    return min(costs) if costs else None
+
+
+def eur(v: float) -> str:
+    """Format a euro amount with a proper minus sign."""
+    return f"{v:.2f} €".replace("-", "−")
 
 
 def dollar_runs():
@@ -472,12 +508,12 @@ and a calibrated twin of the market keeps the score.""")
                   help="Shifting load between hours changes real emissions, not just cost")
     with right:
         st.markdown("**Real prices, hour by hour** — spikes are expensive plants switching on")
-        chart_df = pd.DataFrame({"time": df["time"], "$/MWh": df["LMP"]}).set_index("time")
-        st.line_chart(chart_df, height=190)
+        chart_df = pd.DataFrame({"time": df["time"], "price ($/MWh)": df["LMP"]}).set_index("time")
+        st.line_chart(chart_df, height=190, color=PALETTE["price"])
         st.markdown("**…and every hour has a carbon intensity too** (real fuel mix)")
         st.line_chart(pd.DataFrame({"time": df["time"],
-                                    "kg CO₂/MWh": df["carbon_t_per_mwh"]*1000}
-                                   ).set_index("time"), height=140, color="#7a7a52")
+                                    "carbon (kg CO₂/MWh)": df["carbon_t_per_mwh"]*1000}
+                                   ).set_index("time"), height=140, color=PALETTE["carbon"])
     st.divider()
     st.markdown("### The grid on a map — one price per region, changing every hour")
     spike_day = str(df.loc[df["LMP"].idxmax(), "time"].date())
@@ -502,10 +538,12 @@ or something — must decide: *charge the battery, discharge it, or trade with t
 Get it wrong and solar power is sold cheap at noon and expensive power is bought at dinner.
 The system is simulated over one week with fully disclosed assumptions.""")
 
+    hb_no = EUR_BENCH["No battery"]
+    hb_opt = EUR_BENCH["Best possible (perfect foresight)"]
     b1, b2, b3 = st.columns(3)
-    b1.metric("Doing nothing (no battery)", "10.64 €", help="Cost of the week without any battery")
-    b2.metric("Perfect crystal ball", "−6.32 €", help="A mathematical optimum with perfect foresight — the week turns a profit")
-    b3.metric("Gap the AI must close", "16.96 €")
+    b1.metric("Doing nothing (no battery)", eur(hb_no), help="Cost of the week without any battery")
+    b2.metric("Perfect crystal ball", eur(hb_opt), help="A mathematical optimum with perfect foresight — the week turns a profit")
+    b3.metric("Gap the AI must close", eur(hb_no - hb_opt))
 
     st.markdown("""
 **How we address it.** We gave the problem to the three-agent loop (tab 4): a strategy-writer
@@ -515,9 +553,15 @@ strategies written, tested, and judged. No training, no examples of good behavio
 score as feedback.
 
 **What happened.**""")
+    hb_best = recorded_home_best()
     r1, r2, r3 = st.columns(3)
     r1.metric("Searches that found a profitable strategy", "10 / 10")
-    r2.metric("Best strategy found", "−6.08 €", "0.24 € from the theoretical optimum")
+    if hb_best is not None:
+        r2.metric("Best strategy found", eur(hb_best),
+                  f"{eur(hb_best - hb_opt)} from the theoretical optimum")
+    else:
+        r2.metric("Best strategy found", "−6.08 €",
+                  "0.24 € from the theoretical optimum *(recorded run · Jun–Aug 2026)*")
     r3.metric("Rounds needed to get there", "1–3", "not 1,000+ training episodes")
 
     ep1_trace = ROOT / "results/run1/episode_01/best_trace.json"
@@ -528,7 +572,7 @@ score as feedback.
                     "solar, runs the home through the expensive evening, every single day:")
         st.area_chart(pd.DataFrame({"hour of the week": range(len(soc)),
                                     "battery charge (kWh)": soc}).set_index("hour of the week"),
-                      height=200)
+                      height=200, color=PALETTE["homes"])
     st.info("**The honest finding:** the AI found near-optimal strategies almost immediately — "
             "and further rounds often made things *worse*, which is why the loop always keeps "
             "the best strategy found rather than the latest. You can watch that happen below.")
@@ -589,11 +633,12 @@ dispatched intelligently. Try it yourself:""")
     worst = int(np.argmax(p1 - p0)); a, b = max(0, worst - 60), min(len(test), worst + 60)
     price_df = pd.DataFrame({
         "time": test["time"].iloc[a:b],
-        "Before the data center": p0[a:b],
-        "Rigid data center": p1[a:b],
-        "With the engine": mitigated.price_new[a:b],
+        "Before the data center ($/MWh)": p0[a:b],
+        "Rigid data center ($/MWh)": p1[a:b],
+        "With the engine ($/MWh)": mitigated.price_new[a:b],
     }).set_index("time")
-    st.line_chart(price_df, height=280)
+    st.line_chart(price_df, height=280,
+                  color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
 
     with st.expander("📋 The operational plan the engine hands the data center", expanded=False):
         firm_mw = dc.profile_mw * (1 - dc.deferrable_frac)
@@ -632,14 +677,15 @@ Bottom line: **${(naive.energy_cost - opt.energy_cost)/1e6:.2f}M saved on its ow
 **${(naive.system_cost_delta - opt.system_cost_delta)/1e6:.2f}M less system cost**, identical compute served.""")
         prof = pd.DataFrame({
             "hour": range(24),
-            "avg grid draw MW": [opt.served_mw[hh == h].mean() for h in range(24)],
-            "avg battery MW": [opt.battery_mw[hh == h].mean() for h in range(24)],
-            "avg price $/MWh": [impact.price_base[hh == h].mean() for h in range(24)],
+            "avg grid draw (MW)": [opt.served_mw[hh == h].mean() for h in range(24)],
+            "avg battery (MW)": [opt.battery_mw[hh == h].mean() for h in range(24)],
+            "avg price ($/MWh)": [impact.price_base[hh == h].mean() for h in range(24)],
         }).set_index("hour")
         pc1, pc2 = st.columns([2, 3])
         with pc1:
             st.markdown("**The shape of a typical day**")
-            st.line_chart(prof, height=220)
+            st.line_chart(prof, height=220,
+                          color=[PALETTE["dc"], PALETTE["homes"], PALETTE["price"]])
         with pc2:
             worst_day = test["time"].dt.date.iloc[int(np.argmax(impact.price_new - impact.price_base))]
             st.markdown(f"**Hour-by-hour playbook, hardest day ({worst_day})**")
@@ -653,11 +699,13 @@ Bottom line: **${(naive.energy_cost - opt.energy_cost)/1e6:.2f}M saved on its ow
     st.markdown("""We ran the same three-agent search on this problem — with a twist: here we
 **know the mathematically best answer** (a perfect-foresight optimizer), so we can grade the AI
 precisely. The ladder, from worst to best:""")
+    lad = recorded_ladder()
     l1, l2, l3, l4 = st.columns(4)
-    l1.metric("Do nothing", "$14.9M", help="Added system cost, rigid data center")
-    l2.metric("AI-searched strategy", "$14.1M", "closed 27% of the gap")
-    l3.metric("Hand-written rules", "$13.3M", "closed 55%")
-    l4.metric("Perfect foresight", "$12.0M", "the bound — 100%")
+    l1.metric("Do nothing", f"${lad['naive']/1e6:.1f}M", help="Added system cost, rigid data center")
+    l2.metric("AI-searched strategy", f"${lad['ai']/1e6:.1f}M",
+              f"closed {lad['ai_gap']:.0f}% of the gap")
+    l3.metric("Hand-written rules", f"${lad['pfa']/1e6:.1f}M", f"closed {lad['pfa_gap']:.0f}%")
+    l4.metric("Perfect foresight", f"${lad['dla']/1e6:.1f}M", "the bound — 100%")
     st.info("**The honest finding:** on this harder problem the AI's reactive rules plateau "
             "well above the optimizer — timing a 24-hour backlog against price spikes needs "
             "foresight a simple rule can't express. That's exactly why the engine keeps a "
@@ -737,10 +785,10 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
     st.markdown("Bars above zero are extra draw; below zero is relief. Watch selfish "
                 "flexibility (red) pile everything into the same cheap hours:")
     delta_df = pd.DataFrame({
-        "Selfish (everyone alone)": C["selfish_net"] - C["base"],
-        "Coordinated": C["joint_net"] - C["base"],
+        "Selfish, everyone alone (MW)": C["selfish_net"] - C["base"],
+        "Coordinated (MW)": C["joint_net"] - C["base"],
     }, index=times)
-    st.bar_chart(delta_df, height=280, color=["#e45756", "#54a24b"])
+    st.bar_chart(delta_df, height=280, color=[PALETTE["ai"], PALETTE["carbon"]])
 
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("Base peak", f"{C['base'].max():,.0f} MW")
@@ -756,11 +804,12 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
     pk = int(np.argmax(C["selfish_net"]))
     lo, hi = max(0, pk - 6), min(len(C["base"]), pk + 6)
     zoom = pd.DataFrame({
-        "Grid alone": C["base"][lo:hi],
-        "Selfish": C["selfish_net"][lo:hi],
-        "Coordinated": C["joint_net"][lo:hi],
+        "Grid alone (MW)": C["base"][lo:hi],
+        "Selfish (MW)": C["selfish_net"][lo:hi],
+        "Coordinated (MW)": C["joint_net"][lo:hi],
     }, index=[t.strftime("%a %H:%M") for t in times[lo:hi]])
-    st.bar_chart(zoom, height=260, color=["#9d9d9d", "#e45756", "#54a24b"], stack=False)
+    st.bar_chart(zoom, height=260,
+                 color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]], stack=False)
     st.caption("Grouped bars, 12 hours around the worst selfish hour — the gap between red "
                "and green is what coordination is worth.")
 
@@ -768,7 +817,7 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
     rounds_df = pd.DataFrame(C["rounds"]).set_index("round")[["peak_mw"]]
     rounds_df.loc["bound"] = C["joint_net"].max()
     st.bar_chart(rounds_df.rename(columns={"peak_mw": "system peak (MW)"}), height=220,
-                 color=["#4c78a8"])
+                 color=[PALETTE["grid"]])
 
     bill_selfish = float(((C["p_selfish"] - C["p0"]) * C["existing_mw"]).sum())
     bill_joint = float(((C["p_joint"] - C["p0"]) * C["existing_mw"]).sum())
@@ -1104,7 +1153,8 @@ def render_tour():
         st.header("Electricity is an auction — the priciest plant sets everyone's price")
         daily = df.set_index("time")["LMP"].resample("D").agg(["median", "max"])
         st.line_chart(daily.rename(columns={"median": "typical day ($/MWh)",
-                                            "max": "worst hour ($/MWh)"}), height=260)
+                                            "max": "worst hour ($/MWh)"}), height=260,
+                      color=[PALETTE["price"], PALETTE["ai"]])
         c1, c2, c3 = st.columns(3)
         c1.metric("Typical price", f"${df['LMP'].median():.0f}/MWh")
         c2.metric("Worst hour this year", f"${df['LMP'].max():.0f}/MWh",
@@ -1118,9 +1168,10 @@ def render_tour():
         df, test, twin, iso = load_twin()
         st.header("First, earn the right to say “what if” — the digital twin")
         pred = twin.predict(test["net_load_mw"].values, test["time"])
-        st.line_chart(pd.DataFrame({"actual price": test["LMP"].values,
-                                    "twin's price": pred},
-                                   index=test["time"]), height=260)
+        st.line_chart(pd.DataFrame({"actual price ($/MWh)": test["LMP"].values,
+                                    "twin's price ($/MWh)": pred},
+                                   index=test["time"]), height=260,
+                      color=[PALETTE["grid"], PALETTE["price"]])
         c1, c2, c3 = st.columns(3)
         c1.metric("Correlation (held-out)", f"{twin.report.corr:.2f}")
         c2.metric("Typical error", f"${twin.report.mae:.0f}/MWh")
@@ -1152,8 +1203,9 @@ def render_tour():
         co = run_coordination(50_000, 500, 0, 4)
         st.line_chart(pd.DataFrame({
             "baseline net load (MW)": co["base"],
-            "everyone selfish (herding)": co["selfish_net"],
-            "coordinated": co["joint_net"]}, index=co["times"]), height=280)
+            "everyone selfish, herding (MW)": co["selfish_net"],
+            "coordinated (MW)": co["joint_net"]}, index=co["times"]), height=280,
+                      color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
         r1, r2, r3 = st.columns(3)
         r1.metric("Selfish peak", f"{co['selfish_net'].max():,.0f} MW",
                   f"+{co['selfish_net'].max()-co['base'].max():,.0f} MW rebound",
@@ -1167,11 +1219,15 @@ def render_tour():
 
     elif step == 5:
         st.header("The engine keeps improving — and shows its work")
+        lad = recorded_ladder()
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Do nothing", "$14.9M", "added system cost", delta_color="off")
-        s2.metric("AI-written rules", "$14.1M", "closed 27% of the gap")
-        s3.metric("Hand-written rules", "$13.3M", "closed 55%")
-        s4.metric("Optimizer (bound)", "$12.0M", "100% — kept in the loop")
+        s1.metric("Do nothing", f"${lad['naive']/1e6:.1f}M", "added system cost",
+                  delta_color="off")
+        s2.metric("AI-written rules", f"${lad['ai']/1e6:.1f}M",
+                  f"closed {lad['ai_gap']:.0f}% of the gap")
+        s3.metric("Hand-written rules", f"${lad['pfa']/1e6:.1f}M",
+                  f"closed {lad['pfa_gap']:.0f}%")
+        s4.metric("Optimizer (bound)", f"${lad['dla']/1e6:.1f}M", "100% — kept in the loop")
         st.markdown("""
 AI agents **write strategies as plain code**, a simulator scores them, a coach decides
 *refine or rethink* — and the best strategy is always kept. Where classical optimization
@@ -1211,13 +1267,15 @@ def render_mission():
         st.markdown("##### The worst 3 days — net load under three futures")
         st.line_chart(pd.DataFrame({
             "baseline (MW)": mc_co["base"],
-            "selfish flexibility (herding)": mc_co["selfish_net"],
-            "coordinated": mc_co["joint_net"]}, index=mc_co["times"]), height=250)
+            "selfish flexibility, herding (MW)": mc_co["selfish_net"],
+            "coordinated (MW)": mc_co["joint_net"]}, index=mc_co["times"]), height=250,
+                      color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
         st.markdown("##### Prices those futures produce")
         st.line_chart(pd.DataFrame({
             "baseline ($/MWh)": mc_co["p0"],
-            "selfish": mc_co["p_selfish"],
-            "coordinated": mc_co["p_joint"]}, index=mc_co["times"]), height=180)
+            "selfish ($/MWh)": mc_co["p_selfish"],
+            "coordinated ($/MWh)": mc_co["p_joint"]}, index=mc_co["times"]), height=180,
+                      color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
 
     with ledger:
         st.markdown("##### Ledger")
@@ -1249,13 +1307,14 @@ def render_mission():
             st.info("No recorded agent activity yet — start a run in a 🔴 Live Lab.")
     with board_c:
         st.markdown("##### Strategy scoreboard (recorded)")
-        st.markdown("""
+        lad = recorded_ladder()
+        st.markdown(f"""
 | Policy | Added system cost | Gap closed |
 |---|---|---|
-| Do nothing | $14.9M | — |
-| **AI-written rules** | **$14.1M** | **27%** |
-| Hand-written rules | $13.3M | 55% |
-| Optimizer (bound) | $12.0M | 100% |""")
+| Do nothing | ${lad['naive']/1e6:.1f}M | — |
+| **AI-written rules** | **${lad['ai']/1e6:.1f}M** | **{lad['ai_gap']:.0f}%** |
+| Hand-written rules | ${lad['pfa']/1e6:.1f}M | {lad['pfa_gap']:.0f}% |
+| Optimizer (bound) | ${lad['dla']/1e6:.1f}M | 100% |""")
 
 
 # ---------------------------------------------------------------- today (calm)
@@ -1283,7 +1342,7 @@ the grid absorbs everyone's flexibility, selfish or coordinated.**""")
         "Grid load (MW)": Ct["base"],
         "All flexibility, selfish (MW added)": Ct["selfish_net"] - Ct["base"],
     }, index=times_t)
-    st.bar_chart(fit_df, height=280, color=["#9d9d9d", "#e45756"])
+    st.bar_chart(fit_df, height=280, color=[PALETTE["grid"], PALETTE["ai"]])
     st.caption("Gray bars: the real grid over its worst 3 days. Red bars: everything "
                "today's data center + 50,000 home batteries add or shift. The red never "
                "reaches the gray peaks — it hides in the valley.")
@@ -1344,15 +1403,16 @@ def render_who():
 
     st.markdown("#### The whole year — which peaks got smoothed")
     yd = year_smoothing(500.0, 50, 100)
-    st.line_chart(yd, height=280, color=["#9d9d9d", "#e45756", "#54a24b"])
+    st.line_chart(yd.rename(columns={c: f"{c} ($/MWh)" for c in yd.columns}), height=280,
+                  color=[PALETTE["grid"], PALETTE["ai"], PALETTE["carbon"]])
     shave = (yd["Rigid data center"] - yd["Dispatched data center"])
     smoothed = shave[shave > 10].sort_values(ascending=False)
     c1, c2 = st.columns([1, 2])
     c1.metric("Spike days smoothed", f"{len(smoothed)}",
               f"best day: −${shave.max():.0f}/MWh off the peak")
     with c2:
-        st.bar_chart(smoothed.head(15).rename("peak $/MWh shaved"), height=220,
-                     color=["#54a24b"])
+        st.bar_chart(smoothed.head(15).rename("peak shaved ($/MWh)"), height=220,
+                     color=[PALETTE["carbon"]])
     st.caption("Daily peak prices across the entire dataset: gray = grid alone, red = a rigid "
                "500 MW data center, green = the same data center dispatched by threshold rules "
                "(the fast policy — the LP does better still). Bars: the 15 days where dispatch "
