@@ -768,6 +768,44 @@ optimization starts manufacturing new peaks — and how coordination fixes it.""
 
 # ---------------------------------------------------------------- agents
 with t_agents:
+
+    st.markdown("#### The three-level loop, on one picture")
+    st.markdown("""
+<svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg" style="max-width:860px;width:100%">
+  <defs><marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L8,3 L0,6 z" fill="#8a8a8a"/></marker></defs>
+  <rect x="20" y="20" width="820" height="88" rx="10" fill="#1f77b4" opacity="0.14"/>
+  <text x="34" y="44" font-size="13" fill="#1f77b4" font-weight="bold">LEVEL 3 — STRATEGY (meta)</text>
+  <rect x="330" y="34" width="200" height="60" rx="8" fill="#1f77b4"/>
+  <text x="430" y="60" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">🧢 Coach (LLM)</text>
+  <text x="430" y="80" font-size="11" fill="#e8f1fa" text-anchor="middle">sees only scores → refine or rethink</text>
+  <rect x="20" y="140" width="820" height="88" rx="10" fill="#9467bd" opacity="0.14"/>
+  <text x="34" y="164" font-size="13" fill="#9467bd" font-weight="bold">LEVEL 2 — IMPLEMENTATION</text>
+  <rect x="240" y="154" width="200" height="60" rx="8" fill="#9467bd"/>
+  <text x="340" y="180" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">✍️ Strategy writer (LLM)</text>
+  <text x="340" y="200" font-size="11" fill="#f0eaf7" text-anchor="middle">instruction → policy class (plain Python)</text>
+  <rect x="600" y="154" width="180" height="60" rx="8" fill="#d62728"/>
+  <text x="690" y="180" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">🔧 Bug fixer (LLM)</text>
+  <text x="690" y="200" font-size="11" fill="#fbe9e9" text-anchor="middle">traceback → repaired code (≤5 tries)</text>
+  <rect x="20" y="260" width="820" height="98" rx="10" fill="#2ca02c" opacity="0.14"/>
+  <text x="34" y="284" font-size="13" fill="#2ca02c" font-weight="bold">LEVEL 1 — EXECUTION (not an AI)</text>
+  <rect x="290" y="276" width="280" height="66" rx="8" fill="#2ca02c"/>
+  <text x="430" y="300" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">🌐 Grid twin + simulator</text>
+  <text x="430" y="320" font-size="11" fill="#e9f6e9" text-anchor="middle">runs the policy hour by hour on real data,</text>
+  <text x="430" y="334" font-size="11" fill="#e9f6e9" text-anchor="middle">enforces physics, returns the score</text>
+  <line x1="390" y1="94" x2="345" y2="154" stroke="#8a8a8a" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="300" y="128" font-size="11" fill="#8a8a8a">task description</text>
+  <line x1="360" y1="214" x2="405" y2="276" stroke="#8a8a8a" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="290" y="248" font-size="11" fill="#8a8a8a">policy code</text>
+  <line x1="570" y1="290" x2="660" y2="216" stroke="#d62728" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#ar)"/>
+  <text x="612" y="252" font-size="11" fill="#d62728">crash</text>
+  <line x1="690" y1="214" x2="690" y2="242" stroke="#d62728" stroke-width="2" stroke-dasharray="5,4"/>
+  <line x1="690" y1="242" x2="576" y2="308" stroke="#d62728" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#ar)"/>
+  <line x1="470" y1="276" x2="470" y2="98" stroke="#2ca02c" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="482" y="188" font-size="11" fill="#2ca02c">score + metrics (never raw data)</text>
+  <text x="430" y="382" font-size="11.5" fill="#8a8a8a" text-anchor="middle">Every arrow is a file on disk (pending_prompt.txt → response.txt) — archived verbatim, so every run is replayable. The best strategy is always kept.</text>
+</svg>
+""", unsafe_allow_html=True)
     st.subheader("🤝 Three agents, one loop — who talks to whom")
     st.markdown("""Every strategy you see in this demo was produced by the same conversation
 between three specialists. None of them can do the job alone — and that's deliberate.""")
