@@ -13,6 +13,7 @@ Information architecture (story-first, live separated):
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -264,6 +265,23 @@ def live_lab(flavor: dict, keyp: str):
     live_runs = sorted((ROOT / "results").glob(f"{flavor['prefix']}*"))
     default_dir = st.session_state.get(f"{keyp}_dir") or (str(live_runs[-1]) if live_runs else None)
 
+    with st.expander("🧠 Brain (which model writes the strategies)", expanded=False):
+        b1, b2, b3 = st.columns([1, 1, 1])
+        brain = b1.radio("Backend", ["Claude (default)", "Local model (DGX Spark)"],
+                         key=f"{keyp}_brain", horizontal=True)
+        if brain.startswith("Local"):
+            base_url = b2.text_input("Endpoint (OpenAI-compatible)",
+                                     os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1"),
+                                     key=f"{keyp}_url")
+            model_name = b3.text_input("Served model name",
+                                       os.environ.get("LLM_MODEL", ""),
+                                       key=f"{keyp}_model",
+                                       placeholder="e.g. nvidia/llama-3.1-nemotron-nano-8b")
+        st.caption("Default keeps today's behavior (Anthropic API if a key is set, else the "
+                   "claude CLI). Local points at any OpenAI-compatible server — NIM, vLLM, "
+                   "Ollama — e.g. on a DGX Spark. The worker preflights the endpoint and "
+                   "logs which brain produced the run.")
+
     cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
     n_ep = cc1.number_input("Episodes", 1, 5, flavor["default_ep"], key=f"{keyp}_ne")
     n_it = cc2.number_input("Rounds each", 3, 10, flavor["default_it"], key=f"{keyp}_ni")
@@ -275,10 +293,16 @@ def live_lab(flavor: dict, keyp: str):
                  "--episodes", str(int(n_ep)), "--iterations", str(int(n_it))],
                 cwd=ROOT, check=True, capture_output=True)
         logf = open(ROOT / run_name / "worker.log", "w")
+        wcmd = [sys.executable, "experiments/worker.py", "--run", run_name,
+                "--driver", flavor["driver"]]
+        if st.session_state.get(f"{keyp}_brain", "").startswith("Local"):
+            wcmd += ["--backend", "local",
+                     "--base-url", st.session_state.get(f"{keyp}_url", "http://localhost:8000/v1")]
+            if st.session_state.get(f"{keyp}_model"):
+                wcmd += ["--model", st.session_state[f"{keyp}_model"]]
+        (ROOT / run_name / "brain.txt").write_text(" ".join(wcmd[3:]))
         proc = subprocess.Popen(
-            [sys.executable, "experiments/worker.py", "--run", run_name,
-             "--driver", flavor["driver"]],
-            cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            wcmd, cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
         (ROOT / run_name / "worker.pid").write_text(str(proc.pid))
         st.session_state[f"{keyp}_dir"] = run_name
         st.rerun()

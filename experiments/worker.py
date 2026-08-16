@@ -32,6 +32,19 @@ def complete_with_api(prompt: str, model: str) -> str:
     return "".join(b.text for b in msg.content if b.type == "text")
 
 
+def complete_with_local(prompt: str, model: str, base_url: str, api_key: str) -> str:
+    """Any OpenAI-compatible endpoint (DGX Spark via NIM / vLLM / Ollama…)."""
+    import requests
+    r = requests.post(
+        f"{base_url.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": model, "max_tokens": 4096,
+              "messages": [{"role": "user", "content": prompt}]},
+        timeout=600)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
 def complete_with_cli(prompt: str, model: str) -> str:
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     proc = subprocess.run(
@@ -44,12 +57,20 @@ def complete_with_cli(prompt: str, model: str) -> str:
     return proc.stdout
 
 
+CFG = {"backend": "auto", "base_url": "", "api_key": "local"}
+
+
 def backend() -> str:
-    return "api" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
+    if CFG["backend"] != "auto":
+        return CFG["backend"]
+    return "anthropic-api" if os.environ.get("ANTHROPIC_API_KEY") else "claude-cli"
 
 
 def complete(prompt: str, model: str) -> str:
-    if backend() == "api":
+    b = backend()
+    if b == "local":
+        return complete_with_local(prompt, model, CFG["base_url"], CFG["api_key"])
+    if b == "anthropic-api":
         return complete_with_api(prompt, model)
     return complete_with_cli(prompt, model)
 
@@ -57,17 +78,22 @@ def complete(prompt: str, model: str) -> str:
 def preflight(model: str) -> None:
     """One tiny test call with loud, actionable failure output."""
     b = backend()
-    print(f"backend: {'Anthropic API (ANTHROPIC_API_KEY set)' if b == 'api' else 'claude CLI'}"
-          f" · model: {model}")
+    label = {"anthropic-api": "Anthropic API", "claude-cli": "claude CLI",
+             "local": f"local OpenAI-compatible endpoint {CFG['base_url']}"}[b]
+    print(f"backend: {label} · model: {model}")
     try:
         out = complete("Reply with exactly: OK", model)
         print(f"preflight OK ({out.strip()[:20]!r})")
     except Exception as e:
         print(f"\nPREFLIGHT FAILED: {e!r}\n")
-        if b == "api":
+        if b == "anthropic-api":
             print("Fix: check ANTHROPIC_API_KEY is valid and has credit, e.g.\n"
                   "  curl https://api.anthropic.com/v1/models "
                   '-H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01"')
+        elif b == "local":
+            print(f"Fix: check the endpoint is up and serving the model:\n"
+                  f"  curl {CFG['base_url'].rstrip('/')}/models\n"
+                  "and that --model matches a served model name exactly.")
         else:
             print("Fix: either  export ANTHROPIC_API_KEY=sk-ant-…  or log the CLI in:\n"
                   "  claude  (then /login)\n"
@@ -81,7 +107,16 @@ def main():
     ap.add_argument("--run", required=True)
     ap.add_argument("--model", default="claude-haiku-4-5-20251001")
     ap.add_argument("--driver", default="experiments/driver2.py")
+    ap.add_argument("--backend", default=os.environ.get("LLM_BACKEND", "auto"),
+                    choices=["auto", "anthropic-api", "claude-cli", "local"],
+                    help="auto (default) = today's behavior: Anthropic API if "
+                         "ANTHROPIC_API_KEY is set, else the claude CLI. "
+                         "local = any OpenAI-compatible endpoint (DGX Spark).")
+    ap.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL",
+                    "http://localhost:8000/v1"))
+    ap.add_argument("--api-key", default=os.environ.get("LLM_API_KEY", "local"))
     args = ap.parse_args()
+    CFG.update(backend=args.backend, base_url=args.base_url, api_key=args.api_key)
     run_dir = Path(args.run)
     preflight(args.model)
 
