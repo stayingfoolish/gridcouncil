@@ -46,7 +46,7 @@ _EVAL_SCRIPT = textwrap.dedent(
         "energy_cost": out.energy_cost, "peak_price_delta": out.peak_price_delta,
         "forced_mwh": out.forced_mwh, "battery_util_pct": out.battery_util_pct,
         "served_mw": out.served_mw, "battery_mw": out.battery_mw,
-        "backlog_mwh": out.backlog_mwh,
+        "backlog_mwh": out.backlog_mwh, "reasons": out.reasons or [],
     }}))
     """
 )
@@ -199,7 +199,8 @@ class EngineEpisode:
             (self.episode_dir / "best_trace.json").write_text(json.dumps({
                 "iteration": self.iteration, "system_cost_delta": cost,
                 "served_mw": out["served_mw"], "battery_mw": out["battery_mw"],
-                "backlog_mwh": out["backlog_mwh"]}))
+                "backlog_mwh": out["backlog_mwh"],
+                "reasons": out.get("reasons", [])}))
         self.last_code = code
         self.last_metrics = {k: out[k] for k in
                              ("energy_cost", "peak_price_delta", "forced_mwh",

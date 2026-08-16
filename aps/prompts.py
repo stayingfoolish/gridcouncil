@@ -26,16 +26,16 @@ POLICY_SIGNATURE = '''class Policy:
     """Determines the target action for the battery based on the current state.
 
     Returns:
-      float: The target power for the battery [kW]
-        positive: charging; negative: discharging;
-        zero: no action
+      (action_kw, reason): the target battery power [kW]
+        (positive: charging; negative: discharging; zero: no action)
+        and a SHORT one-sentence explanation of why, mentioning the
+        numbers that drove the decision.
     """
     # --- Implement your logic here ---
-    # Example: Always return 0 (no action)
     action_kw = 0.0
+    reason = "no action: explain the thresholds and values behind this choice"
 
-    # Return the calculated action
-    return action_kw'''
+    return action_kw, reason'''
 
 
 GENERATION_PROMPT = '''You are an expert Python developer.

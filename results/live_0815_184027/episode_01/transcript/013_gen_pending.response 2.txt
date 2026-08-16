@@ -1,0 +1,305 @@
+```python
+import numpy as np
+from collections import deque
+
+
+class DualHorizonDispatchPolicy:
+    """
+    Constraint-based dual-horizon optimization for data center dispatch.
+    Minimizes cost by scheduling flexible compute and battery during cheap periods
+    while respecting deadline and capacity constraints.
+    """
+    
+    def __init__(self):
+        self.price_history = deque(maxlen=672)
+        self.load_history = deque(maxlen=672)
+        
+        self.hour_price_stats = {}
+        self.hour_load_stats = {}
+        
+        self.backlog_deadline_hours = 24.0
+        self.min_reserve_ratio = 0.12
+        self.max_soc_ratio = 0.92
+        self.target_soc_base = 0.50
+        
+        self.commit_horizon_h = 12
+        self.lookahead_horizon_h = 24
+        
+        self.flex_capacity_mw = 250.0
+        self.flex_ramp_rate_mw_per_h = 100.0
+        
+        self.battery_power_rating_mw = 100.0
+        self.battery_efficiency = 0.92
+        
+        self.price_sensitivity = 2.0
+        self.load_volatility_buffer = 1.5
+        
+        self.last_flex_serve = 0.0
+        self.scheduled_serves = deque(maxlen=24)
+        
+    def _ingest_observation(self, hour_of_day: int, current_price: float, 
+                            firm_load_mw: float):
+        self.price_history.append((hour_of_day, current_price))
+        self.load_history.append((hour_of_day, firm_load_mw))
+        
+        same_hour_prices = [p for h, p in self.price_history if h == hour_of_day]
+        same_hour_loads = [l for h, l in self.load_history if h == hour_of_day]
+        
+        if len(same_hour_prices) >= 4:
+            prices_array = np.array(same_hour_prices)
+            self.hour_price_stats[hour_of_day] = {
+                'mean': float(np.mean(prices_array)),
+                'median': float(np.median(prices_array)),
+                'std': float(np.std(prices_array)),
+                'p10': float(np.percentile(prices_array, 10)),
+                'p50': float(np.percentile(prices_array, 50)),
+                'p90': float(np.percentile(prices_array, 90)),
+            }
+        
+        if len(same_hour_loads) >= 4:
+            loads_array = np.array(same_hour_loads)
+            self.hour_load_stats[hour_of_day] = {
+                'mean': float(np.mean(loads_array)),
+                'std': float(np.std(loads_array)),
+                'p95': float(np.percentile(loads_array, 95)),
+            }
+    
+    def _forecast_24h_with_uncertainty(self, current_hour: int, 
+                                       current_price: float) -> tuple:
+        price_forecast = []
+        load_forecast = []
+        price_uncertainty = []
+        load_ceiling = []
+        
+        for offset in range(24):
+            future_hour = (current_hour + offset) % 24
+            
+            if future_hour in self.hour_price_stats:
+                stats = self.hour_price_stats[future_hour]
+                price_forecast.append(stats['mean'])
+                price_uncertainty.append(stats['std'])
+            else:
+                avg_price = float(np.mean([p for _, p in self.price_history])) if self.price_history else current_price
+                price_forecast.append(avg_price)
+                price_uncertainty.append(avg_price * 0.3)
+            
+            if future_hour in self.hour_load_stats:
+                stats = self.hour_load_stats[future_hour]
+                load_forecast.append(stats['mean'])
+                load_ceiling.append(stats['p95'])
+            else:
+                avg_load = float(np.mean([l for _, l in self.load_history])) if self.load_history else 280.0
+                load_forecast.append(avg_load)
+                load_ceiling.append(avg_load * 1.2)
+        
+        return (np.array(price_forecast), np.array(load_forecast), 
+                np.array(price_uncertainty), np.array(load_ceiling))
+    
+    def _compute_cost_to_deadline_ratio(self,
+                                        backlog_mwh: float,
+                                        oldest_backlog_age_h: float,
+                                        price_forecast: np.ndarray,
+                                        load_forecast: np.ndarray,
+                                        battery_soc_mwh: float,
+                                        battery_capacity_mwh: float) -> dict:
+        hours_remaining = self.backlog_deadline_hours - oldest_backlog_age_h
+        if hours_remaining <= 0:
+            return {
+                'cost_to_serve': np.zeros(24),
+                'feasible_windows': [],
+                'earliest_safe_window': 0,
+                'deadline_pressure': 1.0,
+                'must_serve_mw': backlog_mwh / max(hours_remaining, 1.0)
+            }
+        
+        load_pressure = (load_forecast / 350.0) ** 2.5
+        cost_to_serve = price_forecast * (1.0 + load_pressure)
+        
+        deadline_pressure = 1.0 - np.exp(-2.0 * oldest_backlog_age_h / self.backlog_deadline_hours)
+        
+        feasible_windows = self._identify_feasible_windows(
+            load_forecast,
+            battery_soc_mwh,
+            battery_capacity_mwh,
+            backlog_mwh,
+            hours_remaining
+        )
+        
+        earliest_safe_h = feasible_windows[0][0] if feasible_windows else 0
+        must_serve_rate = backlog_mwh / max(hours_remaining, 1.0)
+        
+        return {
+            'cost_to_serve': cost_to_serve,
+            'feasible_windows': feasible_windows,
+            'earliest_safe_window': earliest_safe_h,
+            'deadline_pressure': float(deadline_pressure),
+            'must_serve_mw': float(must_serve_rate),
+        }
+    
+    def _identify_feasible_windows(self,
+                                   load_forecast: np.ndarray,
+                                   battery_soc_mwh: float,
+                                   battery_capacity_mwh: float,
+                                   backlog_mwh: float,
+                                   hours_remaining: float) -> list:
+        firm_capacity_available = 350.0 - load_forecast
+        firm_capacity_available = np.clip(firm_capacity_available, 0, 250.0)
+        
+        windows = []
+        current_window_start = None
+        cumulative_capacity = 0.0
+        
+        for h in range(min(int(hours_remaining) + 1, 24)):
+            if firm_capacity_available[h] > 20.0:
+                if current_window_start is None:
+                    current_window_start = h
+                cumulative_capacity += firm_capacity_available[h]
+            else:
+                if current_window_start is not None:
+                    windows.append((current_window_start, h - 1, cumulative_capacity))
+                    current_window_start = None
+                    cumulative_capacity = 0.0
+        
+        if current_window_start is not None:
+            windows.append((current_window_start, 23, cumulative_capacity))
+        
+        return windows
+    
+    def _optimize_flex_schedule_constraint_based(self,
+                                                 arriving_flex_mw: float,
+                                                 backlog_mwh: float,
+                                                 oldest_backlog_age_h: float,
+                                                 price_forecast: np.ndarray,
+                                                 load_forecast: np.ndarray,
+                                                 battery_soc_mwh: float,
+                                                 battery_capacity_mwh: float) -> float:
+        
+        if backlog_mwh == 0:
+            return arriving_flex_mw
+        
+        metrics = self._compute_cost_to_deadline_ratio(
+            backlog_mwh, oldest_backlog_age_h,
+            price_forecast, load_forecast,
+            battery_soc_mwh, battery_capacity_mwh
+        )
+        
+        deadline_pressure = metrics['deadline_pressure']
+        must_serve_rate = metrics['must_serve_mw']
+        cost_to_serve = metrics['cost_to_serve']
+        
+        hours_remaining = self.backlog_deadline_hours - oldest_backlog_age_h
+        
+        if oldest_backlog_age_h >= 20.0:
+            if load_forecast[0] < 310.0:
+                return min(self.flex_capacity_mw, arriving_flex_mw + must_serve_rate)
+            else:
+                return arriving_flex_mw
+        
+        if deadline_pressure >= 0.70:
+            next_6_min_cost_idx = int(np.argmin(cost_to_serve[:6]))
+            if next_6_min_cost_idx == 0:
+                serve_now = min(self.flex_capacity_mw - arriving_flex_mw,
+                               0.40 * backlog_mwh / max(hours_remaining, 1.0))
+                return min(self.flex_capacity_mw, arriving_flex_mw + serve_now)
+            else:
+                return arriving_flex_mw
+        
+        if deadline_pressure >= 0.40:
+            price_p50 = float(np.percentile(cost_to_serve[:12], 50))
+            if cost_to_serve[0] <= price_p50 * 0.85:
+                serve_now = min(self.flex_capacity_mw - arriving_flex_mw,
+                               0.25 * backlog_mwh / max(hours_remaining, 1.0))
+                return min(self.flex_capacity_mw, arriving_flex_mw + serve_now)
+            return arriving_flex_mw
+        
+        price_p25 = float(np.percentile(cost_to_serve[:24], 25))
+        load_p25 = float(np.percentile(load_forecast[:24], 25))
+        
+        if (cost_to_serve[0] <= price_p25 * 0.90 and 
+            load_forecast[0] <= load_p25 * 1.1):
+            serve_now = min(self.flex_capacity_mw - arriving_flex_mw,
+                           0.15 * backlog_mwh / max(hours_remaining, 1.0))
+            return min(self.flex_capacity_mw, arriving_flex_mw + serve_now)
+        
+        return arriving_flex_mw
+    
+    def _optimize_battery_dispatch_mpc(self,
+                                       price_forecast: np.ndarray,
+                                       load_forecast: np.ndarray,
+                                       price_uncertainty: np.ndarray,
+                                       load_ceiling: np.ndarray,
+                                       battery_soc_mwh: float,
+                                       battery_capacity_mwh: float,
+                                       flex_serve_mw: float,
+                                       firm_load_mw: float,
+                                       arriving_flex_mw: float,
+                                       backlog_mwh: float,
+                                       oldest_backlog_age_h: float) -> float:
+        
+        min_reserve = self.min_reserve_ratio * battery_capacity_mwh
+        max_soc = self.max_soc_ratio * battery_capacity_mwh
+        
+        total_load_now = firm_load_mw + flex_serve_mw
+        
+        if total_load_now > 350.0:
+            discharge_needed = min(total_load_now - 350.0, 
+                                  battery_soc_mwh - min_reserve)
+            return -min(discharge_needed, self.battery_power_rating_mw)
+        
+        hours_remaining_backlog = max(self.backlog_deadline_hours - oldest_backlog_age_h, 0.0)
+        
+        if backlog_mwh > 0 and hours_remaining_backlog > 0:
+            backlog_urgency = 1.0 - np.exp(-2.0 * oldest_backlog_age_h / self.backlog_deadline_hours)
+            price_p25 = float(np.percentile(price_forecast[:12], 25))
+            price_p75 = float(np.percentile(price_forecast[:12], 75))
+            
+            target_soc = self.target_soc_base + 0.15 * backlog_urgency
+        else:
+            backlog_urgency = 0.0
+            price_p25 = float(np.percentile(price_forecast[:12], 25))
+            price_p75 = float(np.percentile(price_forecast[:12], 75))
+            target_soc = self.target_soc_base
+        
+        target_soc_mwh = np.clip(target_soc * battery_capacity_mwh, min_reserve, max_soc)
+        
+        if battery_soc_mwh < target_soc_mwh - 10.0:
+            if price_forecast[0] <= price_p75 * 0.85:
+                charge_power = min(self.battery_power_rating_mw,
+                                 (target_soc_mwh - battery_soc_mwh) / 1.0)
+                return min(charge_power, self.battery_power_rating_mw)
+        
+        if battery_soc_mwh > target_soc_mwh + 10.0:
+            if price_forecast[0] >= price_p25 * 1.2:
+                discharge_power = min(self.battery_power_rating_mw,
+                                    (battery_soc_mwh - target_soc_mwh) / 1.0)
+                return -min(discharge_power, self.battery_power_rating_mw)
+        
+        price_next_12_min = float(np.min(price_forecast[:12]))
+        price_next_12_max = float(np.max(price_forecast[:12]))
+        
+        if price_forecast[0] > price_next_12_min * 1.15 and battery_soc_mwh > target_soc_mwh:
+            discharge_power = min(self.battery_power_rating_mw,
+                                (battery_soc_mwh - target_soc_mwh) / 1.0)
+            return -min(discharge_power, self.battery_power_rating_mw)
+        
+        if price_forecast[0] < price_next_12_max * 0.85 and battery_soc_mwh < target_soc_mwh:
+            charge_power = min(self.battery_power_rating_mw,
+                             (target_soc_mwh - battery_soc_mwh) / 1.0)
+            return min(charge_power, self.battery_power_rating_mw)
+        
+        return 0.0
+    
+    def take_action(self,
+                    hour_of_day: int,
+                    current_price: float,
+                    firm_load_mw: float,
+                    arriving_flex_mw: float,
+                    backlog_mwh: float,
+                    oldest_backlog_age_h: float,
+                    battery_soc_mwh: float,
+                    battery_capacity_mwh: float,
+                    battery_power_mw: float) -> tuple:
+        
+        self._ingest_observation(hour_of_day, current_price, firm_load_mw)
+        
+        

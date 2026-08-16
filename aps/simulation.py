@@ -159,6 +159,7 @@ def simulate(policy, series: ExogenousSeries, params: SystemParams) -> Simulatio
     costs = np.empty(T)
     eta = params.eta_leg
 
+    reasons = []
     for t in range(T):
         raw = policy.take_action(
             current_energy_stored_kwh=float(soc[t]),
@@ -168,6 +169,12 @@ def simulate(policy, series: ExogenousSeries, params: SystemParams) -> Simulatio
             current_grid_sell_price=float(series.sell_price[t]),
             battery_capacity_kwh=params.battery_capacity_kwh,
         )
+        # self-explaining contract: policies may return (action, reason)
+        if isinstance(raw, (tuple, list)):
+            reasons.append(str(raw[1])[:160] if len(raw) > 1 else "")
+            raw = raw[0]
+        else:
+            reasons.append("")
         raw = float(raw)
         if not np.isfinite(raw):
             raise ValueError(f"take_action returned non-finite value {raw!r} at t={t}")
@@ -189,6 +196,7 @@ def simulate(policy, series: ExogenousSeries, params: SystemParams) -> Simulatio
         requested_kw=requested,
         utilization_pct=float(active.mean() * 100.0),
         avg_soc_pct=float(soc.mean() / params.battery_capacity_kwh * 100.0),
+        extra={"reasons": reasons},
     )
 
 

@@ -184,6 +184,7 @@ class EpisodeState:
                 "soc_kwh": outcome.soc_kwh,
                 "actions_kw": outcome.actions_kw,
                 "cost_per_step": outcome.cost_per_step,
+                "reasons": outcome.reasons or [],
             }))
         self.last_code = code
         self.last_metrics = {

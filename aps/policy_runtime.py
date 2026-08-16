@@ -49,6 +49,7 @@ _EVAL_SCRIPT = textwrap.dedent(
         "soc_kwh": result.soc_kwh.tolist(),
         "actions_kw": result.actions_kw.tolist(),
         "cost_per_step": result.cost_per_step.tolist(),
+        "reasons": result.extra.get("reasons", []),
     }}))
     """
 )
@@ -80,6 +81,7 @@ class EvalOutcome:
     soc_kwh: list = None
     actions_kw: list = None
     cost_per_step: list = None
+    reasons: list = None
 
 
 def evaluate_policy_code(
@@ -125,4 +127,5 @@ def evaluate_policy_code(
         soc_kwh=payload["soc_kwh"],
         actions_kw=payload["actions_kw"],
         cost_per_step=payload["cost_per_step"],
+        reasons=payload.get("reasons", []),
     )

@@ -20,18 +20,26 @@ uv pip install --python .venv/bin/python numpy scipy matplotlib pandas scikit-le
 .venv/bin/python -m streamlit run app.py
 ```
 
-Seven tabs: the problem on real market data (including a zonal price map),
-two precomputed stories (a home battery in €, a 500 MW data center in $),
-how the agents talk to each other, two Live Labs that run the agentic search
-in real time, and a full-transparency tab (prompts, data, logs, verbatim
-transcripts).
+Eight tabs: the problem on a full year of real market data (zonal price map,
+hourly carbon intensity from the real fuel mix), three precomputed stories —
+a home battery in €, a 500 MW data center in $, and the flagship
+**coordination story** (a 50,000-home battery fleet and the data center
+smoothing the same demand spike: selfish herding vs a converging negotiation
+vs the coordinated bound) — how the agents talk to each other, two Live Labs
+that run the agentic search in real time (with a mid-run ⚡ demand-spike
+injector to watch the coach adapt), and a full-transparency tab (prompts,
+data, logs, verbatim transcripts). Generated strategies are
+**self-explaining**: they return a one-line reason with every action, shown
+as a per-hour decision ledger in the replays.
 
 ## Layout
 
 ```
 engine/
-  data.py           day-ahead LMP + load + fuel mix via gridstatus (NYISO open
-                    feeds; PJM adapter slot pending an API key)
+  data.py           day-ahead LMP + load + fuel mix + carbon intensity via
+                    gridstatus (NYISO open feeds; PJM adapter slot pending a key)
+  coordination.py   multi-actor scenario: price-taker LPs (herding), damped
+                    price-signal negotiation, and the joint coordinated LP
   twin.py           merit-order digital twin: isotonic supply stack + hourly
                     adjustment, out-of-sample calibration report
   scenario.py       load injection -> counterfactual prices & bill impact
@@ -50,6 +58,7 @@ experiments/
   driver.py         filesystem-based search driver, home battery
   driver2.py        filesystem-based search driver, data-center dispatch
   worker.py         LLM worker loop (Anthropic API or claude CLI)
+  inject.py         mid-run demand-spike / price-surge injector for Live Labs
   analyze.py        aggregation + summary figures
   run_engine_demo.py end-to-end scenario demo + figures + explainer
 results/            recorded runs: per-round strategies, scores, event logs,

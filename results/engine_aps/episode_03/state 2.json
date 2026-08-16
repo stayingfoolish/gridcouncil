@@ -1,0 +1,84 @@
+{
+  "lp_bound": 12019506,
+  "naive_cost": 14878858,
+  "n_iterations": 10,
+  "phase": "gen_pending",
+  "iteration": 5,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "## Suggested Improvement: Aggressive Dynamic Battery Arbitrage with Price-Threshold Charging\n\n**Core Problem Identified:** Battery utilization is critically low at 1.1%, indicating the battery charging/discharging logic is too conservative. The system is leaving significant arbitrage profit on the table.\n\n**Specific Implementation:**\n\nReplace the current battery logic (lines 76-92) with dynamic price-threshold charging:\n\n```python\n# Compute recent price statistics for dynamic thresholds\nrecent_20h = self.price_history[-20:] if len(self.price_history) >= 20 else self.price_history\nprice_20th_percentile = sorted(recent_20h)[int(len(recent_20h) * 0.2)] if recent_20h else 60.0\nprice_80th_percentile = sorted(recent_20h)[int(len(recent_20h) * 0.8)] if recent_20h else 80.0\nprice_mean = sum(recent_20h) / len(recent_20h) if recent_20h else 60.0\n\n# Aggressive charging at low prices\ntarget_soc = self.arbitrage_soc_target * battery_capacity_mwh\nif current_price < price_20th_percentile * 1.02 and soc_ratio < self.arbitrage_soc_target:\n    charge_amount = min(self.battery_charge_rate * 3.0, target_soc - battery_soc_mwh)\n    battery_mw = charge_amount\n# Aggressive discharge at high prices\nelif current_price > price_80th_percentile * 0.95 and soc_ratio > self.hedge_reserve:\n    discharge_amount = battery_power_mw * 1.5\n    available_discharge = battery_soc_mwh * (1.0 - self.hedge_reserve)\n    battery_mw = -min(discharge_amount, available_discharge)\n```\n\n**Parameter Changes:**\n- Change `arbitrage_soc_target` from 0.70 to 0.80 (more aggressive target)\n- Change `hedge_reserve` from 0.20 to 0.15 (freer discharge availability)\n- Change `battery_charge_rate` from 8 to 10 (slightly higher baseline)\n\n**Expected Impact:**\n- Battery utilization: 1.1% \u2192 15-25% (primary cost reduction driver)\n- Added system cost reduction: ~$400K-$600K annually\n- Mechanism: More frequent arbitrage captures cheap-to-peak price spreads; current thresholds are so restrictive that opportunities pass without exploitation\n- Risk mitigation: Dynamic thresholds adapt to market volatility; hedge_reserve still prevents over-discharge\n\n**Why This Specific Improvement:**\nThis directly addresses the fundamental inefficiency (low battery utilization) with minimal code changes and immediate implementability. The other parameters (serve_fraction, volatility estimation) are secondary\u2014the battery is where the profit leakage occurs.",
+  "mode": "refine",
+  "best_cost": 14098256.548312195,
+  "best_iteration": 4,
+  "last_code": "class DispatchPolicy:\n  def __init__(self):\n    self.price_history = []\n    self.flex_load_history = []\n    self.backlog_history = []\n    self.volatility_window = 72\n    self.trend_window = 48\n    self.planning_horizon = 48\n    self.arbitrage_soc_target = 0.70\n    self.hedge_reserve = 0.20\n    self.battery_charge_rate = 8\n    self.regime = None\n    self.drift_estimate = 0.0\n    self.volatility_estimate = 15.0\n    self.serve_tiers = [0.9, 0.7, 0.5, 0.2]\n    self.batch_flexibility = 4\n    self.min_urgency_serve = 0.05\n\n  def take_action(self,\n    hour_of_day: int,\n    current_price: float,\n    firm_load_mw: float,\n    arriving_flex_mw: float,\n    backlog_mwh: float,\n    oldest_backlog_age_h: float,\n    battery_soc_mwh: float,\n    battery_capacity_mwh: float,\n    battery_power_mw: float,\n  ) -> tuple:\n    self.price_history.append(current_price)\n    self.flex_load_history.append(arriving_flex_mw)\n    self.backlog_history.append(backlog_mwh)\n\n    for hist in [self.price_history, self.flex_load_history, self.backlog_history]:\n      if len(hist) > 240:\n        hist.pop(0)\n\n    if len(self.price_history) >= self.volatility_window:\n      recent_prices = self.price_history[-self.trend_window:]\n      volatility = self._compute_volatility(recent_prices)\n      drift = self._compute_drift(recent_prices)\n      self.volatility_estimate = 0.8 * self.volatility_estimate + 0.2 * volatility\n      self.drift_estimate = 0.8 * self.drift_estimate + 0.2 * drift\n\n      if self.drift_estimate > 2.0:\n        self.regime = 'trending_up'\n      elif self.drift_estimate < -2.0:\n        self.regime = 'trending_down'\n      elif self.volatility_estimate > 25.0:\n        self.regime = 'volatile'\n      else:\n        self.regime = 'stable'\n\n    predicted_prices = self._forecast_prices_regime_aware(self.planning_horizon)\n    arbitrage_windows = self._find_arbitrage_windows(predicted_prices)\n    next_cheap_window = arbitrage_windows[0] if arbitrage_windows else None\n    next_peak = self._find_next_peak(predicted_prices)\n\n    soc_ratio = battery_soc_mwh / max(1.0, battery_capacity_mwh)\n    battery_mw = 0.0\n\n    if next_cheap_window:\n      hours_until_cheap = next_cheap_window['hours_until']\n      if hours_until_cheap > 0 and hours_until_cheap <= 6:\n        target_soc = self.arbitrage_soc_target * battery_capacity_mwh\n        if soc_ratio < self.arbitrage_soc_target and current_price < next_cheap_window['price'] * 1.1:\n          charge_amount = min(\n            self.battery_charge_rate * 2.0,\n            target_soc - battery_soc_mwh\n          )\n          battery_mw = charge_amount\n\n    if battery_mw == 0.0:\n      if next_peak and next_peak['hours_until'] > 2 and next_peak['hours_until'] <= 8:\n        if soc_ratio > 0.5:\n          discharge_amount = battery_power_mw * 1.2\n          available_discharge = battery_soc_mwh * (1.0 - self.hedge_reserve)\n          battery_mw = -min(discharge_amount, available_discharge)\n\n    hours_until_deadline = 24.0 - oldest_backlog_age_h\n    serve_fraction = 0.0\n\n    if hours_until_deadline < 2:\n      serve_fraction = 1.0\n    elif hours_until_deadline < 6:\n      price_factor = min(1.0, (current_price / (sum(predicted_prices) / len(predicted_prices) if predicted_prices else 60)))\n      serve_fraction = 0.6 + 0.35 * (1.0 - price_factor)\n    else:\n      min_forecast_price = min(predicted_prices) if predicted_prices else current_price\n      price_proximity = (current_price - min_forecast_price) / max(1.0, min_forecast_price)\n\n      if price_proximity < 0.05:\n        serve_fraction = self.serve_tiers[0]\n      elif price_proximity < 0.10:\n        serve_fraction = self.serve_tiers[1]\n      elif price_proximity < 0.20:\n        serve_fraction = self.serve_tiers[2]\n      else:\n        serve_fraction = self.serve_tiers[3]\n\n    if battery_mw < 0 or (next_peak and next_peak['hours_until'] < 4):\n      serve_fraction = min(1.0, serve_fraction * 1.3)\n\n    new_flex_mw = arriving_flex_mw * serve_fraction\n    backlog_portion = max(0.0, backlog_mwh / max(1.0, hours_until_deadline)) * 0.8\n    flex_serve_mw = min(arriving_flex_mw + backlog_mwh, new_flex_mw + backlog_portion)\n    flex_serve_mw = max(flex_serve_mw, self.min_urgency_serve * arriving_flex_mw)\n\n    return flex_serve_mw, battery_mw\n\n  def _compute_volatility(self, prices):\n    if len(prices) < 2:\n      return 0.0\n    changes = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]\n    return sum(changes) / len(changes)\n\n  def _compute_drift(self, prices):\n    if len(prices) < 2:\n      return 0.0\n    recent = prices[-24:]\n    if len(recent) < 2:\n      return 0.0\n    return (recent[-1] - recent[0]) / len(recent)\n\n  def _forecast_prices_regime_aware(self, window_hours):\n    if len(self.price_history) < 48:\n      return [60.0] * window_hours\n\n    recent_prices = self.price_history[-48:]\n    base_forecast = sum(recent_prices) / len(recent_prices)\n\n    if self.regime == 'trending_up':\n      adjustment = 1.0 + (self.drift_estimate / base_forecast)\n    elif self.regime == 'trending_down':\n      adjustment = 1.0 - (abs(self.drift_estimate) / base_forecast)\n    elif self.regime == 'volatile':\n      adjustment = 1.0\n    else:\n      adjustment = 1.0\n\n    forecast = []\n    for h in range(window_hours):\n      hour_of_forecast = (len(self.price_history) + h) % 24\n      seasonal_factor = 1.0 + 0.15 * (0.5 if hour_of_forecast in [16, 17, 18, 19] else -0.3)\n      predicted = base_forecast * adjustment * seasonal_factor\n      forecast.append(predicted)\n\n    return forecast\n\n  def _find_arbitrage_windows(self, predicted_prices):\n    windows = []\n    min_price = min(predicted_prices) if predicted_prices else 60.0\n\n    for i, price in enumerate(predicted_prices):\n      if price <= min_price * 1.05:\n        windows.append({\n          'hours_until': i,\n          'price': price,\n          'duration': self._window_duration(predicted_prices, i)\n        })\n\n    return sorted(windows, key=lambda w: w['hours_until'])\n\n  def _find_next_peak(self, predicted_prices):\n    if len(predicted_prices) < 2:\n      return None\n\n    avg_price = sum(predicted_prices) / len(predicted_prices)\n    for i, price in enumerate(predicted_prices[1:], 1):\n      if price > avg_price * 1.2:\n        return {\n          'hours_until': i,\n          'price': price\n        }\n\n    return None\n\n  def _window_duration(self, prices, start_index):\n    min_price = min(prices) if prices else 60.0\n    duration = 0\n    for i in range(start_index, len(prices)):\n      if prices[i] <= min_price * 1.08:\n        duration += 1\n      else:\n        break\n    return duration\n",
+  "last_metrics": {
+    "energy_cost": 14537429.108572112,
+    "peak_price_delta": 196.23854545454537,
+    "forced_mwh": 0.0,
+    "battery_util_pct": 1.1111111111111112
+  },
+  "cost_history": [
+    14311795.212897912,
+    14591512.875959652,
+    14540259.770302925,
+    14596146.821364993,
+    14098256.548312195
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "system_cost_delta": 14311795.212897912,
+      "energy_cost": 14902973.863148987,
+      "peak_price_delta": 196.23854545454537,
+      "forced_mwh": 39625.0,
+      "battery_util_pct": 24.72222222222222,
+      "repair_attempts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "system_cost_delta": 14591512.875959652,
+      "energy_cost": 15418561.272203356,
+      "peak_price_delta": 209.8445454545454,
+      "forced_mwh": 9375.0,
+      "battery_util_pct": 5.277777777777778,
+      "repair_attempts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "system_cost_delta": 14540259.770302925,
+      "energy_cost": 15290217.22820342,
+      "peak_price_delta": 196.23854545454537,
+      "forced_mwh": 0.0,
+      "battery_util_pct": 19.444444444444446,
+      "repair_attempts": 0,
+      "mode": "explore",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "system_cost_delta": 14596146.821364993,
+      "energy_cost": 15302111.68190586,
+      "peak_price_delta": 196.23854545454537,
+      "forced_mwh": 0.0,
+      "battery_util_pct": 3.6111111111111107,
+      "repair_attempts": 1,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "system_cost_delta": 14098256.548312195,
+      "energy_cost": 14537429.108572112,
+      "peak_price_delta": 196.23854545454537,
+      "forced_mwh": 0.0,
+      "battery_util_pct": 1.1111111111111112,
+      "repair_attempts": 1,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    }
+  ]
+}

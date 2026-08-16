@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "# Novel Battery Management Strategy: Dynamic Multi-Horizon Arbitrage with Predictive State Management\n\n## Analysis of Current Implementation Limitations\n\n**Strengths:**\n- Proper SOC boundary enforcement prevents system damage\n- Momentum-based trend detection captures price directionality\n- Reactive PV integration handles local generation\n\n**Critical Limitations:**\n1. **Weak Price Prediction:** 4-hour historical window insufficient for volatile markets; momentum dampening (0.6x) is too conservative\n2. **Low Battery Utilization (26.8%):** System over-prioritizes safety margins; min/max targets (0.05/0.95) leave 10% unutilized\n3. **Single-Horizon Decision Making:** Only compares current vs. immediate future; misses multi-step arbitrage opportunities\n4. **Inelastic Confidence Scaling:** Momentum confidence caps at 0.15 threshold; doesn't adapt to market volatility (10.1 is high)\n5. **Stagnation Pattern:** Recent costs [10.22, 10.22, 8.41, 34.65, 3.27] show oscillation; algorithm lacks learning persistence\n\n## Proposed Approach: Kalman-Filter Driven Predictive State Management\n\nInstead of reactive arbitrage, implement **three-horizon lookahead with state prediction confidence adjustment**.\n\n### New Implementation\n\n```python\nclass Policy:\n  def __init__(self):\n    self.price_history = []\n    self.extended_history_len = 48  # Extended to 48 hours for pattern recognition\n    self.volatility_window = 12\n\n    # Aggressive SOC targets (higher utilization)\n    self.min_soc_target = 0.02\n    self.max_soc_target = 0.98\n\n    self.max_charge_power = 15.0\n    self.max_discharge_power = 12.0\n\n    # Kalman filter state for price prediction\n    self.price_estimate = None\n    self.price_variance = 1.0  # Confidence in estimate\n    self.process_noise = 0.05  # Volatility adaptation\n    self.measurement_noise = 0.1\n\n    # Multi-horizon predictions\n    self.horizon_prices = [None] * 3  # 1-step, 2-step, 3-step ahead\n\n    # Action inertia for stability\n    self.last_action = 0.0\n    self.action_inertia = 0.4\n\n    # Volatility-adaptive parameters\n    self.current_volatility = 0.0\n\n  def calculate_volatility(self, price_history):\n    if len(price_history) < self.volatility_window:\n      return 0.05\n    recent = price_history[-self.volatility_window:]\n    mean = sum(recent) / len(recent)\n    variance = sum((p - mean) ** 2 for p in recent) / len(recent)\n    return (variance ** 0.5) / (mean + 0.001)\n\n  def kalman_predict(self, current_price):\n    if self.price_estimate is None:\n      self.price_estimate = current_price\n      return current_price\n\n    # Predict\n    predicted = self.price_estimate\n    predicted_variance = self.price_variance + self.process_noise\n\n    # Update with measurement\n    kalman_gain = predicted_variance / (predicted_variance + self.measurement_noise)\n    self.price_estimate = predicted + kalman_gain * (current_price - predicted)\n    self.price_variance = (1 - kalman_gain) * predicted_variance\n\n    return self.price_estimate\n\n  def multi_horizon_predict(self, price_history, current_price):\n    self.current_volatility = self.calculate_volatility(price_history)\n\n    # Kalman filter for current estimate\n    filtered_price = self.kalman_predict(current_price)\n\n    if len(price_history) < 8:\n      self.horizon_prices = [current_price, current_price, current_price]\n      return self.horizon_prices\n\n    # Calculate trend from last 8 prices\n    recent = price_history[-8:]\n    trend = (sum(recent[-4:]) - sum(recent[:4])) / (4 * (sum(recent) / len(recent) + 0.001))\n\n    # Multi-step prediction with volatility damping\n    volatility_factor = min(self.current_volatility * 2, 0.4)\n\n    self.horizon_prices[0] = filtered_price + trend * 0.8\n    self.horizon_prices[1] = self.horizon_prices[0] + trend * 0.5 * (1 - volatility_factor * 0.5)\n    self.horizon_prices[2] = self.horizon_prices[1] + trend * 0.3 * (1 - volatility_factor)\n\n    return self.horizon_prices\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > self.extended_history_len:\n      self.price_history.pop(0)\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh\n    h1, h2, h3 = self.multi_horizon_predict(self.price_history, current_grid_buy_price)\n\n    action_kw = 0.0\n\n    # Volatility-adaptive confidence\n    confidence_multiplier = 1.0 + self.current_volatility * 3.0\n\n    # Strategy 1: Charge if we expect consistent price rise over horizons\n    if h1 > current_grid_buy_price and h2 > h1 and h3 > h2:\n      margin_h1 = (h1 - current_grid_buy_price) / (current_grid_buy_price + 0.001)\n      if margin_h1 > 0.015:\n        available = battery_capacity_kwh - current_energy_stored_kwh\n        if available > 0.1:\n          soc_headroom = (self.max_soc_target - current_soc) / (self.max_soc_target - self.min_soc_target + 0.001)\n          power_scaling = 0.7 + confidence_multiplier * 0.35 + soc_headroom * 0.4\n          action_kw = min(self.max_charge_power * power_scaling, available)\n\n    # Strategy 2: Discharge if we expect consistent price drop\n    elif h1 < current_grid_sell_price and h2 < h1 and h3 < h2:\n      margin_h1 = (current_grid_sell_price - h1) / (h1 + 0.001)\n      if margin_h1 > 0.015:\n        available = current_energy_stored_kwh\n        if available > 0.1:\n          soc_position = (current_soc - self.min_soc_target) / (self.max_soc_target - self.min_soc_target + 0.001)\n          power_scaling = 0.7 + confidence_multiplier * 0.35 + soc_position * 0.4\n          action_kw = -min(self.max_discharge_power * power_scaling, available)\n\n    # Strategy 3: Aggressive spread arbitrage on divergence\n    elif (h1 - current_grid_buy_price) > 0.08 and current_soc < 0.7:\n      available = battery_capacity_kwh - current_energy_stored_kwh\n      if available > 0.1:\n        action_kw = min(self.max_charge_power * 0.9, available)\n\n    # Strategy 4: PV capture with opportunistic export\n    else:\n      pv_excess = current_pv_generation_kw - current_demand_kw\n      if pv_excess > 0.3 and current_soc < self.max_soc_target - 0.05:\n        action_kw = min(pv_excess * 0.85, self.max_charge_power * 0.3,\n                       battery_capacity_kwh - current_energy_stored_kwh)\n      elif pv_excess < -0.3 and current_soc > self.min_soc_target + 0.05:\n        action_kw = -min(abs(pv_excess) * 0.75, self.max_discharge_power * 0.3,\n                        current_energy_stored_kwh)\n\n    # Apply inertia to smooth oscillations\n    action_kw = action_kw * (1 - self.action_inertia) + self.last_action * self.action_inertia\n    self.last_action = action_kw\n\n    # Enforce hard boundaries\n    new_soc = current_energy_stored_kwh + action_kw\n    if new_soc > battery_capacity_kwh:\n      action_kw = battery_capacity_kwh - current_energy_stored_kwh\n    elif new_soc < 0:\n      action_kw = -current_energy_stored_kwh\n\n    return action_kw\n```\n\n## Key Parameter Changes & Rationale\n\n| Parameter | Old | New | Rationale |\n|-----------|-----|-----|-----------|\n| extended_history_len | 24 | 48 | Capture daily patterns in volatile markets |\n| min_soc_target | 0.05 | 0.02 | Increase usable capacity by 3% |\n| max_soc_target | 0.95 | 0.98 | Increase usable capacity by 3% |\n| arbitrage_margin | 0.02 | 0.015 | Capture more marginal opportunities |\n| price_variance (Kalman) | N/A | 1.0 | Adaptive confidence tracking |\n| action_inertia | N/A | 0.4 | Dampen oscillation cycles |\n| confidence_multiplier | Fixed 0.3 | 1.0 + vol*3 | Scale with market volatility |\n\n## Expected Impact\n\n**Cost Reduction Mechanism:**\n- Current best: -5.97; Target: -8.5 to -10.2 (40-70% improvement)\n- Battery utilization: 26.8% \u2192 65%+ (6x increase in arbitrage volume)\n- Stagnation elimination: Horizon prediction prevents repeating failed patterns\n\n**Behavioral Improvements:**\n1. **Price Momentum Capture:** 3-step lookahead catches sustained trends (currently missing)\n2. **Volatility Adaptation:** Kalman filter confidence adjusts aggressively to market changes\n3. **Oscillation Damping:** Inertia prevents flip-flopping between charge/discharge\n4. **Margin Expansion:** Reduced minimum arbitrage margin catches 1.5-3% spreads missed by conservative 2% threshold\n\n**Risk Mitigation:**\n- Maintains hard SOC boundaries for battery health\n- Volatility multiplier prevents overcommitment in uncertain markets\n- Action inertia provides natural low-pass filtering against noise\n\n## Implementation Priority\n\n**Phase 1 (Immediate):** Deploy Kalman filter + multi-horizon prediction; adjust margins to 0.015\n**Phase 2 (Iteration 12+):** Tune volatility_factor exponent (currently 2.0) based on observed spread widths\n**Phase 3 (Iteration 15+):** Add time-of-day weighting (peak vs. off-peak charging patterns)",
+  "mode": "explore",
+  "best_cost": -5.969724794958003,
+  "best_iteration": 1,
+  "last_code": "class Policy:\n  def __init__(self):\n    self.price_history = []\n    self.extended_history_len = 48\n    self.volatility_window = 12\n\n    self.min_soc_target = 0.02\n    self.max_soc_target = 0.98\n\n    self.max_charge_power = 15.0\n    self.max_discharge_power = 12.0\n\n    self.price_estimate = None\n    self.price_variance = 1.0\n    self.process_noise = 0.05\n    self.measurement_noise = 0.1\n\n    self.horizon_prices = [None] * 3\n\n    self.last_action = 0.0\n    self.action_inertia = 0.4\n\n    self.current_volatility = 0.0\n\n  def calculate_volatility(self, price_history):\n    if len(price_history) < self.volatility_window:\n      return 0.05\n    recent = price_history[-self.volatility_window:]\n    mean = sum(recent) / len(recent)\n    variance = sum((p - mean) ** 2 for p in recent) / len(recent)\n    return (variance ** 0.5) / (mean + 0.001)\n\n  def kalman_predict(self, current_price):\n    if self.price_estimate is None:\n      self.price_estimate = current_price\n      return current_price\n\n    predicted = self.price_estimate\n    predicted_variance = self.price_variance + self.process_noise\n\n    kalman_gain = predicted_variance / (predicted_variance + self.measurement_noise)\n    self.price_estimate = predicted + kalman_gain * (current_price - predicted)\n    self.price_variance = (1 - kalman_gain) * predicted_variance\n\n    return self.price_estimate\n\n  def multi_horizon_predict(self, price_history, current_price):\n    self.current_volatility = self.calculate_volatility(price_history)\n\n    filtered_price = self.kalman_predict(current_price)\n\n    if len(price_history) < 8:\n      self.horizon_prices = [current_price, current_price, current_price]\n      return self.horizon_prices\n\n    recent = price_history[-8:]\n    trend = (sum(recent[-4:]) - sum(recent[:4])) / (4 * (sum(recent) / len(recent) + 0.001))\n\n    volatility_factor = min(self.current_volatility * 2, 0.4)\n\n    self.horizon_prices[0] = filtered_price + trend * 0.8\n    self.horizon_prices[1] = self.horizon_prices[0] + trend * 0.5 * (1 - volatility_factor * 0.5)\n    self.horizon_prices[2] = self.horizon_prices[1] + trend * 0.3 * (1 - volatility_factor)\n\n    return self.horizon_prices\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > self.extended_history_len:\n      self.price_history.pop(0)\n\n    current_soc = current_energy_stored_kwh / battery_capacity_kwh\n    h1, h2, h3 = self.multi_horizon_predict(self.price_history, current_grid_buy_price)\n\n    action_kw = 0.0\n\n    confidence_multiplier = 1.0 + self.current_volatility * 3.0\n\n    if h1 > current_grid_buy_price and h2 > h1 and h3 > h2:\n      margin_h1 = (h1 - current_grid_buy_price) / (current_grid_buy_price + 0.001)\n      if margin_h1 > 0.015:\n        available = battery_capacity_kwh - current_energy_stored_kwh\n        if available > 0.1:\n          soc_headroom = (self.max_soc_target - current_soc) / (self.max_soc_target - self.min_soc_target + 0.001)\n          power_scaling = 0.7 + confidence_multiplier * 0.35 + soc_headroom * 0.4\n          action_kw = min(self.max_charge_power * power_scaling, available)\n\n    elif h1 < current_grid_sell_price and h2 < h1 and h3 < h2:\n      margin_h1 = (current_grid_sell_price - h1) / (h1 + 0.001)\n      if margin_h1 > 0.015:\n        available = current_energy_stored_kwh\n        if available > 0.1:\n          soc_position = (current_soc - self.min_soc_target) / (self.max_soc_target - self.min_soc_target + 0.001)\n          power_scaling = 0.7 + confidence_multiplier * 0.35 + soc_position * 0.4\n          action_kw = -min(self.max_discharge_power * power_scaling, available)\n\n    elif (h1 - current_grid_buy_price) > 0.08 and current_soc < 0.7:\n      available = battery_capacity_kwh - current_energy_stored_kwh\n      if available > 0.1:\n        action_kw = min(self.max_charge_power * 0.9, available)\n\n    else:\n      pv_excess = current_pv_generation_kw - current_demand_kw\n      if pv_excess > 0.3 and current_soc < self.max_soc_target - 0.05:\n        action_kw = min(pv_excess * 0.85, self.max_charge_power * 0.3,\n                       battery_capacity_kwh - current_energy_stored_kwh)\n      elif pv_excess < -0.3 and current_soc > self.min_soc_target + 0.05:\n        action_kw = -min(abs(pv_excess) * 0.75, self.max_discharge_power * 0.3,\n                        current_energy_stored_kwh)\n\n    action_kw = action_kw * (1 - self.action_inertia) + self.last_action * self.action_inertia\n    self.last_action = action_kw\n\n    new_soc = current_energy_stored_kwh + action_kw\n    if new_soc > battery_capacity_kwh:\n      action_kw = battery_capacity_kwh - current_energy_stored_kwh\n    elif new_soc < 0:\n      action_kw = -current_energy_stored_kwh\n\n    return action_kw\n",
+  "last_metrics": {
+    "utilization_pct": 51.78571428571429,
+    "avg_soc_pct": 93.81738845360645
+  },
+  "cost_history": [
+    9.333247801052517,
+    -5.969724794958003,
+    8.901047668924654,
+    35.88390279641321,
+    10.220634755508168,
+    10.220634755508168,
+    8.413867093128294,
+    34.64507929097502,
+    3.2700917625396957,
+    15.069394304042236
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": 9.333247801052517,
+      "utilization_pct": 5.952380952380952,
+      "avg_soc_pct": 14.519145679456885,
+      "runtime_s": 0.0005316669121384621,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": -5.969724794958003,
+      "utilization_pct": 86.90476190476191,
+      "avg_soc_pct": 52.66038088030872,
+      "runtime_s": 0.000512958038598299,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": 8.901047668924654,
+      "utilization_pct": 6.547619047619048,
+      "avg_soc_pct": 3.8518410298001364,
+      "runtime_s": 0.0005044578574597836,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": 35.88390279641321,
+      "utilization_pct": 88.69047619047619,
+      "avg_soc_pct": 70.24209675562024,
+      "runtime_s": 0.0005980408750474453,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 10.220634755508168,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 0.2958579881656805,
+      "runtime_s": 0.0007344167679548264,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 10.220634755508168,
+      "utilization_pct": 0.5952380952380952,
+      "avg_soc_pct": 0.2958579881656805,
+      "runtime_s": 0.0013265418820083141,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 8.413867093128294,
+      "utilization_pct": 29.761904761904763,
+      "avg_soc_pct": 73.54443688341851,
+      "runtime_s": 0.0007259580306708813,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 34.64507929097502,
+      "utilization_pct": 51.78571428571429,
+      "avg_soc_pct": 61.749397378762424,
+      "runtime_s": 0.0008240002207458019,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 3.2700917625396957,
+      "utilization_pct": 26.785714285714285,
+      "avg_soc_pct": 69.75407966692771,
+      "runtime_s": 0.0005450001917779446,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 15.069394304042236,
+      "utilization_pct": 51.78571428571429,
+      "avg_soc_pct": 93.81738845360645,
+      "runtime_s": 0.0008495422080159187,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}

@@ -1,0 +1,141 @@
+{
+  "n_iterations": 10,
+  "phase": "done",
+  "iteration": 10,
+  "repair_attempts": 0,
+  "restarts": 0,
+  "task_description": "NOVEL BATTERY MANAGEMENT STRATEGY: MEAN-REVERSION + MARGIN ARBITRAGE\n\n====================\nCURRENT IMPLEMENTATION ANALYSIS\n====================\n\nSTRENGTHS:\n1. Adaptive learning mechanism that adjusts thresholds based on recent successes\n2. Percentile-based approach is robust to absolute price changes\n3. Safety guardrails prevent dangerous battery states\n4. Considers multiple decision signals (price, SOC, demand response)\n\nCRITICAL LIMITATIONS CAUSING STAGNATION:\n1. UNDER-UTILIZATION (21.4% utilization, 81.4% avg SOC): Battery sits mostly charged, missing profit opportunities. The high SOC indicates insufficient discharge activity.\n2. THRESHOLD TRAPS: Adaptive thresholds (0.50 charge, 0.65 discharge) may converge to conservative values that discourage action. The 0.15 adaptation rate allows drift without recovery.\n3. PERCENTILE BLINDNESS: Purely percentile-based decisions ignore absolute price spreads. A price could be at 60th percentile but still represent a huge profit opportunity if sell price is 40% higher.\n4. WEAK MARGIN SIGNALS: Demand response is tertiary and conditional on sell_price > 0. Should be primary driver when buy-sell spreads are large.\n5. SMALL LEARNING WINDOW: 20-action window creates noisy learning. Best cost (-6.04) suggests the system once worked but lost it through noise or drift.\n6. REACTIVE ONLY: No anticipation of price trends or volatility patterns.\n\n====================\nNOVEL STRATEGY: MEAN-REVERSION + MARGIN ARBITRAGE\n====================\n\nCore Insight: Instead of relative percentile thinking, use ABSOLUTE deviation from rolling mean combined with BUY-SELL SPREAD ARBITRAGE.\n\nKey Principles:\n1. Keep battery in flexible middle range (35-65% SOC) not at 81%\n2. Trade aggressively when price deviates from mean (mean-reversion trades)\n3. Trade opportunistically when buy-sell spread is wide (arbitrage margin)\n4. Scale action intensity with volatility - high volatility = more aggressive\n5. Use larger learning window (50 actions) to stabilize learning\n\n====================\nIMPLEMENTATION\n====================\n\nclass Policy:\n  def __init__(self):\n    self.price_history = []\n    self.action_history = []\n    self.performance_window = 50  # Increased from 20 for stability\n    self.adaptation_rate = 0.08   # Decreased from 0.15 to prevent drift\n\n    # Mean-reversion trading thresholds (standard deviations from mean)\n    self.charge_std_threshold = 0.75    # Buy when price \u2264 0.75 std below mean\n    self.discharge_std_threshold = 0.95 # Sell when price \u2265 0.95 std above mean\n    self.min_profitable_margin = 0.06   # Arbitrage when spread > 6% of mean\n\n    # Aggressive action sizing (currently 80% and limited by space/soc)\n    self.base_charge_rate = 0.85        # Use 85% of MAX_CHARGE capacity\n    self.base_discharge_rate = 0.90     # Use 90% of MAX_DISCHARGE capacity\n\n    # SOC management: keep battery in active trading zone\n    self.soc_target_low = 0.35          # Don't let battery drop below this\n    self.soc_target_high = 0.70         # Don't let battery sit above this\n    self.min_action_kw = 0.08           # Lower threshold enables more trades\n\n  def get_price_statistics(self, price_history, window=35):\n    \"\"\"Calculate mean and standard deviation of recent prices\"\"\"\n    if len(price_history) < window:\n      recent = price_history[-10:] if len(price_history) >= 10 else price_history\n    else:\n      recent = price_history[-window:]\n\n    if len(recent) < 2:\n      return price_history[-1] if price_history else 0, 0.01\n\n    mean = sum(recent) / len(recent)\n    variance = sum((p - mean) ** 2 for p in recent) / len(recent)\n    std_dev = max(variance ** 0.5, 0.01)  # Avoid division by zero\n    return mean, std_dev\n\n  def get_volatility_multiplier(self, std_dev, mean):\n    \"\"\"Scale action size based on volatility - higher volatility = more opportunity\"\"\"\n    if mean < 0.01:\n      return 1.0\n    coefficient_of_variation = std_dev / mean\n    # When CV > 10% (high volatility), boost aggression up to 1.4x\n    volatility_boost = min(coefficient_of_variation * 3.5, 0.4)\n    return 1.0 + volatility_boost\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    MAX_CHARGE = 10.0\n    MAX_DISCHARGE = 8.0\n\n    soc = current_energy_stored_kwh / battery_capacity_kwh\n\n    # Critical safety guardrails\n    if soc < 0.05:\n      return min(MAX_CHARGE, battery_capacity_kwh - current_energy_stored_kwh)\n    if soc > 0.95:\n      return -min(MAX_DISCHARGE, current_energy_stored_kwh)\n\n    # Track price history\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > 96:\n      self.price_history.pop(0)\n\n    # Get current price statistics\n    buy_mean, buy_std = self.get_price_statistics(self.price_history, window=35)\n\n    # Normalize price deviations\n    buy_deviation = (current_grid_buy_price - buy_mean) / (buy_std + 0.001)\n    sell_deviation = (current_grid_sell_price - buy_mean) / (buy_std + 0.001)\n\n    # Calculate profit margin\n    margin_percentage = (current_grid_sell_price - current_grid_buy_price) / (buy_mean + 0.001)\n    volatility_multiplier = self.get_volatility_multiplier(buy_std, buy_mean)\n\n    action = 0.0\n\n    # PRIMARY STRATEGY: MEAN-REVERSION TRADING\n    # Buy when price is significantly below its rolling mean\n    if buy_deviation < -self.charge_std_threshold and soc < 0.85:\n      space = battery_capacity_kwh - current_energy_stored_kwh\n      # Intensity based on how far below mean (higher deviation = more aggressive)\n      intensity = min(1.0, abs(buy_deviation) / 2.5)\n      charge = MAX_CHARGE * self.base_charge_rate * intensity * volatility_multiplier\n      charge = min(charge, space)\n      if charge > self.min_action_kw:\n        action = charge\n\n    # Sell when price is significantly above its rolling mean\n    elif sell_deviation > self.discharge_std_threshold and soc > 0.15:\n      intensity = min(1.0, abs(sell_deviation) / 2.5)\n      discharge = MAX_DISCHARGE * self.base_discharge_rate * intensity * volatility_multiplier\n      discharge = min(discharge, current_energy_stored_kwh)\n      if discharge > self.min_action_kw:\n        action = -discharge\n\n    # SECONDARY STRATEGY: MARGIN ARBITRAGE (when deviation signals are weak)\n    # This captures trades when buy-sell spread widens, regardless of absolute levels\n    elif margin_percentage > self.min_profitable_margin and abs(buy_deviation) < 1.0:\n      margin_intensity = min(1.0, margin_percentage / 0.15)  # Normalize to 15% spread\n\n      if soc < self.soc_target_high and current_grid_buy_price < buy_mean * 1.05:\n        # Buy cheaply when we have sell upside\n        space = battery_capacity_kwh - current_energy_stored_kwh\n        charge = MAX_CHARGE * 0.50 * margin_intensity * (0.5 + volatility_multiplier * 0.3)\n        charge = min(charge, space)\n        if charge > self.min_action_kw:\n          action = charge\n\n      elif soc > self.soc_target_low and current_grid_sell_price > buy_mean * 0.95:\n        # Sell at premium when we have cheap entry\n        discharge = MAX_DISCHARGE * 0.50 * margin_intensity * (0.5 + volatility_multiplier * 0.3)\n        discharge = min(discharge, current_energy_stored_kwh)\n        if discharge > self.min_action_kw:\n          action = -discharge\n\n    # TERTIARY: DEMAND RESPONSE with SOC management\n    elif current_demand_kw > current_pv_generation_kw + 2.0 and soc > 0.28:\n      if soc > self.soc_target_high:\n        discharge = min(MAX_DISCHARGE * 0.35, current_energy_stored_kwh)\n        if discharge > self.min_action_kw:\n          action = -discharge\n\n    # Record action\n    action_record = {\n      'action': action,\n      'soc': soc,\n      'buy_price': current_grid_buy_price,\n      'sell_price': current_grid_sell_price,\n      'buy_deviation': buy_deviation,\n      'margin': margin_percentage,\n      'timestamp': len(self.price_history)\n    }\n    self.action_history.append(action_record)\n    if len(self.action_history) > self.performance_window * 3:\n      self.action_history.pop(0)\n\n    return action\n\n\n====================\nEXPECTED IMPACT\n====================\n\nCOST IMPROVEMENT:\n- Current cost: 25.06 \u2192 Projected: 8-12 range (first 2-3 iterations)\n- Best possible: Should recover toward -6.04 range within 5-7 iterations\n- Why: Mean-reversion is mathematically sound for oscillating prices. Margin arbitrage captures riskless spread trades.\n\nUTILIZATION:\n- Battery utilization: 21.4% \u2192 55-65% (more frequent, smaller trades)\n- Average SOC: 81.4% \u2192 48-52% (battery in active zone, not sitting)\n- This means more trades, more opportunities to profit\n\nBEHAVIOR CHANGES:\n1. Battery will cycle 3-4x more frequently (every 6-8 hours vs 20+ hours currently)\n2. Trades will be smaller in magnitude but more numerous (better risk distribution)\n3. Strategy responds to volatility - profitable in high-volatility periods\n4. Margin trades create \"free options\" when spreads widen\n\nPARAMETERS TO MONITOR:\n- If cost doesn't improve after 3 iterations: reduce charge/discharge rates from 0.85/0.90 to 0.70/0.75\n- If battery sits below 35% SOC consistently: lower charge_std_threshold to 0.60\n- If utilizing margin trades well: gradually increase min_profitable_margin from 0.06 to 0.08\n- If high volatility environment (CV > 15%): volatility_multiplier can safely reach 1.5-1.6x\n\nCONCRETE FIRST STEPS:\n1. Deploy with default parameters (no manual tuning)\n2. Run 3-5 iterations; expect cost reduction to single digits\n3. Verify battery SOC moving into 35-70% range instead of staying at 81%\n4. Monitor margin_percentage trades - should become 30-40% of total actions",
+  "mode": "explore",
+  "best_cost": -6.044736254386303,
+  "best_iteration": 0,
+  "last_code": "class Policy:\n  def __init__(self):\n    self.price_history = []\n    self.action_history = []\n    self.performance_window = 50  # Increased from 20 for stability\n    self.adaptation_rate = 0.08   # Decreased from 0.15 to prevent drift\n\n    # Mean-reversion trading thresholds (standard deviations from mean)\n    self.charge_std_threshold = 0.75    # Buy when price \u2264 0.75 std below mean\n    self.discharge_std_threshold = 0.95 # Sell when price \u2265 0.95 std above mean\n    self.min_profitable_margin = 0.06   # Arbitrage when spread > 6% of mean\n\n    # Aggressive action sizing (currently 80% and limited by space/soc)\n    self.base_charge_rate = 0.85        # Use 85% of MAX_CHARGE capacity\n    self.base_discharge_rate = 0.90     # Use 90% of MAX_DISCHARGE capacity\n\n    # SOC management: keep battery in active trading zone\n    self.soc_target_low = 0.35          # Don't let battery drop below this\n    self.soc_target_high = 0.70         # Don't let battery sit above this\n    self.min_action_kw = 0.08           # Lower threshold enables more trades\n\n  def get_price_statistics(self, price_history, window=35):\n    \"\"\"Calculate mean and standard deviation of recent prices\"\"\"\n    if len(price_history) < window:\n      recent = price_history[-10:] if len(price_history) >= 10 else price_history\n    else:\n      recent = price_history[-window:]\n\n    if len(recent) < 2:\n      return price_history[-1] if price_history else 0, 0.01\n\n    mean = sum(recent) / len(recent)\n    variance = sum((p - mean) ** 2 for p in recent) / len(recent)\n    std_dev = max(variance ** 0.5, 0.01)  # Avoid division by zero\n    return mean, std_dev\n\n  def get_volatility_multiplier(self, std_dev, mean):\n    \"\"\"Scale action size based on volatility - higher volatility = more opportunity\"\"\"\n    if mean < 0.01:\n      return 1.0\n    coefficient_of_variation = std_dev / mean\n    # When CV > 10% (high volatility), boost aggression up to 1.4x\n    volatility_boost = min(coefficient_of_variation * 3.5, 0.4)\n    return 1.0 + volatility_boost\n\n  def take_action(self,\n    current_energy_stored_kwh: float,\n    current_pv_generation_kw: float,\n    current_demand_kw: float,\n    current_grid_buy_price: float,\n    current_grid_sell_price: float,\n    battery_capacity_kwh: float,\n  ) -> float:\n\n    MAX_CHARGE = 10.0\n    MAX_DISCHARGE = 8.0\n\n    soc = current_energy_stored_kwh / battery_capacity_kwh\n\n    # Critical safety guardrails\n    if soc < 0.05:\n      return min(MAX_CHARGE, battery_capacity_kwh - current_energy_stored_kwh)\n    if soc > 0.95:\n      return -min(MAX_DISCHARGE, current_energy_stored_kwh)\n\n    # Track price history\n    self.price_history.append(current_grid_buy_price)\n    if len(self.price_history) > 96:\n      self.price_history.pop(0)\n\n    # Get current price statistics\n    buy_mean, buy_std = self.get_price_statistics(self.price_history, window=35)\n\n    # Normalize price deviations\n    buy_deviation = (current_grid_buy_price - buy_mean) / (buy_std + 0.001)\n    sell_deviation = (current_grid_sell_price - buy_mean) / (buy_std + 0.001)\n\n    # Calculate profit margin\n    margin_percentage = (current_grid_sell_price - current_grid_buy_price) / (buy_mean + 0.001)\n    volatility_multiplier = self.get_volatility_multiplier(buy_std, buy_mean)\n\n    action = 0.0\n\n    # PRIMARY STRATEGY: MEAN-REVERSION TRADING\n    # Buy when price is significantly below its rolling mean\n    if buy_deviation < -self.charge_std_threshold and soc < 0.85:\n      space = battery_capacity_kwh - current_energy_stored_kwh\n      # Intensity based on how far below mean (higher deviation = more aggressive)\n      intensity = min(1.0, abs(buy_deviation) / 2.5)\n      charge = MAX_CHARGE * self.base_charge_rate * intensity * volatility_multiplier\n      charge = min(charge, space)\n      if charge > self.min_action_kw:\n        action = charge\n\n    # Sell when price is significantly above its rolling mean\n    elif sell_deviation > self.discharge_std_threshold and soc > 0.15:\n      intensity = min(1.0, abs(sell_deviation) / 2.5)\n      discharge = MAX_DISCHARGE * self.base_discharge_rate * intensity * volatility_multiplier\n      discharge = min(discharge, current_energy_stored_kwh)\n      if discharge > self.min_action_kw:\n        action = -discharge\n\n    # SECONDARY STRATEGY: MARGIN ARBITRAGE (when deviation signals are weak)\n    # This captures trades when buy-sell spread widens, regardless of absolute levels\n    elif margin_percentage > self.min_profitable_margin and abs(buy_deviation) < 1.0:\n      margin_intensity = min(1.0, margin_percentage / 0.15)  # Normalize to 15% spread\n\n      if soc < self.soc_target_high and current_grid_buy_price < buy_mean * 1.05:\n        # Buy cheaply when we have sell upside\n        space = battery_capacity_kwh - current_energy_stored_kwh\n        charge = MAX_CHARGE * 0.50 * margin_intensity * (0.5 + volatility_multiplier * 0.3)\n        charge = min(charge, space)\n        if charge > self.min_action_kw:\n          action = charge\n\n      elif soc > self.soc_target_low and current_grid_sell_price > buy_mean * 0.95:\n        # Sell at premium when we have cheap entry\n        discharge = MAX_DISCHARGE * 0.50 * margin_intensity * (0.5 + volatility_multiplier * 0.3)\n        discharge = min(discharge, current_energy_stored_kwh)\n        if discharge > self.min_action_kw:\n          action = -discharge\n\n    # TERTIARY: DEMAND RESPONSE with SOC management\n    elif current_demand_kw > current_pv_generation_kw + 2.0 and soc > 0.28:\n      if soc > self.soc_target_high:\n        discharge = min(MAX_DISCHARGE * 0.35, current_energy_stored_kwh)\n        if discharge > self.min_action_kw:\n          action = -discharge\n\n    # Record action\n    action_record = {\n      'action': action,\n      'soc': soc,\n      'buy_price': current_grid_buy_price,\n      'sell_price': current_grid_sell_price,\n      'buy_deviation': buy_deviation,\n      'margin': margin_percentage,\n      'timestamp': len(self.price_history)\n    }\n    self.action_history.append(action_record)\n    if len(self.action_history) > self.performance_window * 3:\n      self.action_history.pop(0)\n\n    return action\n",
+  "last_metrics": {
+    "utilization_pct": 22.61904761904762,
+    "avg_soc_pct": 69.71456387093698
+  },
+  "cost_history": [
+    -6.044736254386303,
+    8.901047668924654,
+    13.459608137072397,
+    10.99073232606995,
+    66.93500926505989,
+    31.368366479903305,
+    56.1690737864117,
+    10.640326983725089,
+    25.060987198177642,
+    26.081463943884483
+  ],
+  "records": [
+    {
+      "iteration": 0,
+      "total_cost": -6.044736254386303,
+      "utilization_pct": 87.5,
+      "avg_soc_pct": 52.58571452722531,
+      "runtime_s": 0.0006012092344462872,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "initial",
+      "code_file": "iter_00_policy.py"
+    },
+    {
+      "iteration": 1,
+      "total_cost": 8.901047668924654,
+      "utilization_pct": 6.547619047619048,
+      "avg_soc_pct": 3.8518410298001364,
+      "runtime_s": 0.0004781670868396759,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "refine",
+      "code_file": "iter_01_policy.py"
+    },
+    {
+      "iteration": 2,
+      "total_cost": 13.459608137072397,
+      "utilization_pct": 17.857142857142858,
+      "avg_soc_pct": 89.3609216994217,
+      "runtime_s": 0.0004870831035077572,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_02_policy.py"
+    },
+    {
+      "iteration": 3,
+      "total_cost": 10.99073232606995,
+      "utilization_pct": 1.7857142857142856,
+      "avg_soc_pct": 88.96220986881328,
+      "runtime_s": 0.0005280408076941967,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_03_policy.py"
+    },
+    {
+      "iteration": 4,
+      "total_cost": 66.93500926505989,
+      "utilization_pct": 62.5,
+      "avg_soc_pct": 57.39239173770137,
+      "runtime_s": 0.0008612498641014099,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_04_policy.py"
+    },
+    {
+      "iteration": 5,
+      "total_cost": 31.368366479903305,
+      "utilization_pct": 24.404761904761905,
+      "avg_soc_pct": 66.865327757214,
+      "runtime_s": 0.0009510419331490993,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_05_policy.py"
+    },
+    {
+      "iteration": 6,
+      "total_cost": 56.1690737864117,
+      "utilization_pct": 50.0,
+      "avg_soc_pct": 51.27377315029802,
+      "runtime_s": 0.0009519997984170914,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_06_policy.py"
+    },
+    {
+      "iteration": 7,
+      "total_cost": 10.640326983725089,
+      "utilization_pct": 0.0,
+      "avg_soc_pct": 50.0,
+      "runtime_s": 0.001244458369910717,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_07_policy.py"
+    },
+    {
+      "iteration": 8,
+      "total_cost": 25.060987198177642,
+      "utilization_pct": 21.428571428571427,
+      "avg_soc_pct": 81.3740919965899,
+      "runtime_s": 0.0009984998032450676,
+      "repair_attempts": 1,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_08_policy.py"
+    },
+    {
+      "iteration": 9,
+      "total_cost": 26.081463943884483,
+      "utilization_pct": 22.61904761904762,
+      "avg_soc_pct": 69.71456387093698,
+      "runtime_s": 0.0008412497118115425,
+      "repair_attempts": 0,
+      "restarts": 0,
+      "mode": "explore",
+      "code_file": "iter_09_policy.py"
+    }
+  ],
+  "price_volatility_pct": 10.095067070983646
+}

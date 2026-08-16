@@ -47,13 +47,15 @@ POLICY_SIGNATURE = '''class DispatchPolicy:
     """Decide this hour's flexible dispatch.
 
     Returns:
-      (flex_serve_mw, battery_mw)
+      (flex_serve_mw, battery_mw, reason)
       flex_serve_mw: deferrable compute to run now [MW] (0 = defer everything;
         serving more than arriving_flex_mw works down the backlog)
       battery_mw: positive = charge, negative = discharge [MW]
+      reason: SHORT one-sentence explanation citing the numbers that
+        drove this hour's decision
     """
     # --- Implement your logic here ---
-    return arriving_flex_mw, 0.0'''
+    return arriving_flex_mw, 0.0, "running arrivals as-is; explain thresholds here"'''
 
 
 GENERATION_PROMPT = '''You are an expert Python developer working on power-market optimization.
@@ -169,6 +171,7 @@ class DispatchOutcome:
     served_mw: list = None
     battery_mw: list = None
     backlog_mwh: list = None
+    reasons: list = None
 
 
 def simulate_dispatch(policy, env: dict) -> DispatchOutcome:
@@ -183,6 +186,7 @@ def simulate_dispatch(policy, env: dict) -> DispatchOutcome:
     E, P, eta = env["batt_mwh"], env["batt_mw"], env["eta"]
 
     soc = E / 2.0
+    reasons = []
     backlog = deque()   # (mwh, age_h)
     served = np.zeros(T); batt = np.zeros(T); blog = np.zeros(T)
     forced_total = 0.0
@@ -202,6 +206,7 @@ def simulate_dispatch(policy, env: dict) -> DispatchOutcome:
             battery_power_mw=P,
         )
         s_req, b_req = float(raw[0]), float(raw[1])
+        reasons.append(str(raw[2])[:160] if len(raw) > 2 else "")
         if not (np.isfinite(s_req) and np.isfinite(b_req)):
             raise ValueError(f"non-finite action at t={t}: {raw!r}")
 
@@ -251,6 +256,7 @@ def simulate_dispatch(policy, env: dict) -> DispatchOutcome:
         served_mw=served.tolist(),
         battery_mw=batt.tolist(),
         backlog_mwh=blog.tolist(),
+        reasons=reasons,
     )
 
 

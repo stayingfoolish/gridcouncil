@@ -23,7 +23,7 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from engine.data import fetch
+from engine.data import YEAR_END, YEAR_START, fetch
 from engine.optimizer import dispatch_dla, dispatch_pfa, evaluate
 from engine.scenario import assess, datacenter
 from engine.twin import MeritOrderTwin
@@ -34,12 +34,15 @@ st.set_page_config(page_title="Grid Optimization Engine", page_icon="⚡",
 EUR_BENCH = {"No battery": 10.64, "Best possible (perfect foresight)": -6.32}
 
 
-@st.cache_resource(show_spinner="Loading real market data and calibrating the twin…")
+@st.cache_resource(show_spinner="Loading a year of market data and calibrating the twin…")
 def load_twin():
-    df, iso = fetch("2026-06-01", "2026-08-14")
+    df, iso = fetch(YEAR_START, YEAR_END)
     df = df.sort_values("time").reset_index(drop=True)
-    twin = MeritOrderTwin.calibrate(df)
-    test = df.iloc[-twin.report.n_test:].reset_index(drop=True)
+    # a year of context; the operational twin is calibrated on the most recent
+    # 90 days (supply stacks drift with season and fuel prices)
+    twin = MeritOrderTwin.calibrate(df.iloc[-2160:].reset_index(drop=True))
+    # scenario window: the last 15 days (inside the twin's held-out tail)
+    test = df.iloc[-360:].reset_index(drop=True)
     return df, test, twin, iso
 
 
@@ -228,6 +231,25 @@ def replay_ui(runs: dict, keyp: str):
         with st.expander("Read the full strategy the AI wrote this round (real code)"):
             st.code(cur["code"], language="python")
 
+    bt = run_dir / ep_name / "best_trace.json"
+    if bt.exists():
+        trace = json.loads(bt.read_text())
+        reasons = trace.get("reasons") or []
+        if any(reasons):
+            with st.expander("🧾 Decision ledger — the best strategy explains every hour, "
+                             "in its own words"):
+                acts = trace.get("actions_kw") or trace.get("served_mw") or []
+                ledger = pd.DataFrame({
+                    "hour": range(len(reasons)),
+                    "action": [round(a, 2) for a in acts[:len(reasons)]],
+                    "the strategy's own reason": reasons,
+                })
+                st.dataframe(ledger[ledger["the strategy's own reason"] != ""].head(96),
+                             height=260, hide_index=True)
+        else:
+            st.caption("🧾 Decision ledger: this run predates self-explaining strategies — "
+                       "new runs record the strategy's own one-line reason for every hour.")
+
 
 def live_lab(flavor: dict, keyp: str):
     """Start + watch a live APS run. flavor: name, driver, prefix, unit, scale,
@@ -261,7 +283,15 @@ def live_lab(flavor: dict, keyp: str):
         st.session_state[f"{keyp}_dir"] = run_name
         st.rerun()
     if default_dir and (ROOT / default_dir).joinpath("worker.pid").exists():
-        if cc4.button("⏹ Stop worker", key=f"{keyp}_stop"):
+        sp1, sp2 = cc4.columns(2)
+        if sp1.button("⚡ Inject spike", key=f"{keyp}_spike", type="secondary",
+                      help="Perturb the world mid-run: demand spike (data center) or "
+                           "price surge (home). The next rounds are scored against the "
+                           "harder world — watch the coach react."):
+            subprocess.run([sys.executable, "experiments/inject.py",
+                            "--run", str(default_dir)], cwd=ROOT, capture_output=True)
+            st.toast("Spike injected — the world just got harder.", icon="⚡")
+        if sp2.button("⏹ Stop worker", key=f"{keyp}_stop"):
             pid_file = ROOT / default_dir / "worker.pid"
             try:
                 import os as _os
@@ -308,11 +338,12 @@ def live_lab(flavor: dict, keyp: str):
             live_df[flavor["best_label"]] = bl["dla"] / sc
             st.line_chart(live_df, height=240)
         st.markdown("**Deliberation feed** (newest first):")
-        icons = {"score": "🎯", "crash": "💥"}
+        icons = {"score": "🎯", "crash": "💥", "spike": "⚡"}
         for e in reversed(events[-12:]):
             icon = icons.get(e["kind"], "🧠")
-            who = "Coach" if e["kind"].startswith("coach") else \
-                  ("Score" if e["kind"] == "score" else "Crash")
+            who = ("Coach" if e["kind"].startswith("coach") else
+                   "Score" if e["kind"] == "score" else
+                   "WORLD CHANGED" if e["kind"] == "spike" else "Crash")
             st.markdown(f"{icon} **{e['episode']} · round {e['iteration'] + 1} · {who}** — "
                         f"{e['detail'][:220]}{'…' if len(e['detail']) > 220 else ''}")
     live_feed()
@@ -384,10 +415,10 @@ st.caption("A live model of a real power grid, an optimizer that keeps new deman
            "raising everyone's bill, and AI agents that teach themselves control "
            "strategies. All numbers come from real market data or fully disclosed simulations.")
 
-(t_prob, t_home, t_dc, t_agents, t_live_home, t_live_dc, t_hood) = st.tabs([
+(t_prob, t_home, t_dc, t_coord, t_agents, t_live_home, t_live_dc, t_hood) = st.tabs([
     "1 · The problem", "2 · 🏠 Story: Home battery", "3 · 🏢 Story: Data center",
-    "4 · 🤝 How the agents talk", "🔴 Live Lab: Home", "🔴 Live Lab: Data center",
-    "🔍 Under the hood"])
+    "4 · 🌊 Story: Smoothing the spike", "5 · 🤝 How the agents talk",
+    "🔴 Live Lab: Home", "🔴 Live Lab: Data center", "🔍 Under the hood"])
 
 # ---------------------------------------------------------------- the problem
 with t_prob:
@@ -412,10 +443,21 @@ and a calibrated twin of the market keeps the score.""")
         m2.metric("Worst hour in the data", f"${df['LMP'].max():.0f}/MWh",
                   f"{df['LMP'].max()/df['LMP'].median():.0f}× the typical", delta_color="inverse")
         m3.metric("Twin accuracy (unseen weeks)", f"{twin.report.corr:.0%} correlation")
+        m4, m5 = st.columns(2)
+        m4.metric("Grid carbon intensity (avg)",
+                  f"{df['carbon_t_per_mwh'].mean()*1000:.0f} kg CO₂/MWh",
+                  help="Computed hourly from the real fuel mix")
+        m5.metric("Dirtiest vs cleanest hour",
+                  f"{df['carbon_t_per_mwh'].max()/max(df['carbon_t_per_mwh'].min(),1e-9):.1f}×",
+                  help="Shifting load between hours changes real emissions, not just cost")
     with right:
         st.markdown("**Real prices, hour by hour** — spikes are expensive plants switching on")
         chart_df = pd.DataFrame({"time": df["time"], "$/MWh": df["LMP"]}).set_index("time")
-        st.line_chart(chart_df, height=260)
+        st.line_chart(chart_df, height=190)
+        st.markdown("**…and every hour has a carbon intensity too** (real fuel mix)")
+        st.line_chart(pd.DataFrame({"time": df["time"],
+                                    "kg CO₂/MWh": df["carbon_t_per_mwh"]*1000}
+                                   ).set_index("time"), height=140, color="#7a7a52")
     st.divider()
     st.markdown("### The grid on a map — one price per region, changing every hour")
     spike_day = str(df.loc[df["LMP"].idxmax(), "time"].date())
@@ -515,6 +557,14 @@ dispatched intelligently. Try it yourself:""")
               f"{(opt.energy_cost - naive.energy_cost)/1e6:+.1f}M")
 
     _, test, twin, _ = load_twin()
+    ci = test["carbon_t_per_mwh"].values
+    tons_naive = float((dc.profile_mw * ci).sum())
+    tons_opt = float((opt.served_mw * ci).sum())
+    cb1, cb2 = st.columns(2)
+    cb1.metric("Emissions, rigid", f"{tons_naive:,.0f} t CO₂",
+               help="Grid-average carbon intensity per hour × the data center's draw")
+    cb2.metric("Emissions, with the engine", f"{tons_opt:,.0f} t CO₂",
+               f"{tons_opt - tons_naive:+,.0f} t", delta_color="inverse")
     p0, p1 = impact.price_base, impact.price_new
     worst = int(np.argmax(p1 - p0)); a, b = max(0, worst - 60), min(len(test), worst + 60)
     price_df = pd.DataFrame({
@@ -596,6 +646,122 @@ precisely. The ladder, from worst to best:""")
     st.divider()
     st.markdown("### 🎬 Replay the recorded search, round by round")
     replay_ui(dollar_runs(), "dc")
+
+
+# ---------------------------------------------------------------- coordination story
+@st.cache_data(show_spinner="Solving the three regimes (selfish, negotiated, coordinated)…")
+def run_coordination(n_homes: int, dc_mw: int, extra_spike_mw: int, n_rounds: int):
+    import numpy as _np
+    from engine.coordination import dc_actor, fleet_actor, run_scenario as _run
+    df, test, twin, _ = load_twin()
+    tail = df.iloc[-twin.report.n_test:].reset_index(drop=True)  # twin's held-out tail
+    peak = int(tail["net_load_mw"].idxmax())
+    a, b = max(0, peak - 36), min(len(tail), peak + 36)
+    win = tail.iloc[a:b].reset_index(drop=True)
+    T = len(win)
+    base = win["net_load_mw"].values.copy()
+    if extra_spike_mw:
+        c = int(_np.argmax(base))
+        w = _np.zeros(T); lo, hi = max(0, c - 12), min(T, c + 12)
+        w[lo:hi] = extra_spike_mw * _np.hanning(hi - lo)
+        base = base + w
+    hour_adj = _np.array([twin.hour_adj.get(h, 0.0) for h in win["time"].dt.hour])
+    actors = [dc_actor(T, mw=float(dc_mw)), fleet_actor(T, n_homes)]
+    res = _run(actors, base, twin.grid, twin.grid_price, hour_adj, n_rounds=n_rounds)
+    price = res["price_fn"]
+    out = {
+        "times": win["time"], "base": base, "existing_mw": win["load_mw"].values,
+        "p0": res["p0"],
+        "selfish_net": res["selfish"]["net"],
+        "joint_net": res["joint"]["net"],
+        "rounds": [{"round": r["round"], "peak_mw": r["peak_mw"],
+                    "peak_price": r["peak_price"]} for r in res["rounds"]],
+        "p_selfish": price(res["selfish"]["net"]),
+        "p_joint": price(res["joint"]["net"]),
+        "fleet_batt": res["joint"]["dispatches"][1].battery_mw,
+        "dc_draw": res["joint"]["dispatches"][0].draw_mw,
+        "fleet_batt_selfish": res["selfish"]["dispatches"][1].battery_mw,
+    }
+    return out
+
+
+with t_coord:
+    st.subheader("🌊 One grid, two flexible actors — smoothing the same spike together")
+    st.markdown("""
+**The problem.** On the worst stretch of the year, a demand spike hits while a data center
+is connecting *and* tens of thousands of home batteries all try to be smart at once. Good
+intentions are not enough: **if everyone reacts to the same price signal independently, they
+all discharge into the same hour and all recharge in the same trough — creating a brand-new
+peak** (the herding problem). Coordination is not a nicety; it is the product.""")
+
+    k1, k2, k3, k4 = st.columns(4)
+    n_homes = k1.slider("Home batteries enrolled", 10_000, 100_000, 50_000, 10_000)
+    dc_mw = k2.slider("Data center size (MW)", 200, 1000, 500, 100)
+    extra_spike = k3.slider("Extra heat-wave severity (MW)", 0, 2000, 0, 250,
+                            help="0 = the real worst 3 days as recorded; add MW to stress it further")
+    n_rounds = k4.slider("Negotiation rounds", 2, 8, 5)
+
+    C = run_coordination(n_homes, dc_mw, extra_spike, n_rounds)
+
+    st.markdown("#### Act 1 — Everyone for themselves (herding)")
+    st.markdown("Each actor optimizes selfishly against the same forecast. Watch the peak "
+                "*grow* and a rebound appear where they all recharge:")
+    net_df = pd.DataFrame({
+        "time": C["times"],
+        "Grid alone (base)": C["base"],
+        "Selfish flexibility": C["selfish_net"],
+        "Coordinated": C["joint_net"],
+    }).set_index("time")
+    st.line_chart(net_df, height=300)
+
+    h1, h2, h3 = st.columns(3)
+    h1.metric("Base peak", f"{C['base'].max():,.0f} MW")
+    h2.metric("Selfish peak", f"{C['selfish_net'].max():,.0f} MW",
+              f"{C['selfish_net'].max() - C['base'].max():+,.0f} MW", delta_color="inverse")
+    h3.metric("Coordinated peak", f"{C['joint_net'].max():,.0f} MW",
+              f"{C['joint_net'].max() - C['base'].max():+,.0f} MW")
+    if C["joint_net"].max() < C["base"].max():
+        st.success(f"**The headline:** coordinated, the grid absorbs a {dc_mw} MW data "
+                   f"center and {n_homes:,} batteries — and the peak ends up "
+                   f"**{C['base'].max() - C['joint_net'].max():,.0f} MW lower than before "
+                   "anyone connected.** New demand, smaller peak.")
+
+    st.markdown("#### Act 2 — The negotiation (watch coordination emerge)")
+    st.markdown("A coordinator re-prices the system after each round of responses; actors "
+                "adapt with damping. The peak walks down toward the coordinated bound:")
+    rounds_df = pd.DataFrame(C["rounds"]).set_index("round")
+    rounds_df["coordinated bound"] = C["joint_net"].max()
+    st.line_chart(rounds_df[["peak_mw", "coordinated bound"]], height=220)
+
+    st.markdown("#### Act 3 — Who did what, and who won")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown("**The coordinated plan's moving parts**")
+        parts = pd.DataFrame({
+            "time": C["times"],
+            "Data center draw (MW)": C["dc_draw"],
+            "Home fleet battery (MW, − = discharging)": C["fleet_batt"],
+        }).set_index("time")
+        st.line_chart(parts, height=240)
+    with d2:
+        st.markdown("**The ledger (over these 3 days)**")
+        bill_selfish = float(((C["p_selfish"] - C["p0"]) * C["existing_mw"]).sum())
+        bill_joint = float(((C["p_joint"] - C["p0"]) * C["existing_mw"]).sum())
+        fleet_rev = float((-C["fleet_batt"] * C["p_joint"]).sum())
+        st.metric("Existing consumers, selfish flexibility",
+                  f"${bill_selfish/1e6:+.1f}M", delta_color="inverse")
+        st.metric("Existing consumers, coordinated",
+                  f"${bill_joint/1e6:+.1f}M",
+                  f"{(bill_joint - bill_selfish)/1e6:+.1f}M vs selfish")
+        st.metric("Home fleet arbitrage earnings",
+                  f"${max(fleet_rev, 0)/1e3:,.0f}k",
+                  f"≈ ${max(fleet_rev, 0)/max(n_homes,1):.2f} per home")
+        st.caption("Same physics, same actors — the only difference between the red and "
+                   "green lines is whether anyone coordinates them.")
+    st.info("**How this connects to the agents:** the negotiation above is the coordinator "
+            "layer the agent system plugs into — each actor's strategy can be a hand-built "
+            "optimizer (shown here) or an AI-written policy from the Live Labs. The "
+            "scoreboard doesn't care who wrote the strategy; it prices the outcome.")
 
 # ---------------------------------------------------------------- agents
 with t_agents:

@@ -1,0 +1,193 @@
+```python
+from collections import deque
+
+class Policy:
+    def __init__(self):
+        # Power constraints
+        self.max_charge_power = 10
+        self.max_discharge_power = 5
+        
+        # Dynamic battery thresholds
+        self.battery_min_threshold = 0.15
+        self.battery_max_threshold = 0.85
+        self.critical_min = 0.05
+        
+        # Price prediction & volatility
+        self.price_history = []
+        self.history_window = 30
+        self.volatility_window = 15
+        
+        # Opportunity cost tracking
+        self.recent_prices = deque(maxlen=10)
+        self.price_trend = 0.0
+        self.volatility_regime = "normal"
+        
+    def _calculate_advanced_metrics(self, price_history: list) -> dict:
+        if len(price_history) < 5:
+            return {
+                'avg_price': sum(price_history) / len(price_history),
+                'std_dev': 0,
+                'trend': 0,
+                'momentum': 0,
+                'price_percentile': 0.5
+            }
+        
+        recent = price_history[-5:]
+        older = price_history[-15:-5] if len(price_history) >= 15 else price_history[:len(price_history)//2]
+        
+        avg_recent = sum(recent) / len(recent)
+        avg_older = sum(older) / len(older) if older else avg_recent
+        
+        trend = (avg_recent - avg_older) / (avg_older + 1e-6)
+        
+        if len(recent) >= 3:
+            momentum = (recent[-1] - recent[-3]) / (recent[-3] + 1e-6)
+        else:
+            momentum = 0
+        
+        sorted_prices = sorted(price_history[-10:])
+        current_price = price_history[-1]
+        percentile = sum(1 for p in sorted_prices if p <= current_price) / len(sorted_prices)
+        
+        std_dev = (sum((p - avg_recent)**2 for p in recent) / len(recent))**0.5
+        
+        return {
+            'avg_price': avg_recent,
+            'std_dev': std_dev,
+            'trend': trend,
+            'momentum': momentum,
+            'price_percentile': percentile
+        }
+    
+    def _determine_volatility_regime(self, std_dev: float, avg_price: float) -> str:
+        cv = (std_dev / (avg_price + 1e-6)) * 100
+        
+        if cv > 15:
+            return "high_volatility"
+        elif cv > 8:
+            return "normal"
+        else:
+            return "low_volatility"
+    
+    def _calculate_opportunity_cost(self,
+        battery_level: float,
+        current_price: float,
+        avg_price: float,
+        trend: float,
+        price_percentile: float,
+    ) -> float:
+        
+        discharge_regret = (price_percentile - 0.5) * 100
+        charge_regret = (0.5 - price_percentile) * 100
+        
+        if trend > 0.02:
+            charge_regret *= 0.7
+            discharge_regret *= 1.3
+        elif trend < -0.02:
+            charge_regret *= 1.3
+            discharge_regret *= 0.7
+        
+        return discharge_regret - charge_regret
+    
+    def take_action(self,
+        current_energy_stored_kwh: float,
+        current_pv_generation_kw: float,
+        current_demand_kw: float,
+        current_grid_buy_price: float,
+        current_grid_sell_price: float,
+        battery_capacity_kwh: float,
+    ) -> float:
+        
+        self.price_history.append(current_grid_buy_price)
+        if len(self.price_history) > self.history_window:
+            self.price_history.pop(0)
+        
+        self.recent_prices.append(current_grid_buy_price)
+        
+        metrics = self._calculate_advanced_metrics(self.price_history)
+        self.volatility_regime = self._determine_volatility_regime(
+            metrics['std_dev'], 
+            metrics['avg_price']
+        )
+        self.price_trend = metrics['trend']
+        
+        battery_level = current_energy_stored_kwh / battery_capacity_kwh
+        excess_pv = max(0, current_pv_generation_kw - current_demand_kw)
+        deficit = max(0, current_demand_kw - current_pv_generation_kw)
+        
+        energy_to_full = battery_capacity_kwh - current_energy_stored_kwh
+        max_charge_available = min(self.max_charge_power, energy_to_full)
+        max_discharge_available = min(self.max_discharge_power, current_energy_stored_kwh)
+        
+        if self.volatility_regime == "high_volatility":
+            charge_threshold = metrics['avg_price'] * 0.85
+            discharge_threshold = metrics['avg_price'] * 1.15
+            min_soc_for_arbitrage = 0.25
+        elif self.volatility_regime == "low_volatility":
+            charge_threshold = metrics['avg_price'] * 0.95
+            discharge_threshold = metrics['avg_price'] * 1.05
+            min_soc_for_arbitrage = 0.20
+        else:
+            charge_threshold = metrics['avg_price'] * 0.90
+            discharge_threshold = metrics['avg_price'] * 1.10
+            min_soc_for_arbitrage = 0.20
+        
+        opp_cost = self._calculate_opportunity_cost(
+            battery_level,
+            current_grid_buy_price,
+            metrics['avg_price'],
+            metrics['trend'],
+            metrics['price_percentile']
+        )
+        
+        action_kw = 0.0
+        
+        if excess_pv > 0:
+            if battery_level < self.battery_max_threshold:
+                pv_adjusted_charge_threshold = charge_threshold * 1.3
+                
+                if current_grid_buy_price < pv_adjusted_charge_threshold or battery_level < 0.3:
+                    charge_amount = min(excess_pv, max_charge_available)
+                    action_kw = charge_amount
+                    return action_kw
+        
+        if deficit > 0:
+            if (current_grid_buy_price > discharge_threshold and 
+                battery_level > self.battery_min_threshold and 
+                opp_cost > 5):
+                
+                discharge_amount = min(deficit, max_discharge_available)
+                action_kw = -discharge_amount
+                return action_kw
+        
+        if excess_pv == 0 and deficit == 0:
+            
+            if (current_grid_buy_price < charge_threshold and
+                battery_level < self.battery_max_threshold and
+                metrics['price_percentile'] < 0.35 and
+                metrics['trend'] > -0.01):
+                
+                charge_amount = min(self.max_charge_power * 1.2, max_charge_available)
+                action_kw = charge_amount
+                return action_kw
+            
+            if (current_grid_buy_price > discharge_threshold and
+                battery_level > min_soc_for_arbitrage and
+                metrics['price_percentile'] > 0.65 and
+                metrics['trend'] < 0.01 and
+                battery_level < self.battery_max_threshold * 0.95):
+                
+                discharge_amount = min(self.max_discharge_power, max_discharge_available)
+                action_kw = -discharge_amount
+                return action_kw
+            
+            if battery_level > self.battery_max_threshold * 0.98 and current_grid_buy_price < metrics['avg_price']:
+                action_kw = -self.max_discharge_power * 0.3
+                return action_kw
+            
+            if battery_level < self.battery_min_threshold * 1.5 and current_grid_buy_price < charge_threshold:
+                action_kw = self.max_charge_power * 0.4
+                return action_kw
+        
+        return action_kw
+```
