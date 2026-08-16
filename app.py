@@ -45,6 +45,46 @@ def load_twin():
     return df, test, twin, iso
 
 
+ZONES = {  # NYISO load-zone centroids
+    "WEST": (42.90, -78.85), "GENESE": (43.00, -77.60), "CENTRL": (43.05, -76.15),
+    "NORTH": (44.70, -73.50), "MHK VL": (43.10, -75.20), "CAPITL": (42.65, -73.75),
+    "HUD VL": (41.70, -73.90), "MILLWD": (41.20, -73.80), "DUNWOD": (40.95, -73.85),
+    "N.Y.C.": (40.75, -73.98), "LONGIL": (40.80, -73.10),
+}
+
+
+@st.cache_data(show_spinner="Loading zonal prices for the map…")
+def load_zonal_day(day: str) -> pd.DataFrame:
+    import gridstatus
+    lmp = gridstatus.NYISO().get_lmp(date=day, market="DAY_AHEAD_HOURLY")
+    lmp = lmp[lmp["Location"].isin(ZONES)]
+    lmp["hour"] = lmp["Interval Start"].dt.hour
+    return lmp[["hour", "Location", "LMP"]]
+
+
+def price_map(day_df: pd.DataFrame, hour: int):
+    import pydeck as pdk
+    snap = day_df[day_df["hour"] == hour].copy()
+    snap["lat"] = snap["Location"].map(lambda z: ZONES[z][0])
+    snap["lon"] = snap["Location"].map(lambda z: ZONES[z][1])
+    pmax = max(float(day_df["LMP"].max()), 1.0)
+    snap["frac"] = (snap["LMP"] / pmax).clip(0, 1)
+    snap["color"] = snap["frac"].map(
+        lambda f: [int(40 + 215 * f), int(180 * (1 - f) + 40), 60, 200])
+    snap["radius"] = 8000 + snap["frac"] * 32000
+    snap["label"] = snap.apply(lambda r: f"${r.LMP:.0f}", axis=1)
+    layers = [
+        pdk.Layer("ScatterplotLayer", snap, get_position="[lon, lat]",
+                  get_fill_color="color", get_radius="radius", pickable=True),
+        pdk.Layer("TextLayer", snap, get_position="[lon, lat]", get_text="label",
+                  get_size=14, get_color=[255, 255, 255, 255]),
+    ]
+    return pdk.Deck(layers=layers,
+                    initial_view_state=pdk.ViewState(latitude=42.7, longitude=-75.5, zoom=5.6),
+                    tooltip={"text": "{Location}: {label}/MWh"},
+                    map_style=None)
+
+
 @st.cache_data(show_spinner=False)
 def run_scenario(mw: float, flex_pct: int, batt_mw: int, use_lookahead: bool):
     _, test, twin, _ = load_twin()
@@ -118,6 +158,21 @@ the bill of every home on the grid. The question every city and utility is askin
             "calibrated until its simulated prices track what the market actually did. "
             "Once it tracks reality, it can answer *what-if* questions reality never ran.")
 
+    st.divider()
+    st.markdown("### The grid on a map — one price per region, changing every hour")
+    spike_day = str(df.loc[df["LMP"].idxmax(), "time"].date())
+    day = st.date_input("Day", value=pd.to_datetime(spike_day).date(),
+                        min_value=df["time"].min().date(), max_value=df["time"].max().date())
+    hour = st.slider("Hour of day", 0, 23, 18,
+                     help="Drag through the day — watch prices climb into the evening")
+    try:
+        day_df = load_zonal_day(str(day))
+        st.pydeck_chart(price_map(day_df, hour), height=420)
+        st.caption("Real NYISO zonal day-ahead prices. Bigger, redder = more expensive. "
+                   f"The preselected day is the most expensive hour in the dataset ({spike_day}).")
+    except Exception as e:
+        st.warning(f"Map data unavailable ({e}); the price chart above tells the same story.")
+
 # ---------------------------------------------------------------- tab 2
 with tab2:
     st.subheader("Drop a data center on the grid — then let the engine fix the damage")
@@ -172,6 +227,49 @@ with tab3:
 control strategy as code → the twin scores it against the market → a *coach* AI reads the
 score and either sharpens the strategy or orders a rethink. Watch the score, and read the
 coach's calls.""")
+
+    live = st.toggle("🔴 Live mode — watch a run happening right now",
+                     help="Start one in a terminal:  python experiments/driver2.py init "
+                          "--run results/engine_live --episodes 3 --iterations 8  &&  "
+                          "python experiments/worker.py --run results/engine_live")
+    if live:
+        @st.fragment(run_every="4s")
+        def live_feed():
+            live_dir = ROOT / "results/engine_live"
+            ev_file = live_dir / "events.jsonl"
+            if not ev_file.exists():
+                st.info("Waiting for a live run… kick one off in a terminal:")
+                st.code("python experiments/driver2.py init --run results/engine_live --episodes 3 --iterations 8\n"
+                        "python experiments/worker.py --run results/engine_live", language="bash")
+                return
+            events = [json.loads(l) for l in ev_file.read_text().splitlines()]
+            bl = json.loads((live_dir / "baselines.json").read_text())
+            scores = [e for e in events if e["kind"] == "score"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Rounds scored so far", len(scores))
+            c2.metric("Coach interventions",
+                      sum(1 for e in events if e["kind"].startswith("coach")))
+            c3.metric("Crashes self-repaired",
+                      sum(1 for e in events if e["kind"] == "crash"))
+            if scores:
+                costs = [float(e["detail"].split("$")[1].split(" ")[0].replace(",", ""))
+                         for e in scores]
+                live_df = pd.DataFrame({
+                    "round": range(1, len(costs) + 1),
+                    "attempt ($M)": [c / 1e6 for c in costs]}).set_index("round")
+                live_df["Do nothing"] = bl["naive"] / 1e6
+                live_df["Best possible"] = bl["dla"] / 1e6
+                st.line_chart(live_df, height=240)
+            st.markdown("**Deliberation feed** (newest first):")
+            icons = {"score": "🎯", "crash": "💥"}
+            for e in reversed(events[-12:]):
+                icon = icons.get(e["kind"], "🧠")
+                who = "Coach" if e["kind"].startswith("coach") else \
+                      ("Score" if e["kind"] == "score" else "Crash")
+                st.markdown(f"{icon} **{e['episode']} · round {e['iteration'] + 1} · {who}** — "
+                            f"{e['detail'][:220]}{'…' if len(e['detail']) > 220 else ''}")
+        live_feed()
+        st.stop()
 
     runs = {}
     if (ROOT / "results/run1").exists():
